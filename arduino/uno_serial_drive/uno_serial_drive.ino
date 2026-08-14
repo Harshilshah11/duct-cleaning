@@ -1,0 +1,201 @@
+/*
+ * uno_serial_drive — Arduino Uno on the Pi's USB tether, driving a dual-channel
+ * motor driver from ground station joystick data.
+ *
+ *   Pi  -> Uno   "CMD <seq> M <left> <right>\n"    left/right = -255..255
+ *   Pi  -> Uno   "CMD <seq> STOP\n"                explicit neutral
+ *   Uno -> Pi    "ACK <seq>\n"
+ *
+ * Same framing as uno_eth_link.ino so the two links stay interchangeable, but
+ * over USB CDC serial instead of UDP. The Pi does the arcade mixing (see
+ * ground_station/uno_serial.py) and sends per-motor demands; this sketch only
+ * applies them. Keeping the mixing off the Uno means steering can be retuned
+ * without a reflash, and it keeps the code that runs next to the motors small
+ * enough to audit in one sitting.
+ *
+ * PIN MAP (from Harshil, 2026-08-14):
+ *
+ *   channel 1 / LEFT    DIR1 = D9    PWM1 = D10
+ *   channel 2 / RIGHT   DIR2 = D8    PWM2 = D11
+ *
+ * DO NOT run this sketch with the W5100/W5500 Ethernet shield fitted. That
+ * shield owns D10-D13 for SPI (D10 is its chip select) and D4 for the SD slot,
+ * so D10 and D11 as motor PWM collide with it directly. This pin map is only
+ * available BECAUSE the link moved from the shield to the USB tether. If the
+ * shield ever goes back on, the motor pins must move — not the other way round.
+ *
+ * D10 and D11 are both PWM-capable (D9/D10 = Timer1, D11 = Timer2), which is
+ * why the DIR lines got D9 and D8: a direction pin only needs digitalWrite, so
+ * it must never occupy one of the six PWM pins that a second motor might want.
+ *
+ * PWM runs at the stock ~490 Hz. That is inside the audible band and some
+ * drivers whine at it. Timer1 can be pushed to ~31 kHz with
+ * `TCCR1B = (TCCR1B & 0xF8) | 0x01;` but that only moves D9/D10 — D11 is on
+ * Timer2 and would still sit at 490 Hz, giving the two motors different PWM
+ * frequencies. Change both or neither; mismatched channels behave differently
+ * at the same demand, which reads as a mechanical fault.
+ *
+ * FAILSAFE — the reason this is more than a parse loop. If no valid command
+ * arrives for FAILSAFE_MS, safeState() stops both motors. A tethered robot that
+ * keeps driving on its last command after the USB cable pops out is exactly the
+ * failure this prevents. TEST IT WITH THE WHEELS OFF THE GROUND: unplug the USB
+ * cable mid-drive and confirm both motors stop within a third of a second.
+ *
+ * Build: Arduino IDE, board "Arduino Uno", no external libraries.
+ */
+
+// --- Motor driver pins -------------------------------------------------------
+const uint8_t DIR1 = 9;    // channel 1 direction  (LEFT)
+const uint8_t PWM1 = 10;   // channel 1 speed
+const uint8_t DIR2 = 8;    // channel 2 direction  (RIGHT)
+const uint8_t PWM2 = 11;   // channel 2 speed
+
+const uint8_t STATUS_LED = LED_BUILTIN;
+
+// --- Failsafe ----------------------------------------------------------------
+// 300 ms, matching uno_eth_link.ino: long enough to ride out a handful of missed
+// frames at the 50 Hz command rate, short enough that the robot stops within a
+// third of a second of a real tether failure.
+const unsigned long FAILSAFE_MS = 300;
+
+// --- Tuning ------------------------------------------------------------------
+// Below this the motor buzzes and heats without turning, so treat it as zero.
+// Raise it if the drivetrain stalls at low demand; lower it for finer crawl.
+const int DEADBAND = 12;
+
+// Hard ceiling on demand. Drop this to tame a robot that is too quick to drive
+// safely indoors — it scales everything, so steering stays proportional.
+const int MAX_PWM = 255;
+
+// --- Serial framing ----------------------------------------------------------
+// Uno has 2 KB of SRAM total; 64 bytes is plenty for "CMD 65535 M -255 -255"
+// and leaves room for everything else.
+const uint8_t RX_BUFFER = 64;
+char line[RX_BUFFER];
+uint8_t lineLen = 0;
+
+unsigned long lastCommandMs = 0;
+bool linkUp = false;
+uint16_t lastSeq = 0;
+unsigned long commandsReceived = 0;
+
+int currentLeft = 0;
+int currentRight = 0;
+
+/* Apply one motor channel. Sign picks direction, magnitude becomes PWM. */
+void applyMotor(uint8_t dirPin, uint8_t pwmPin, int demand) {
+  if (demand > MAX_PWM) demand = MAX_PWM;
+  if (demand < -MAX_PWM) demand = -MAX_PWM;
+  if (demand > -DEADBAND && demand < DEADBAND) demand = 0;
+
+  // Direction is set BEFORE the new PWM value. Doing it the other way round
+  // spends a few microseconds driving the old direction at the new speed, which
+  // is a current spike through the bridge on every reversal.
+  digitalWrite(dirPin, demand >= 0 ? HIGH : LOW);
+  analogWrite(pwmPin, demand >= 0 ? demand : -demand);
+}
+
+/* Both motors to neutral. Runs on every failsafe trip, so it must be
+ * unconditional and must not depend on any prior state. */
+void safeState() {
+  currentLeft = 0;
+  currentRight = 0;
+  analogWrite(PWM1, 0);
+  analogWrite(PWM2, 0);
+  digitalWrite(DIR1, LOW);
+  digitalWrite(DIR2, LOW);
+  digitalWrite(STATUS_LED, LOW);
+}
+
+void setup() {
+  // Outputs are driven to a stopped state BEFORE they are made outputs, so the
+  // pins cannot glitch high for the instant between pinMode and the first write.
+  digitalWrite(DIR1, LOW);
+  digitalWrite(DIR2, LOW);
+  digitalWrite(PWM1, LOW);
+  digitalWrite(PWM2, LOW);
+  pinMode(DIR1, OUTPUT);
+  pinMode(DIR2, OUTPUT);
+  pinMode(PWM1, OUTPUT);
+  pinMode(PWM2, OUTPUT);
+  pinMode(STATUS_LED, OUTPUT);
+
+  safeState();
+
+  Serial.begin(115200);
+  Serial.println(F("uno_serial_drive ready"));
+  Serial.print(F("DIR1=D9 PWM1=D10 (left)  DIR2=D8 PWM2=D11 (right)  failsafe "));
+  Serial.print(FAILSAFE_MS);
+  Serial.println(F(" ms"));
+}
+
+/* Parse one complete line and act on it. */
+void handleLine(char *buf) {
+  unsigned int seq = 0;
+  int left = 0;
+  int right = 0;
+
+  // "CMD <seq> M <left> <right>" — the common case, checked first.
+  if (sscanf(buf, "CMD %u M %d %d", &seq, &left, &right) == 3) {
+    currentLeft = left;
+    currentRight = right;
+    applyMotor(DIR1, PWM1, left);
+    applyMotor(DIR2, PWM2, right);
+  } else if (sscanf(buf, "CMD %u STOP", &seq) == 1) {
+    safeState();
+  } else {
+    Serial.print(F("WARN: unparsable: "));
+    Serial.println(buf);
+    return;
+  }
+
+  lastSeq = (uint16_t)seq;
+  commandsReceived++;
+  lastCommandMs = millis();
+
+  if (!linkUp) {
+    linkUp = true;
+    Serial.println(F("LINK UP"));
+  }
+  digitalWrite(STATUS_LED, HIGH);
+
+  Serial.print(F("ACK "));
+  Serial.println(lastSeq);
+}
+
+void loop() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+
+    if (c == '\r') {
+      continue;                     // tolerate CRLF senders
+    }
+    if (c == '\n') {
+      line[lineLen] = '\0';
+      if (lineLen > 0) {
+        handleLine(line);
+      }
+      lineLen = 0;
+      continue;
+    }
+    if (lineLen < RX_BUFFER - 1) {
+      line[lineLen++] = c;
+    } else {
+      // Overlong line: drop it rather than let it wrap and fabricate a command
+      // out of two halves. Resync happens at the next newline.
+      lineLen = 0;
+      Serial.println(F("WARN: line too long, dropped"));
+    }
+  }
+
+  // millis() subtraction, never `millis() > last + FAILSAFE_MS`. Unsigned
+  // wraparound at ~49 days makes the additive form compare wrong exactly once,
+  // and this form stays correct across the rollover.
+  if (linkUp && (millis() - lastCommandMs) >= FAILSAFE_MS) {
+    linkUp = false;
+    safeState();
+    Serial.print(F("LINK DOWN - failsafe after "));
+    Serial.print(commandsReceived);
+    Serial.println(F(" commands"));
+  }
+}

@@ -1,0 +1,19 @@
+# The two RTSP streams to display. One URL per line.
+# Lines starting with # are ignored.
+#
+# CAM 1 — camera at 192.168.1.103 (MAC 00:c2:33:71:13:6d), reached over eth0.
+#   /stream   h264  1280x720 @25   (main)
+#   /stream1  h265   720x576 @25   (sub)
+#
+# CAM 2 — second camera at 192.168.1.101. Assumed to be the same model, so the
+#   same paths. Confirm before trusting it — this camera family answers 200 OK
+#   to DESCRIBE on paths that serve nothing, so only pulling video proves it:
+#     ffprobe -v error -rtsp_transport tcp -show_entries stream=codec_name,width,height \
+#             -of default=noprint_wrappers=1:nokey=1 rtsp://192.168.1.101:554/stream
+#   See "Finding the RTSP path" in the README for the loop over the usual paths.
+#
+# Both cameras hang off eth0 and each needs its own /32 host route:
+#     ./setup_camera_link.sh 192.168.1.103 192.168.1.101
+
+rtsp://192.168.1.103:554/stream
+rtsp://192.168.1.101:554/stream

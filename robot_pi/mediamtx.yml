@@ -1,0 +1,58 @@
+# MediaMTX config for the robot-side Raspberry Pi OS Lite (192.168.1.30).
+#
+# Deliberately minimal — MediaMTX rejects unknown/removed keys, and option names
+# have changed between releases, so everything not listed here stays at default
+# (RTSP on :8554, TCP+UDP both enabled).
+#
+# Install to /usr/local/etc/mediamtx.yml — see install_robot_streams.sh
+#
+# IMPORTANT — device paths:
+#   /dev/video0 and /dev/video2 are NOT stable across reboots or replug. Once the
+#   cameras are working, run:
+#       ls -l /dev/v4l/by-id/
+#   and replace the -i argument below with the persistent by-id path, e.g.
+#       -i /dev/v4l/by-id/usb-046d_C270_HD_WEBCAM_XXXX-video-index0
+#   Otherwise cam1 and cam2 can swap after a power cycle.
+
+logLevel: info
+
+paths:
+  cam1:
+    # runOnInit fires when MediaMTX starts and publishes ffmpeg's output into
+    # this path. runOnInitRestart brings it back if the camera drops out.
+    runOnInit: >
+      ffmpeg -nostdin -hide_banner -loglevel warning
+      -f v4l2 -input_format mjpeg -video_size 640x480 -framerate 30
+      -i /dev/video0
+      -c:v libx264 -preset ultrafast -tune zerolatency
+      -profile:v baseline -pix_fmt yuv420p -g 30 -b:v 1500k
+      -an -f rtsp -rtsp_transport tcp
+      rtsp://127.0.0.1:$RTSP_PORT/$MTX_PATH
+    runOnInitRestart: yes
+
+  cam2:
+    runOnInit: >
+      ffmpeg -nostdin -hide_banner -loglevel warning
+      -f v4l2 -input_format mjpeg -video_size 640x480 -framerate 30
+      -i /dev/video2
+      -c:v libx264 -preset ultrafast -tune zerolatency
+      -profile:v baseline -pix_fmt yuv420p -g 30 -b:v 1500k
+      -an -f rtsp -rtsp_transport tcp
+      rtsp://127.0.0.1:$RTSP_PORT/$MTX_PATH
+    runOnInitRestart: yes
+
+# Encoder notes
+# -------------
+# -input_format mjpeg : most UVC webcams only reach 30fps at 640x480+ in MJPEG.
+#                       If a camera refuses to open, drop this line (falls back
+#                       to raw YUYV, usually capped at 10-15fps) or check
+#                       `v4l2-ctl -d /dev/video0 --list-formats-ext`.
+# -g 30               : keyframe every second, so the GUI shows picture within
+#                       ~1s of connecting instead of waiting for a random IDR.
+# libx264 ultrafast   : ~640x480@30 costs roughly one core on a Pi 4. If you are
+#                       CPU-bound, and the robot Pi is a Pi 4 or older, try the
+#                       hardware encoder:  -c:v h264_v4l2m2m -b:v 2M
+#                       (the Pi 5 has NO hardware H.264 encoder — keep libx264.)
+# Raising resolution  : bump -video_size to 1280x720 and -b:v to 3000k, but test
+#                       CPU on the robot Pi and decode headroom on the ground
+#                       station before committing.

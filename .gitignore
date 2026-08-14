@@ -1,0 +1,15 @@
+# Byte-compiled
+__pycache__/
+*.pyc
+*.pyo
+
+# The hand-rolled snapshots git replaces. Kept ignored rather than deleted so
+# an old .bak lying around never silently becomes a tracked file.
+*.bak
+*.bak-*
+*.orig
+
+# Local tool + OS noise
+.claude/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,41 @@
+# MediaMTX config that serves two SYNTHETIC RTSP streams - no cameras needed.
+#
+# Purpose: prove the whole decode-and-display path (RTSP -> GStreamer -> OpenCV
+# -> Qt panel) works before any real camera exists. Both sources are animated,
+# so a frozen picture is obviously distinguishable from a live one.
+#
+#   cam1 -> testsrc   (colour bars + moving bar + running timer)
+#   cam2 -> testsrc2  (different pattern, also animated)
+#
+# Install to /usr/local/etc/mediamtx.yml. Swap in mediamtx.yml (the real one)
+# when the USB cameras are connected.
+#
+# Kept minimal on purpose: MediaMTX rejects unknown/removed config keys and the
+# names change between releases, so anything not set here stays at its default
+# (RTSP on :8554).
+
+logLevel: info
+
+paths:
+  cam1:
+    # 640x480@15 keeps CPU low - this Pi is encoding BOTH streams and decoding
+    # them back AND running the GUI, all on the same four cores.
+    # -g 15 = keyframe every second, so a client sees picture within ~1s.
+    runOnInit: >
+      ffmpeg -nostdin -hide_banner -loglevel warning
+      -re -f lavfi -i testsrc=size=640x480:rate=15
+      -c:v libx264 -preset ultrafast -tune zerolatency
+      -profile:v baseline -pix_fmt yuv420p -g 15 -b:v 1000k
+      -an -f rtsp -rtsp_transport tcp
+      rtsp://127.0.0.1:8554/cam1
+    runOnInitRestart: yes
+
+  cam2:
+    runOnInit: >
+      ffmpeg -nostdin -hide_banner -loglevel warning
+      -re -f lavfi -i testsrc2=size=640x480:rate=15
+      -c:v libx264 -preset ultrafast -tune zerolatency
+      -profile:v baseline -pix_fmt yuv420p -g 15 -b:v 1000k
+      -an -f rtsp -rtsp_transport tcp
+      rtsp://127.0.0.1:8554/cam2
+    runOnInitRestart: yes

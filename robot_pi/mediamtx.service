@@ -1,0 +1,17 @@
+[Unit]
+Description=MediaMTX RTSP server (robot cameras)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml
+Restart=always
+RestartSec=3
+# USB cameras need video group access; root is simplest for bring-up.
+User=root
+# Give the cameras a moment to enumerate after a cold boot.
+ExecStartPre=/bin/sleep 4
+
+[Install]
+WantedBy=multi-user.target
