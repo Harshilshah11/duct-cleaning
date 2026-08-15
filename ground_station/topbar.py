@@ -23,13 +23,17 @@ import os
 import time
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPixmap
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
 from recorder import hms
 
-MONO = "DejaVu Sans Mono"
 SANS = "DejaVu Sans"
+# The bar used to set its chips and clock in the terminal mono. Mono was really
+# only buying a clock that does not twitch as the digits change, and a fixed
+# width on that one label buys the same thing without making the whole bar look
+# like a console. Kept as a name so the clock rule below stays readable.
+MONO = SANS
 
 # The bar is sized around the logo rather than the other way round: 42 + 6px of
 # air top and bottom. Those 16px over the original 38 come straight out of the
@@ -225,6 +229,11 @@ class TopBar(QWidget):
 
         self._clock_label = QLabel("--:--:--")
         self._clock_label.setObjectName("clock")
+        # Ticks once a second in a proportional face, so pin the width to its
+        # widest reading or the separator beside it steps sideways all day.
+        self._clock_label.setFixedWidth(
+            QFontMetrics(QFont(SANS, 9)).horizontalAdvance("00:00:00") + 18)
+        self._clock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         # --- layout ---------------------------------------------------------
         row = QHBoxLayout(self)

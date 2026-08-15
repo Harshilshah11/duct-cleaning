@@ -53,7 +53,11 @@ from inputs_panel import InputsPanel
 from splash import SplashScreen
 from uno_motors import MotorLink
 
-MONO = "DejaVu Sans Mono"
+SANS = "DejaVu Sans"
+# One typeface across the app. The panel headers and the NO SIGNAL placeholder
+# used the terminal mono; nothing here is tabular data, so it only ever read as
+# a console that had been given a logo.
+MONO = SANS
 
 # cv2, link, stream and topbar are NOT imported here — _load_video_stack() does
 # it once main() has the logo on the screen. cv2 alone is ~2s of import on a Pi 4
