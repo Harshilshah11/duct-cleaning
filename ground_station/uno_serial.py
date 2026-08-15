@@ -134,10 +134,11 @@ ACT_MAX_PWM = int(os.environ.get("UNO_ACT_MAX_PWM", "255"))
 def act_demand(state, pot_pct):
     """3-position actuator switch -> ONE signed demand.
 
-    ONLY THE SIGN REACHES THE HARDWARE NOW. The actuator lost its PWM pin to the
-    light on 2026-08-14 (D5), so uno_eth_link.ino drives ACT_DIR alone and reads
-    nothing from this value but its sign. The magnitude stays at full scale so
-    the field still means "-255..255" on the wire.
+    ONLY THE SIGN REACHES THE HARDWARE. The actuator lost its speed demand when
+    its PWM pin went to the light on 2026-08-14 (D5), so uno_eth_link.ino reads
+    nothing from this value but its sign -- positive extends, negative retracts,
+    zero cuts the enable. The magnitude stays at full scale so the field still
+    means "-255..255" on the wire.
 
     THE POT NO LONGER SETS ROD SPEED. It dims the light instead -- see
     light_demand() below. pot_pct is still accepted so callers need not change,
@@ -153,10 +154,12 @@ def act_demand(state, pot_pct):
     has failed, and the safe answer to a switch you cannot trust is not to guess
     which way it was travelling.
 
-    BUT 0 IS NO LONGER A STOP over the Ethernet link. With no enable pin the Uno
-    can only choose a direction, and it reads 0 as RETRACT. Returning 0 here now
-    means "retract", not "hold still" -- the rod cannot be held in software at
-    all. Give the driver a real enable line to get that back.
+    0 IS A GENUINE STOP AGAIN. The rod has a real enable line on the Uno (D4 as
+    of 2026-08-15, A2 before that), so 0 cuts the channel's power and the rod
+    holds position -- it no longer means "drive the other way". That is what
+    makes returning 0 for FAULT and for a stale sample the safe answer rather
+    than merely the least-bad one, and it is what lets the sketch's failsafe stop
+    the rod instead of running it into an end stop.
     """
     if state not in ("EXTEND", "RETRACT"):
         return 0

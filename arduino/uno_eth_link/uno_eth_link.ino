@@ -22,14 +22,16 @@
  * an older sender degrades to "wheels only, everything else stopped" rather
  * than to "everything else stuck at its last value".
  *
- * <act> is signed by the Pi: positive extends, negative retracts. ONLY THE SIGN
- * IS USED — this channel lost its PWM pin to the light on 2026-08-14 and now has
- * direction and nothing else, so 0 does NOT stop the rod, it retracts it. The
- * 3-position switch truth table (GPIO16/19, active-LOW) is decoded in
- * ground_station/inputs.py, NOT here:
+ * <act> is signed by the Pi: positive extends, negative retracts, and 0 STOPS.
+ * Only the sign is used — this channel has no speed demand, having lost the pot
+ * to the light on 2026-08-14 — but it does have an enable again on D4, so zero
+ * cuts power rather than picking the other direction. The 3-position switch
+ * truth table (GPIO16/19, active-LOW) is decoded in ground_station/inputs.py,
+ * NOT here:
  *     16=0 19=1 -> EXTEND     16=1 19=1 -> STOP     16=1 19=0 -> RETRACT
  * Both legs closed is a broken interlock; inputs.py calls that FAULT and
- * uno_motors.py sends 0. See applyActuator() for why that is no longer a stop.
+ * uno_motors.py sends 0, which is now a genuine stop — the safe answer to a
+ * switch you cannot trust.
  *
  * <brush> is a plain 0/1 from the panel's TOGGLE switch (Pi GPIO13, active-LOW
  * like every switch on that panel — closed reads as ON). The brush has no speed
@@ -58,15 +60,19 @@
  *
  *   channel 1 / LEFT    DIR1 = D9        PWM1 = D3    (Timer2)
  *   channel 2 / RIGHT   DIR2 = D8        PWM2 = D6    (Timer0)
- *   linear actuator     ACT_DIR = D2     (no PWM — direction only)
- *   brush motor         BRUSH = D7       (on/off)
+ *   linear actuator     ACT_DIR = D7     ACT_PWM = D4  (LOW extends! see below)
+ *   brush motor         BRUSH_DIR = D2   BRUSH_PWM = A1 (held 255, on/off)
  *   light               LIGHT_DIR = A0   LIGHT_PWM = D5 (Timer0)
  *
  * EVERY PIN IS NOW SPOKEN FOR. D0/D1 are the USB serial this telemetry goes out
- * on, D4 and D10-D13 belong to the shield, and all four of the Uno's usable PWM
- * pins (D3, D5, D6, D9) are allocated — D9 to a direction line, which is the one
+ * on, D10-D13 belong to the shield, and all four of the Uno's usable PWM pins
+ * (D3, D5, D6, D9) are allocated — D9 to a direction line, which is the one
  * place a PWM pin is still spendable if something else ever needs dimming.
- * A1-A5 remain as plain digital I/O.
+ * A1 is the brush's speed line, a static HIGH that needs no timer; A2-A5 are
+ * spare plain digital I/O since the rod's enable moved off A2 to D4.
+ *
+ * D4 IS THE SHIELD'S microSD CHIP SELECT AND THE ROD NOW OWNS IT — see the
+ * ACT_DIR/ACT_PWM block below. RUN THIS BOARD WITH THE microSD SLOT EMPTY.
  *
  * REWIRED 2026-08-14: D7 is freed and the old DIR1=D7 / PWM1=D9 / PWM2=D3 map
  * is gone. DIR1 took over D9 (a direction line only needs digitalWrite, so
@@ -112,9 +118,10 @@
  * stop within a third of a second.
  *
  * OTHER WIRING NOTES:
- *   - The shield's microSD slot shares SPI on pin 4. An unselected SD card
- *     holds MISO and the Ethernet chip never talks. setup() parks pin 4 HIGH to
- *     deselect it, which is why that line is there even with no card in.
+ *   - The shield's microSD slot shares SPI on pin 4, which the rod's RETRACT
+ *     line now owns. A card left in that slot fights the Ethernet chip for MISO
+ *     whenever the rod is stopped, which is most of the time; the slot must be
+ *     EMPTY. See the ACT_DIR/ACT_PWM block.
  *
  * The MAC below is locally administered (the 0x02 bit in the first byte) and
  * must be unique on your LAN. Newer shields ship with a real MAC on a sticker —
@@ -138,23 +145,109 @@ const uint8_t PWM1 = 3;    // channel 1 speed, Timer2  (~490 Hz)
 const uint8_t DIR2 = 8;    // channel 2 direction (RIGHT)
 const uint8_t PWM2 = 6;    // channel 2 speed, Timer0  (~980 Hz, see pin note)
 
-// --- Linear actuator: DIRECTION ONLY, no PWM (rewired 2026-08-14) ------------
+// --- Linear actuator: DIR + PWM, DIR on D7 (pinout corrected 2026-08-15) -----
 // Direction comes from the ground station's 3-position actuator switch
-// (GPIO16/19 on the Pi), decoded there and arriving as one signed number.
-// ONLY ITS SIGN IS USED NOW: > 0 extends, <= 0 retracts.
+// (GPIO16/19 on the Pi), decoded there and arriving as one signed number:
+// > 0 extends, < 0 retracts, 0 STOPS.
 //
-// D5 USED TO BE THIS CHANNEL'S PWM AND IS NOW THE LIGHT'S. That is a real loss
-// of capability, not a tidy-up: with no PWM/enable pin this channel has no speed
-// control and, more importantly, no OFF. See applyActuator() for what that costs
-// the failsafe before you run the rod near an end stop.
+// MEASURED ON THE RIG, and this is the authority — the levels below are the
+// ones the driver actually wants, not an inference from how the wheels work:
 //
-// D2 is a plain digital pin — it was chosen over the originally proposed D13
-// because D13 is the SPI CLOCK the W5100 shield uses. The SPI peripheral drives
-// SCK during every packet, so a direction line there would be pulsed by the
-// Ethernet traffic itself and would corrupt the link at the same time.
-const uint8_t ACT_DIR = 2;
+//     level 1 / EXTEND    D7 = LOW    D4 = HIGH
+//     middle  / STOP      D7 = held   D4 = LOW    -> rod holds position
+//     level 3 / RETRACT   D7 = HIGH   D4 = HIGH
+//
+// EXTEND IS DIR **LOW**. Every other direction line on this board (the wheels,
+// the brush) treats HIGH as forward, so the natural assumption is wrong here and
+// applyMotor()'s convention must not be copied onto this channel. That is why
+// the two levels are named constants below instead of a bare ternary.
+//
+// D4 IS THE ONLY THING THAT GATES THE ROD. D7 selects a direction but does not
+// start or stop anything, so STOP is D4 LOW with D7 left wherever it was — which
+// is what "hold that position" means, and why applyActuator() deliberately does
+// not touch the direction line on a stop.
+//
+// THE DIRECTION LINE IS D7, NOT D2. It was on D2 until this was measured, and D2
+// is now free. D7's previous owner was BRUSH_DIR — see the brush block below,
+// because that pin cannot serve both and the brush had to move.
+//
+// Neither pin has a timer behind it, which costs nothing: this channel lost its
+// speed demand when the pot moved to the light, so the only levels it ever needs
+// are full-scale and off, and a static HIGH is 255/255 duty. The middle stage,
+// if it is ever wanted again, is synthesised on D4 — see serviceActuatorPwm().
+//
+// ---------------------------------------------------------------------------
+// D4 IS THE SHIELD'S microSD CHIP SELECT. RUN WITH THE SLOT EMPTY.
+// ---------------------------------------------------------------------------
+// The rod's second line moved A2 -> D4 on 2026-08-15 to match the wiring on the
+// rig. D4 is electrically fine as an output, but it is shared with the microSD
+// socket on every W5100/W5500 shield, and that has two consequences worth
+// knowing before you chase a ghost:
+//
+//   1. WITH A CARD IN THE SLOT THIS LINK WILL DIE. CS is active-LOW, so the
+//      rod's STOP level (D4 LOW) SELECTS the card — and stopped is what the rod
+//      is most of the time. A selected card drives MISO during the SPI reads
+//      this sketch makes to the W5100 on every pass of loop(), which corrupts
+//      them. The symptom is an Ethernet link that works while the rod is moving
+//      and dies when it stops, which reads as a power or wiring fault and is
+//      neither. There is no software fix from here: one pin cannot be both a
+//      chip select and a motor gate. Empty slot, or move this line to A2-A5.
+//
+//   2. setup() USED TO PARK D4 HIGH to deselect that card, AND THAT WAS THE BUG
+//      THAT KEPT THE ROD RUNNING. That park is now gone — see setup(). Together
+//      with D7 being held HIGH as the brush's direction line, it meant the rod
+//      saw "retract, at full scale" from the moment the Uno left reset, forever,
+//      no matter what the panel switch said. Two pins that nothing thought of as
+//      the actuator's added up to a permanent retract command.
+//
+// If a card ever has to go in that slot, A2 is free and is a drop-in replacement
+// — change the one constant below and nothing else, because this channel is
+// driven by digitalWrite/soft-PWM and needs no timer.
+const uint8_t ACT_DIR = 7;   // "Dir" on the rig — LOW extends, HIGH retracts
+const uint8_t ACT_PWM = 4;   // "Pwm" on the rig — the only line that gates it
 
-// Flip if EXTEND on the panel drives the rod the wrong way.
+// Spelled out because this channel is the ODD ONE OUT: LOW is forward here and
+// HIGH is forward everywhere else on the board. Swap these two if the rod
+// travels the wrong way — it is a one-line change and needs no other edit.
+const int ACT_LEVEL_EXTEND = LOW;
+const int ACT_LEVEL_RETRACT = HIGH;
+
+// THREE STAGES: the panel's 3-position switch selects 0% / 50% / 100% duty.
+//
+//     STOP    -> ACT_DUTY_STOP     (0)    rod holds position
+//     RETRACT -> ACT_DUTY_RETRACT  (128)  50%
+//     EXTEND  -> ACT_DUTY_EXTEND   (255)  100%
+//
+// Swap the two non-zero values if you want the fast stage on the other throw;
+// they are named so that is a one-line change and not an arithmetic puzzle.
+// RETRACT RAISED 128 -> 255 on 2026-08-14. At 128 the rod moved on the extend
+// throw and did nothing at all on the retract throw, which is the signature of a
+// stage that cannot break away rather than one that is wired wrong: 50% duty is
+// about where a loaded actuator stalls, and lifting against gravity is the
+// direction that runs out of torque first. Put it back to 128 if you want the
+// slow stage, but only once the rod is known to travel BOTH ways at full scale.
+const int ACT_DUTY_STOP = 0;
+const int ACT_DUTY_RETRACT = 255;
+const int ACT_DUTY_EXTEND = 255;
+
+// NEITHER LINE IS A TIMER PIN, so the 50% stage is generated in software by
+// serviceActuatorPwm() below, on whichever line is the active one. 0% and 100%
+// still resolve to a plain static level and cost nothing; only the middle stage
+// is synthesised.
+//
+// 250 Hz. Slow enough that the main loop — which spends most of its time in an
+// SPI read of the W5100 — can hit each edge closely enough, fast enough that the
+// rod sees a smooth average rather than steps. A linear actuator is mechanically
+// far too slow to care about ripple at this rate.
+const unsigned long ACT_PWM_PERIOD_US = 4000;
+
+// The duty currently demanded on D4, 0..255. Written by applyActuator(), acted
+// on by serviceActuatorPwm() every pass of loop().
+int actDuty = 0;
+
+// Flip if EXTEND on the panel drives the rod the wrong way. Equivalent to
+// swapping ACT_LEVEL_EXTEND/ACT_LEVEL_RETRACT; use whichever reads better to
+// you, but do not do both — they cancel.
 const bool INVERT_ACT = false;
 
 // --- Panel light: dimmable, added 2026-08-14 ---------------------------------
@@ -170,18 +263,47 @@ const bool INVERT_ACT = false;
 const uint8_t LIGHT_DIR = A0;
 const uint8_t LIGHT_PWM = 5;   // Timer0 (~980 Hz) — same 0-duty caveat as D6
 
-// --- Brush motor: single-pin on/off, added 2026-08-14 ------------------------
-// Driven straight from the panel's TOGGLE switch (Pi GPIO13). One line only —
-// a relay/MOSFET module, or a driver with its enable jumpered high — so there
-// is no speed control here, which is all a 2-position toggle can express
-// anyway. This is why the brush gets no PWM pin: by the time it was added the
-// Uno had NONE left (3 and 6 are the drive motors, 5 the actuator, 9 is DIR1,
-// 10/11 belong to the shield's SPI).
-const uint8_t BRUSH_PIN = 7;
+// --- Brush motor: DIR + PWM on a driver channel (rewired 2026-08-14) ---------
+// Driven from the panel's TOGGLE switch (Pi GPIO13).
+//
+// THIS WAS ONE PIN AND THAT IS WHY IT DID NOT WORK. The brush hangs off a
+// dual-channel driver channel, exactly like the wheels, so it needs BOTH inputs:
+// a direction line AND a speed line. Driving D7 alone set the direction of a
+// channel whose PWM input was never asserted, so the bridge stayed off and the
+// motor never turned — while the telemetry cheerfully reported BRUSH=ON, because
+// the sketch really was driving the one pin it knew about.
+//
+// There is still no speed control, which is all a 2-position toggle can express,
+// so the speed line is simply held at full scale whenever the brush runs.
+//
+// THAT IS WHY BRUSH_PWM CAN LIVE ON A1, a pin with no timer behind it: 255/255
+// duty IS a static HIGH. analogWrite(pin, 255) on an AVR resolves to exactly
+// that, so a hardware PWM channel would buy nothing here — which is fortunate,
+// because there were none left (3 and 6 are the wheels, 5 the light, 9 is DIR1,
+// 10-13 belong to the shield's SPI).
+// MOVED D7 -> D2 ON 2026-08-15, AND THIS WAS NOT A TIDY-UP. D7 is the linear
+// actuator's direction line on the rig, and this sketch was holding it HIGH
+// permanently as the brush's direction — a constant, written on every frame.
+// HIGH on that pin means RETRACT, so between this and the SD-deselect park on
+// D4 the rod was handed a full-scale retract command from reset onwards, by two
+// lines neither of which anyone thought of as the actuator's. That is the whole
+// explanation for a rod that only ever drove one way and never stopped.
+//
+// D2 IS CONFIRMED AGAINST THE RIG (Harshil, 2026-08-15): brush is Dir -> D2,
+// Pwm -> A1, driven from the panel TOGGLE on Pi GPIO13. This is not an inference
+// from D7 having been taken — the wire really is on D2, and the sketch was the
+// thing that was wrong.
+const uint8_t BRUSH_DIR = 2;
+const uint8_t BRUSH_PWM = A1;
 
-// Many relay boards are ACTIVE-LOW — the coil pulls in when the pin goes low,
-// and such a board will run the brush the whole time the Uno is in reset if
-// this is wrong. Set false for those.
+// The brush spins one way only, so its direction is a constant rather than a
+// demand. Flip this if the brush runs backwards.
+const bool BRUSH_DIR_LEVEL = HIGH;
+
+// Many driver and relay inputs are ACTIVE-LOW — the channel enables when the pin
+// goes low, and such a board will run the brush the whole time the Uno is in
+// reset if this is wrong. Set false for those. Applies to BRUSH_PWM, the line
+// that actually gates the motor.
 const bool BRUSH_ACTIVE_HIGH = true;
 
 // Flip either of these if a wheel spins the wrong way. Doing it here is much
@@ -201,6 +323,24 @@ const unsigned long FAILSAFE_MS = 300;
 // Below this the motor buzzes and heats without turning, so treat it as zero.
 const int DEADBAND = 12;
 const int MAX_PWM = 255;
+
+// The smallest duty that actually TURNS a loaded wheel. Between DEADBAND and
+// roughly a third of full duty these gearmotors only buzz: the bridge is
+// switching, but the average voltage never breaks static friction, so a
+// half-deflected stick makes heat instead of motion.
+//
+// Any surviving non-zero demand is therefore stretched onto MIN_DUTY..MAX_PWM
+// instead of 1..MAX_PWM, so the first millimetre of stick travel already drives.
+//
+// Zero stays exactly zero. This raises the smallest MOVING demand; it must never
+// turn a stop into a crawl. DEADBAND decides what counts as a stop and must stay
+// BELOW this value — DEADBAND zeroes the small demands first, and only what
+// survives is lifted to MIN_DUTY.
+//
+// Set to 0 to disable the floor entirely and go back to a linear 0..255 map.
+// Raise it if the robot still stalls on carpet, lower it if it lurches the
+// moment the stick leaves centre. 90/255 is about 35%.
+const int MIN_DUTY = 90;
 
 // --- Buffers -----------------------------------------------------------------
 // NOT UDP_TX_PACKET_MAX_SIZE. That constant is 24 bytes in the stock library and
@@ -255,33 +395,95 @@ void applyMotor(uint8_t dirPin, uint8_t pwmPin, int demand, bool invert) {
     // pin-map note at the top.
     digitalWrite(pwmPin, LOW);
   } else {
+    if (MIN_DUTY > 0) {
+      // Stretch 1..MAX_PWM onto MIN_DUTY..MAX_PWM so the slowest demand the
+      // stick can express is still one the motor can act on. Done here rather
+      // than on the Pi so it covers EVERY sender — the UDP link, uno_serial.py
+      // and any bench tool alike — and so two of them cannot apply it twice.
+      //
+      // The multiply is promoted to long deliberately: 254 * 165 is 41910, which
+      // overflows the Uno's 16-bit int and would wrap to a negative duty, i.e. a
+      // wheel that runs backwards near full stick.
+      duty = MIN_DUTY
+             + (int)(((long)(duty - 1) * (MAX_PWM - MIN_DUTY)) / (MAX_PWM - 1));
+    }
     analogWrite(pwmPin, duty);
   }
 }
 
 /* Brush motor: on or off, nothing in between. Any non-zero demand means ON, so
  * the Pi can send a plain 0/1 and this still behaves if someone later sends a
- * speed there by mistake. */
+ * speed there by mistake.
+ *
+ * Both lines are written every call, not just the one that changed. The
+ * direction is a constant, but writing it here means a channel that browns out
+ * and comes back gets its direction restored by the next frame rather than
+ * running whichever way its input floated to. */
 void applyBrush(int on) {
   bool run = (on != 0);
-  digitalWrite(BRUSH_PIN, (run == BRUSH_ACTIVE_HIGH) ? HIGH : LOW);
+  // Direction before speed, the same ordering rule applyMotor() follows: setting
+  // the gate first would spend a moment driving the old direction at full duty.
+  digitalWrite(BRUSH_DIR, BRUSH_DIR_LEVEL);
+  // Full scale or nothing. A static HIGH is 255/255 duty — see BRUSH_PWM above.
+  digitalWrite(BRUSH_PWM, (run == BRUSH_ACTIVE_HIGH) ? HIGH : LOW);
 }
 
-/* Linear actuator: DIRECTION ONLY. Sign is the whole signal — >0 extends, <=0
- * retracts — because D5, this channel's old PWM pin, now dims the light.
+/* Linear actuator: D7 picks the direction, D4 gates it, zero holds position.
  *
- * READ THIS BEFORE TRUSTING THE FAILSAFE. With no PWM or enable line, a demand
- * of 0 cannot mean "hold still"; it can only mean "drive the other way". This
- * pin picks a direction and nothing in this sketch can cut the rod's power.
- * safeState() parks D2 LOW, which brings the rod to rest ONLY if the driver's
- * enable is tied to something that dies with it. If that enable is jumpered
- * permanently high, the rod keeps travelling after a tether failure until it
- * hits its end stop, and no change here can prevent that. Wire the driver a real
- * enable line if the rod must be able to stop.
+ * ZERO IS A REAL STOP. D4 is what powers the channel, so dropping it low leaves
+ * the rod exactly where it is — which is what the panel's middle throw means and
+ * what the failsafe needs. It is not a brake and not a reversal; the rod simply
+ * stops being driven.
+ *
+ * THE DIRECTION LINE IS DELIBERATELY NOT TOUCHED ON A STOP. Re-pointing it at a
+ * rod that is no longer powered buys nothing, and holding the last direction
+ * means a resumed command carries on the way it was already going. It also
+ * keeps STOP to a single write on the one pin that matters.
  */
 void applyActuator(int demand, bool invert) {
   if (invert) demand = -demand;
-  digitalWrite(ACT_DIR, demand > 0 ? HIGH : LOW);
+  if (demand == 0) {
+    actDuty = ACT_DUTY_STOP;
+    digitalWrite(ACT_PWM, LOW);
+    return;
+  }
+  // Direction BEFORE the gate, the same ordering rule applyMotor() follows: the
+  // other order spends a few microseconds driving the old direction at full
+  // scale, which is a current spike through the bridge on every reversal.
+  //
+  // ACT_LEVEL_* rather than a bare HIGH/LOW because this channel extends on LOW
+  // while every other direction line here goes forward on HIGH.
+  digitalWrite(ACT_DIR, demand > 0 ? ACT_LEVEL_EXTEND : ACT_LEVEL_RETRACT);
+  // Only the SIGN chooses the stage. The Pi sends full scale either way, so
+  // reading a magnitude here would just be reading a constant — and the whole
+  // point of the three stages is that the switch position picks the speed.
+  actDuty = demand > 0 ? ACT_DUTY_EXTEND : ACT_DUTY_RETRACT;
+}
+
+/* Software PWM for the rod, because D4 has no timer. Called every pass of
+ * loop(), which is what makes it work at all: the loop is short and the only
+ * thing that can stall it for long is a Serial.print, so the edges land close
+ * enough for a mechanism this slow.
+ *
+ * 0 and 255 short-circuit to a static level. That matters for more than speed:
+ * a stopped rod must be held LOW by something that cannot be caught mid-cycle,
+ * and a full-speed rod should not be chopped by a software timer that a blocked
+ * loop could freeze in the low half. Only the middle stage is synthesised, and
+ * a stall there costs a slower rod, never a runaway one. */
+void serviceActuatorPwm() {
+  if (actDuty <= ACT_DUTY_STOP) {
+    digitalWrite(ACT_PWM, LOW);
+    return;
+  }
+  if (actDuty >= MAX_PWM) {
+    digitalWrite(ACT_PWM, HIGH);
+    return;
+  }
+  // micros() wraps about every 71 minutes; the modulo makes that a single
+  // short cycle, not a stuck output, so it is left unhandled deliberately.
+  unsigned long phase = micros() % ACT_PWM_PERIOD_US;
+  unsigned long onFor = (ACT_PWM_PERIOD_US * (unsigned long)actDuty) / MAX_PWM;
+  digitalWrite(ACT_PWM, phase < onFor ? HIGH : LOW);
 }
 
 /* Panel light: brightness 0..255, straight off the potentiometer.
@@ -320,11 +522,11 @@ void safeState() {
   digitalWrite(PWM2, LOW);
   digitalWrite(DIR1, LOW);
   digitalWrite(DIR2, LOW);
-  // The actuator is parked, not stopped — D2 is a direction line and this
-  // channel has no enable pin since D5 became the light. Read applyActuator()
-  // before assuming this brings the rod to rest; on a driver whose enable is
-  // jumpered high, it does not.
-  digitalWrite(ACT_DIR, LOW);
+  // The rod is genuinely STOPPED, not merely pointed somewhere: applyActuator(0)
+  // drops BOTH drive lines, which is this driver's off state. Before the channel
+  // was rewired as a pair a failsafe could only pick a direction, and the rod ran
+  // to its end stop.
+  applyActuator(0, INVERT_ACT);
   // Brush off too — via applyBrush so an active-LOW module gets the right
   // level. A spinning brush is the loudest thing on the robot; it must not be
   // what survives a failsafe.
@@ -372,20 +574,30 @@ void setup() {
   digitalWrite(DIR2, LOW);
   digitalWrite(PWM1, LOW);
   digitalWrite(PWM2, LOW);
-  digitalWrite(ACT_DIR, LOW);
+  // BOTH rod lines must be at their stopped level before they become outputs —
+  // the same reasoning as the brush's A1 below. This is also what replaced the
+  // old "park pin 4 HIGH to deselect the SD card" line: HIGH on D4 is the rod's
+  // RETRACT drive, and that park is why the rod ran from reset forever.
+  digitalWrite(ACT_DIR, ACT_LEVEL_EXTEND);
+  digitalWrite(ACT_PWM, LOW);
   digitalWrite(LIGHT_DIR, LOW);
   digitalWrite(LIGHT_PWM, LOW);
   // The brush's OFF level is written BEFORE pinMode, and on an active-LOW
   // module that level is HIGH. Writing it first switches on the input pull-up,
   // which holds the module off across the gap; leaving the pin floating there
   // is exactly how a relay board ends up running the brush during reset.
-  digitalWrite(BRUSH_PIN, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
-  pinMode(BRUSH_PIN, OUTPUT);
+  // Only BRUSH_PWM gates the motor, so it is the one that must be safe here —
+  // the direction line can settle whenever.
+  digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
+  digitalWrite(BRUSH_DIR, BRUSH_DIR_LEVEL);
+  pinMode(BRUSH_PWM, OUTPUT);
+  pinMode(BRUSH_DIR, OUTPUT);
   pinMode(DIR1, OUTPUT);
   pinMode(DIR2, OUTPUT);
   pinMode(PWM1, OUTPUT);
   pinMode(PWM2, OUTPUT);
   pinMode(ACT_DIR, OUTPUT);
+  pinMode(ACT_PWM, OUTPUT);
   // A0 as a digital output. pinMode(A0, OUTPUT) is the whole ceremony — nothing
   // else is needed to stop it being an ADC input.
   pinMode(LIGHT_DIR, OUTPUT);
@@ -397,9 +609,17 @@ void setup() {
   pinMode(STATUS_LED, OUTPUT);
   safeState();
 
-  // Deselect the shield's SD card before Ethernet.begin() touches the bus.
-  pinMode(4, OUTPUT);
-  digitalWrite(4, HIGH);
+  // NO SD DESELECT HERE ANY MORE, AND THIS WAS HALF THE BUG. Pin 4 is the rod's
+  // gate (ACT_PWM), and the old pinMode(4, OUTPUT)/digitalWrite(4, HIGH) pair
+  // asserted it at every reset and never lowered it again — nothing else in the
+  // sketch touched pin 4. The other half was D7, held HIGH as the brush's
+  // direction, which on the rod's driver means RETRACT. Full-scale retract,
+  // latched from reset, from two pins neither of which was thought of as the
+  // actuator's. Neither line looked wrong on its own.
+  //
+  // With the slot empty there is no card to deselect, so the line is simply
+  // gone; safeState() above has already left D4 LOW. See the ACT_DIR/ACT_PWM
+  // block.
 
   // Static IP — no DHCP. Ethernet.begin(mac, ip) cannot fail or block, unlike
   // the DHCP form which stalls ~60 s when no server answers. On a point-to-point
@@ -420,8 +640,30 @@ void setup() {
   Serial.print(F(":"));
   Serial.println(LISTEN_PORT);
   Serial.println(F("DIR1=D9 PWM1=D3 (left)  DIR2=D8 PWM2=D6 (right)"));
-  Serial.println(F("ACT_DIR=D2 (linear actuator, DIRECTION ONLY - no stop)"));
-  Serial.println(F("BRUSH=D7 on/off (panel TOGGLE, Pi GPIO13)"));
+  // Printed because a silently stale board is the expensive failure here: the
+  // link ACKs and the pins look right whatever build is loaded, so every value
+  // that changes behaviour belongs in the banner where a reset reveals it.
+  Serial.print(F("deadband<"));
+  Serial.print(DEADBAND);
+  Serial.print(F(", non-zero demand scaled to "));
+  Serial.print(MIN_DUTY);
+  Serial.print(F(".."));
+  Serial.println(MAX_PWM);
+  // Printed as the truth table rather than as two pin numbers, because the bug
+  // this channel spent a day on was a WIRING SCHEME misread, not a wrong pin:
+  // both pin numbers were right the whole time. A banner that says only
+  // "ACT=D2/D4" would have looked correct on the broken build too.
+  Serial.println(F("ACT_DIR=D7 ACT_PWM=D4 - LOW on D7 EXTENDS (opposite the wheels)"));
+  Serial.print(F("  soft-PWM stages 0/"));
+  Serial.print(ACT_DUTY_RETRACT);
+  Serial.print(F("/"));
+  Serial.print(ACT_DUTY_EXTEND);
+  Serial.println(F(" (stop/retract/extend)"));
+  // Loud, and in the banner rather than a comment, because the failure it warns
+  // about looks like a flaky cable: with a card in the slot the link dies except
+  // while retracting. A reset is the one moment someone is watching.
+  Serial.println(F("  ^ D4 is the shield's SD chip select - RUN WITH THE SLOT EMPTY"));
+  Serial.println(F("BRUSH_DIR=D2 BRUSH_PWM=A1 held 255 (TOGGLE, Pi GPIO13)"));
   Serial.println(F("LIGHT_DIR=A0 LIGHT_PWM=D5 (pot-dimmed, 0-255)"));
   Serial.print(F("failsafe after "));
   Serial.print(FAILSAFE_MS);
@@ -429,6 +671,11 @@ void setup() {
 }
 
 void loop() {
+  // First thing every pass, and again after the packet work below: the rod's
+  // 50% stage is synthesised here, so the more often this runs the cleaner its
+  // duty. Everything else in this loop is either instant or rate-limited.
+  serviceActuatorPwm();
+
   int size = udp.parsePacket();
   if (size > 0) {
     int n = udp.read(packet, RX_BUFFER - 1);

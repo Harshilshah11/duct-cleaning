@@ -261,9 +261,81 @@ def _test():
     return 0 if s["acked"] else 1
 
 
+def _act_test(hold_s):
+    """Drive the ROD ONLY, with the panel switch out of the loop.
+
+    THIS EXISTS TO SPLIT ONE QUESTION INTO TWO. "The switch reads EXTEND but the
+    rod does not move" has two halves -- does the demand reach the Uno's pins,
+    and does the driver act on them -- and watching the panel cannot separate
+    them. This drives act_demand() directly, so GPIO16/19, the ADC and the UI are
+    all bypassed: whatever happens here is the Uno and everything downstream of
+    it, nothing else.
+
+    Probe D7 and D4 against the Uno's GND with a multimeter while each stage
+    holds. The table printed below is what a correctly flashed board produces.
+    D4 is the gate -- it is what makes the rod move at all -- and D7 only picks
+    which way. So:
+
+      * D4 never goes high  -> the board is not running this build. Check the
+        reset banner says ACT_DIR=D7 ACT_PWM=D4.
+      * D4 HIGH the whole time, including on STOP -> the board is running an OLD
+        build that parks pin 4 high to deselect the shield's SD card. That park
+        is what drove the rod continuously; it is gone from the current sketch.
+      * D7 never changes -> an old build is still driving D7 as BRUSH_DIR, which
+        it held HIGH forever. HIGH is retract, which is why the rod only ever
+        went one way.
+      * both pins correct, rod still dead -> the Uno has done its job. The fault
+        is the driver, its motor supply, or the rod's own wiring.
+      * link drops when the rod stops -> a microSD card is in the shield's slot.
+        D4 is its chip select and STOP (D4 low) selects it. Pull the card.
+    """
+    print("ROD FREE TO MOVE, both end stops clear. Ctrl-C to abort.\n")
+    print("  probe D7 (Dir) and D4 (Pwm) against GND:")
+    print("    EXTEND   D7 = LOW    D4 = HIGH")
+    print("    STOP     D7 = held   D4 = LOW    <- rod holds position")
+    print("    RETRACT  D7 = HIGH   D4 = HIGH")
+    print("  NOTE D7 LOW extends -- this channel is the opposite of the wheels.\n")
+
+    link = MotorLink()
+    link.start()
+    time.sleep(1.0)
+    try:
+        # STOP between the throws, not just at the end: the interesting failure
+        # is a rod that extends and will not retract, and running the two throws
+        # back to back would hide it behind the reversal.
+        for state in ("EXTEND", "STOP", "RETRACT", "STOP"):
+            print(f"  {state:8} -> act={act_demand(state, None):+d}")
+            deadline = time.monotonic() + hold_s
+            while time.monotonic() < deadline:
+                # Pushed continuously because the run loop ages this sample on
+                # its own clock -- stop feeding it and the rod stops, which is
+                # the same failsafe the panel relies on.
+                link.set_actuator(state, None)
+                time.sleep(0.05)
+    except KeyboardInterrupt:
+        print("\naborted")
+    finally:
+        link.stop()
+        time.sleep(0.3)
+    s = link.latest()
+    print(f"\nsent={s['sent']} acked={s['acked']} loss={s['loss_pct']:.1f}%")
+    if not s["acked"]:
+        print("NOTHING ACKED - the rod was never the problem; fix the link first"
+              " (python3 uno_motors.py --status)")
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="joystick -> Uno motor link")
     ap.add_argument("--status", action="store_true", help="prove the Uno answers")
     ap.add_argument("--test", action="store_true", help="drive each direction")
+    ap.add_argument("--act", action="store_true",
+                    help="drive the linear actuator only, panel switch bypassed")
+    ap.add_argument("--hold", type=float, default=3.0, metavar="SEC",
+                    help="seconds per stage for --act, default 3 (long enough "
+                         "to get a meter on the pin)")
     args = ap.parse_args()
+    if args.act:
+        sys.exit(_act_test(args.hold))
     sys.exit(_test() if args.test else _status())
