@@ -294,7 +294,14 @@ class TopBar(QWidget):
 
         state = status.get("state") or "STOPPED"
         held = hms(status.get("elapsed"))
-        if state == "RECORDING":
+        left = status.get("pending_left")
+        if left is not None:
+            # The recording is about to be deleted. This is the one chip state
+            # that is a question rather than a report, so it blinks and counts -
+            # a still chip would read as just another thing that is fine.
+            lit = int(time.monotonic() * 2.8) % 2 == 0
+            self._rec_pill.set(f"SAVE?  {left:.0f}s", "warn", "●" if lit else "○")
+        elif state == "RECORDING":
             # Blink at ~1.4Hz off the wall clock, so a busy Pi slows the frame
             # rate without slowing the blink. Matches inputs_panel.SessionView.
             lit = int(time.monotonic() * 2.8) % 2 == 0

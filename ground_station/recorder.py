@@ -65,6 +65,12 @@ def _load_cv2():
 # three state strings rather than a second set that can drift.
 from inputs import PAUSED, RECORDING, STOPPED
 
+# A fourth state that no switch produces: the window after STOP in which the
+# recording exists on disk but has not been claimed. It lives here rather than
+# in inputs.py precisely because it is not a switch position - it is what the
+# recorder is doing while it waits to be told whether the run was worth keeping.
+PENDING = "SAVE?"
+
 
 def _stamp(when=None):
     return (when or datetime.now()).strftime("%Y%m%d-%H%M%S")
@@ -107,7 +113,11 @@ class CameraRecorder(threading.Thread):
         self.slug = slug
 
         self._lock = threading.Lock()
-        self._stop = threading.Event()
+        # NOT self._stop: threading.Thread already has a private _stop() that
+        # Thread.join() calls to reap a finished thread, so an Event of that
+        # name shadows it and join() dies with "'Event' object is not callable".
+        # It only shows up at shutdown, which is the worst place to find it.
+        self._stopping = threading.Event()
         self._writer = None
         self._size = None            # (w, h) the open writer was built for
         self._path = None
@@ -140,6 +150,11 @@ class CameraRecorder(threading.Thread):
         with self._lock:
             self._rolling = bool(rolling)
 
+    def idle(self):
+        """True when no file is open, so its clips are safe to move or delete."""
+        with self._lock:
+            return self._writer is None and not self._close
+
     def status(self):
         with self._lock:
             return {
@@ -152,7 +167,7 @@ class CameraRecorder(threading.Thread):
             }
 
     def stop(self):
-        self._stop.set()
+        self._stopping.set()
 
     # -- internals ------------------------------------------------------------
 
@@ -210,15 +225,15 @@ class CameraRecorder(threading.Thread):
         checked_disk = 0.0
 
         try:
-            while not self._stop.is_set():
+            while not self._stopping.is_set():
                 next_tick += period
                 now = time.monotonic()
                 # A long stall (a reconnect storm, a busy Pi) must not turn into
                 # a burst of catch-up writes that all carry the same frame.
                 if next_tick < now:
                     next_tick = now
-                self._stop.wait(max(0.0, next_tick - now))
-                if self._stop.is_set():
+                self._stopping.wait(max(0.0, next_tick - now))
+                if self._stopping.is_set():
                     break
 
                 with self._lock:
@@ -259,7 +274,7 @@ class CameraRecorder(threading.Thread):
                     writer, size = self._open_writer(path, frame)
                     if writer is None:
                         # Do not spin retrying a broken encoder every tick.
-                        self._stop.wait(1.0)
+                        self._stopping.wait(1.0)
                         continue
                     self._writer, self._size = writer, size
                     with self._lock:
@@ -274,7 +289,7 @@ class CameraRecorder(threading.Thread):
                         self._release()
                         with self._lock:
                             self._error = f"disk full - {free:.0f} MB free"
-                        self._stop.wait(5.0)
+                        self._stopping.wait(5.0)
                         continue
 
                 try:
@@ -334,6 +349,12 @@ class SessionManager:
         self._toast = None          # (text, detail, monotonic_expiry)
         self._last_saves = None     # last save_presses count acted on
 
+        # Every file this session has handed to a recorder, so a discard can
+        # remove exactly what was written and nothing else - see _discard().
+        self._written = []
+        # The unclaimed recording, if any: see PENDING.
+        self._pending = None
+
     # -- clock ----------------------------------------------------------------
 
     def _elapsed(self):
@@ -368,6 +389,7 @@ class SessionManager:
         paths = self._clip_paths()
         for rec in self.recorders:
             rec.begin_clip(paths[rec.slug])
+        self._written.extend(paths.values())
         self._clip_rolled = 0.0
         self._clip_since = time.monotonic() if self.state == RECORDING else None
 
@@ -378,10 +400,17 @@ class SessionManager:
     # -- session --------------------------------------------------------------
 
     def _start(self):
+        # Anything still unclaimed loses its window here. Silence is a discard
+        # everywhere else in this flow, and a second run starting is a stronger
+        # signal than silence that the operator has moved on from the first.
+        if self._pending:
+            self._resolve_pending(keep=False, reason="superseded")
+
         self.session_started = datetime.now()
         self.session_dir = os.path.join(self.root, _stamp(self.session_started))
         os.makedirs(self.session_dir, exist_ok=True)
         self.clip = 0
+        self._written = []
         self._rolled = self._clip_rolled = 0.0
         self._roll_since = self._clip_since = None
         self._begin_clip()
@@ -392,11 +421,108 @@ class SessionManager:
         self._end_clip()
         for rec in self.recorders:
             rec.set_rolling(False)
-        if held >= 1.0:
-            self._toast_now("SAVED", f"{self.clip} clip{'s' if self.clip != 1 else ''}"
-                                     f"  {hms(held)}")
         self._roll_since = self._clip_since = None
-        self._discard_if_empty()
+
+        # Nothing worth asking about: no time on the clock, or the cameras never
+        # delivered a frame so there is no file to keep either way.
+        wrote = any(rec.status()["frames"] for rec in self.recorders)
+        if held < 1.0 or not wrote or config.RECORD_CONFIRM_S <= 0:
+            if held >= 1.0 and wrote:
+                self._toast_now("SAVED", f"{self._clip_word()}  {hms(held)}")
+            self._discard_if_empty()
+            return
+
+        # The recorder threads close their writers on their next tick, up to
+        # 1/RECORD_FPS later. The window is orders of magnitude longer than
+        # that, so the files are always complete before it can be resolved.
+        self._pending = {
+            "until": time.monotonic() + config.RECORD_CONFIRM_S,
+            "held": held,
+            "clips": self.clip,
+            "dir": self.session_dir,
+            "files": list(self._written),
+        }
+
+    def _clip_word(self, clips=None):
+        clips = self.clip if clips is None else clips
+        return f"{clips} clip{'s' if clips != 1 else ''}"
+
+    # -- the confirm window ----------------------------------------------------
+
+    def pending_left(self):
+        """Seconds remaining to claim the last recording, or None if not waiting."""
+        if not self._pending:
+            return None
+        return max(0.0, self._pending["until"] - time.monotonic())
+
+    def _resolve_pending(self, keep, reason=""):
+        pending, self._pending = self._pending, None
+        if not pending:
+            return
+        held, clips = pending["held"], pending["clips"]
+        if keep:
+            self._toast_now("SAVED", f"{self._clip_word(clips)}  {hms(held)}")
+            return
+
+        # The encoder threads close their writers on their own tick, so a
+        # discard fired the instant after STOP - which "superseded" is - can
+        # land while the file is still open. On Windows os.remove then raises
+        # and the delete silently does nothing; on Linux it unlinks a file the
+        # writer is still filling. Wait for them, briefly and boundedly.
+        self._await_closed()
+
+        # Remove exactly the files this session handed out, then the directory -
+        # os.remove per known path and a bare rmdir, never rmtree. A recursive
+        # delete pointed at a path built from a timestamp is one bad join away
+        # from taking something else with it, and this runs unattended.
+        failed = 0
+        for path in pending["files"]:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass                    # never opened - the camera was dead
+            except OSError:
+                failed += 1
+        try:
+            os.rmdir(pending["dir"])
+        except OSError:
+            pass
+        if pending["dir"] == self.session_dir:
+            self.session_dir = None
+
+        detail = f"{self._clip_word(clips)}  {hms(held)}"
+        if failed:
+            # Do not claim a discard that did not happen - the operator would
+            # walk away believing the card is clear when it is not.
+            self._toast_now("DISCARD FAILED",
+                            f"{failed} file{'s' if failed != 1 else ''} still on disk")
+        else:
+            self._toast_now("DISCARDED",
+                            f"{detail}  ({reason})" if reason else detail)
+
+    def _await_closed(self, timeout=1.5):
+        """Block until every encoder has released its file, or `timeout`.
+
+        Only ever called on a state transition, never per frame, and normally
+        returns at once - by the time a confirm window expires the writers have
+        been shut for fifteen seconds. The bound exists so a wedged encoder
+        thread cannot freeze the UI, not because waiting is expected.
+        """
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if all(rec.idle() for rec in self.recorders):
+                return True
+            time.sleep(0.02)
+        return False
+
+    def poll(self):
+        """Expire the confirm window. main.py calls this once per UI frame.
+
+        Deliberately not folded into status(): a getter that deletes files is a
+        getter nobody can call safely, including from a debugger.
+        """
+        if self._pending and time.monotonic() >= self._pending["until"]:
+            self._resolve_pending(keep=False, reason="not saved")
 
     def _discard_if_empty(self):
         """Remove the session directory if nothing was ever written into it.
@@ -440,13 +566,21 @@ class SessionManager:
             rec.set_rolling(state == RECORDING)
 
     def save_clip(self):
-        """The GPIO25 press: close this clip, open the next, confirm on screen.
+        """The GPIO25 press. It means two different things by design:
 
-        Deliberately does not stop the recording. The button exists so an
-        operator who just drove past something worth keeping can bank it without
-        interrupting the run - stopping to save would mean the next thing down
-        the duct goes unrecorded.
+        While rolling, it closes this clip and opens the next without stopping -
+        so an operator who just drove past something worth keeping can bank it
+        and let the run continue, rather than having to stop and lose whatever
+        comes next down the duct.
+
+        In the window after STOP, it claims the whole recording. Same button,
+        same meaning to the operator ("keep that"), so it needs no second
+        control and no explaining.
         """
+        if self._pending:
+            self._resolve_pending(keep=True)
+            return True
+
         if self.state == STOPPED or self.session_dir is None:
             self._toast_now("NOTHING TO SAVE", "not recording")
             return False
@@ -503,8 +637,14 @@ class SessionManager:
 
     def status(self):
         cams = [rec.status() for rec in self.recorders]
+        left = self.pending_left()
         return {
-            "state": self.state,
+            # PENDING outranks the switch state: the switch says STOPPED, but
+            # what the operator has to act on is the unanswered question.
+            "state": PENDING if left is not None else self.state,
+            "pending_left": left,
+            "pending_held": self._pending["held"] if self._pending else None,
+            "pending_clips": self._pending["clips"] if self._pending else None,
             "elapsed": self._elapsed(),
             "clip": self.clip,
             "clip_elapsed": self._clip_elapsed(),
@@ -520,6 +660,12 @@ class SessionManager:
     def stop(self):
         if self.state != STOPPED:
             self.set_state(STOPPED)
+        # Shutting the viewer down is not the operator declining to save - it is
+        # the window being cut short before they could answer. Keep it. The rule
+        # is "unclaimed footage is discarded", and footage nobody was given the
+        # chance to claim is not unclaimed.
+        if self._pending:
+            self._resolve_pending(keep=True)
         for rec in self.recorders:
             rec.stop()
         for rec in self.recorders:

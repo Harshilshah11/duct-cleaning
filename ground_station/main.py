@@ -418,6 +418,10 @@ class GroundStationWindow(QWidget):
         # than one frame stale.
         self.session.set_state(self._session_state(snapshot))
         self.session.on_save_button(snapshot.get("save_presses"))
+        # Expires the post-stop confirm window, which can delete the recording.
+        # After the save button, so a press landing on the last frame of the
+        # window is honoured rather than raced.
+        self.session.poll()
         status = self.session.status()
         self.inputs_panel.set_state(snapshot, status)
         self.topbar.set_recording(status)

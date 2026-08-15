@@ -171,3 +171,13 @@ RECORD_MAX_WIDTH = int(os.environ.get("RECORD_MAX_WIDTH", "0"))
 # just lose the recording - it takes X, the viewer and this SSH session with it,
 # which is a far worse failure than a truncated video.
 RECORD_MIN_FREE_MB = int(os.environ.get("RECORD_MIN_FREE_MB", "512"))
+
+# Seconds to hold a finished recording waiting for the SAVE button before
+# deleting it. Stopping does not keep the run any more - the operator has this
+# long to say the run was worth keeping, and silence means it was not.
+#
+# THIS DELETES VIDEO. It is the one setting here that can lose work, so it is
+# deliberately generous and deliberately loud in the UI: the strip counts the
+# window down and the SAVE pill pulses for the whole of it. Set
+# RECORD_CONFIRM_S=0 to go back to keeping everything automatically.
+RECORD_CONFIRM_S = float(os.environ.get("RECORD_CONFIRM_S", "15"))

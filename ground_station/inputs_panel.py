@@ -32,7 +32,9 @@ from __future__ import annotations
 import time
 
 from PySide6.QtCore import Qt, QRectF
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
+from PySide6.QtGui import (
+    QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen,
+)
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
 )
@@ -71,11 +73,12 @@ def font(points, bold=False):
 # screen. The floor is the joystick box plus its caption and readout - the one
 # element here that cannot be made shorter without making it useless.
 #
-# 177 is measured, not chosen: it is what the DRIVE block's sizeHint asks for.
+# 179 is measured, not chosen: it is what the DRIVE block's sizeHint asks for.
 # Guessing gave 162, which cost the joystick box its bottom edge and dropped the
 # x/y readout onto the block border - and a fixed height clips silently rather
-# than reporting anything. Re-measure it if anything in DRIVE grows.
-STRIP_HEIGHT = 177
+# than reporting anything. Re-measure it whenever anything in DRIVE grows, or
+# any block gains chrome: the 3px accent border alone moved it by 2.
+STRIP_HEIGHT = 179
 
 # --- palette -----------------------------------------------------------------
 # The top bar's colours, so the two light surfaces are the same light. Keep them
@@ -94,6 +97,15 @@ WARN = "#8a5a06"      # paused
 BAD = "#c02b26"       # fault / error
 REC = "#c0322b"       # recording
 
+# One accent per block, so the three groups are told apart by colour before the
+# titles are read - which is how you find the one you want without scanning.
+# TOOLS is teal rather than the obvious green: its brush pill goes green when
+# on, and a block whose chrome is the same green as its state makes the state
+# harder to spot, not easier.
+DRIVE_TONE = "#3f6fb5"      # brand blue
+TOOLS_TONE = "#0e7490"      # teal
+REC_TONE = "#c0322b"        # the recording red
+
 # state -> (text+border colour, fill). Tinted fills rather than saturated
 # blocks: on a light field the colour has to read against white, which is the
 # same rule topbar.py's chips follow.
@@ -106,17 +118,34 @@ TONES = {
     "none":  (MUTED, "#f0f3f9"),
 }
 
-# Session state -> (tone key, does the dot blink). Blinking is reserved for
-# RECORDING: it is the one state where being wrong about it costs the footage.
+# Session state -> (tone key, does the dot blink). Blinking is reserved for the
+# two states where being wrong about it costs the footage: RECORDING, and the
+# window in which the recording is about to be deleted for want of a button.
 SESSION_LOOK = {
     "RECORDING": ("rec", True),
     "PAUSED": ("pause", False),
+    "SAVE?": ("pause", True),
     "STOPPED": ("off", False),
 }
 
 # Per-control lit tone, keyed on the names in inputs.SWITCHES.
 PILL_TONE = {"START / STOP": "rec", "PAUSE / RESUME": "pause",
              "SAVE": "info", "BRUSH": "on"}
+
+
+def wash(colour, amount):
+    """Blend `colour` toward white. amount 0 = untouched, 1 = white.
+
+    QColor.lighter() raises the HSV value, which on a dark saturated hue does
+    not fade it - it turns it neon. The teal used by TOOLS came back as a bright
+    cyan that pulled the eye harder than the state it was framing. Interpolating
+    to white instead gives the same soft tint from any base hue, which is what a
+    tint is actually for.
+    """
+    c, w = QColor(colour), QColor("#ffffff")
+    mix = lambda a, b: round(a + (b - a) * amount)
+    return QColor(mix(c.red(), w.red()), mix(c.green(), w.green()),
+                  mix(c.blue(), w.blue()))
 
 
 def _sized(label, points, bold=False):
@@ -245,12 +274,12 @@ class JoystickView(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         box = QRectF(1, 1, self.width() - 2, self.height() - 2)
 
-        p.setPen(QPen(QColor(LINE), 1))
-        p.setBrush(QColor("#f7faff"))
+        p.setPen(QPen(wash(ACCENT, 0.60), 1))
+        p.setBrush(wash(ACCENT, 0.93))
         p.drawRoundedRect(box, 5, 5)
 
         cx, cy = box.center().x(), box.center().y()
-        p.setPen(QPen(QColor(TRACK), 1, Qt.DashLine))
+        p.setPen(QPen(wash(ACCENT, 0.72), 1, Qt.DashLine))
         p.drawLine(int(box.left()), int(cy), int(box.right()), int(cy))
         p.drawLine(int(cx), int(box.top()), int(cx), int(box.bottom()))
 
@@ -300,8 +329,14 @@ class PotBar(QWidget):
             return
         inner = box.adjusted(1.5, 1.5, -1.5, -1.5)
         inner.setWidth(max(0.0, inner.width() * self._pct / 100.0))
+        # Lighter at the top, so the fill has a lit edge rather than reading as
+        # a flat rectangle of colour. This is the one element on the strip big
+        # enough for the shading to be worth anything.
+        fill = QLinearGradient(inner.topLeft(), inner.bottomLeft())
+        fill.setColorAt(0.0, wash(ACCENT, 0.22))
+        fill.setColorAt(1.0, QColor(ACCENT))
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(ACCENT))
+        p.setBrush(fill)
         p.drawRoundedRect(inner, self._radius - 1, self._radius - 1)
 
 
@@ -326,9 +361,10 @@ class ActuatorStages(QWidget):
 
     WIDTH = 132
 
-    def __init__(self):
+    def __init__(self, tone=ACCENT):
         super().__init__()
         self._stage = None
+        self._tone = tone
         self.set_scale(1.0)
 
     def set_scale(self, k):
@@ -357,8 +393,8 @@ class ActuatorStages(QWidget):
 
         track = QRectF(1.0, float(self.PAD), float(self.TRACK_W),
                        float(self.ROW_H * len(self.STAGES)))
-        p.setPen(QPen(QColor(BAD if fault else LINE), 1))
-        p.setBrush(QColor(TRACK if not fault else "#fdecea"))
+        p.setPen(QPen(QColor(BAD) if fault else wash(self._tone, 0.62), 1))
+        p.setBrush(QColor("#fdecea") if fault else wash(self._tone, 0.88))
         p.drawRoundedRect(track, self.TRACK_W / 2.0, self.TRACK_W / 2.0)
 
         cx = track.center().x()
@@ -373,7 +409,7 @@ class ActuatorStages(QWidget):
             # everywhere else, so position is legible from across the room
             radius = (5.0 if active else 2.5) * self.TRACK_W / 14.0
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(colour if active else "#b9c6dc"))
+            p.setBrush(QColor(colour) if active else wash(self._tone, 0.55))
             p.drawEllipse(QRectF(cx - radius, cy - radius, radius * 2, radius * 2))
 
             p.setPen(QColor(colour if active else MUTED))
@@ -388,17 +424,21 @@ class Block(QFrame):
     Add content with `.add()`; each call is a sub-column inside the block.
     """
 
-    def __init__(self, title):
+    def __init__(self, title, tone=ACCENT):
         super().__init__()
         self.setObjectName("block")
+        self._tone = tone
+        # A coloured top edge rather than a coloured card: the card has to stay
+        # near-white for the tinted state fills inside it to read, so the colour
+        # goes on the one edge that can carry it without tinting the contents.
         self.setStyleSheet(
             f"#block {{ background:{CARD}; border:1px solid {LINE};"
-            f"border-radius:6px; }}")
+            f"border-top:3px solid {tone}; border-radius:6px; }}")
 
         self._body = QHBoxLayout()
         self._body.setContentsMargins(0, 0, 0, 0)
 
-        title_label = _tint(_sized(QLabel(title), 8, bold=True), INK,
+        title_label = _tint(_sized(QLabel(title), 8, bold=True), tone,
                             "letter-spacing:2px;")
 
         self._outer = QVBoxLayout(self)
@@ -463,7 +503,7 @@ class SessionView(QWidget):
 
         self.head = _label("● STOPPED", 14, MUTED, bold=True)
 
-        self.elapsed = _label("--:--", 13, TEXT, bold=True)
+        self.elapsed = _label("--:--", 13, INK, bold=True)
 
         self.detail = _label("idle", 8, MUTED)
 
@@ -533,11 +573,25 @@ class SessionView(QWidget):
             self.head.setText(f"{'●' if lit else '○'} {state}")
             _tint(self.head, colour)
 
-        self.elapsed.setText(hms(status.get("elapsed")) if state != "STOPPED"
-                             else "--:--")
+        left = status.get("pending_left")
+
+        if left is not None:
+            # The clock becomes a countdown, because during this window the
+            # number that matters is how long is left to act, not how long the
+            # run was - that is in the line underneath.
+            self.elapsed.setText(f"{left:.0f}s")
+        else:
+            self.elapsed.setText(hms(status.get("elapsed"))
+                                 if state != "STOPPED" else "--:--")
 
         error = status.get("error")
-        if error:
+        if left is not None:
+            clips = status.get("pending_clips") or 0
+            self.detail.setText(
+                f"press SAVE to keep  ·  {clips} clip{'s' if clips != 1 else ''}"
+                f"  {hms(status.get('pending_held'))}")
+            _tint(self.detail, WARN)
+        elif error:
             self.detail.setText(error)
             _tint(self.detail, BAD)
         elif state == "STOPPED":
@@ -558,8 +612,11 @@ class SessionView(QWidget):
             self.toast.setStyleSheet("background:transparent; border:none; color:%s;" % MUTED)
         else:
             text, detail = toast
-            good = text.startswith("SAVED") and "EMPTY" not in text
-            fg, bg = TONES["on" if good else "pause"]
+            # DISCARDED gets the recording red, not the amber "something is a
+            # bit off" - footage was deleted, and that has to look different
+            # from a save that merely found nothing to write.
+            fg, bg = TONES["rec" if text.startswith("DISCARDED")
+                           else "on" if text == "SAVED" else "pause"]
             self.toast.setText(f"{text}   {detail}")
             self.toast.setStyleSheet(
                 f"color:{fg}; background:{bg}; border:1px solid {fg};"
@@ -577,9 +634,16 @@ class SessionView(QWidget):
             if self._presses is not None and presses > self._presses:
                 self._flash_until = time.monotonic() + self.SAVE_FLASH_S
             self._presses = presses
-        self.save_pill.set_value(
-            True if time.monotonic() < self._flash_until
-            else (None if presses is None else False))
+        # Through the confirm window the SAVE pill pulses on its own: it is the
+        # only control that can keep the recording, and the operator has a
+        # counted number of seconds to find it.
+        if left is not None:
+            self.save_pill.set_value(
+                int(time.monotonic() * self.BLINK_HZ * 2) % 2 == 0)
+        else:
+            self.save_pill.set_value(
+                True if time.monotonic() < self._flash_until
+                else (None if presses is None else False))
 
 
 class InputsPanel(QFrame):
@@ -592,13 +656,26 @@ class InputsPanel(QFrame):
     # does not fit at all, so this is a real fork, not a preference. 1500 is the
     # measured crossover, with margin.
     LARGE_AT = 1500
-    LARGE_K = 1.4
+    # 1.75, up from 1.4. The ceiling is not taste, it is the video: the strip is
+    # a fixed STRIP_HEIGHT * k tall and every pixel it takes comes off the
+    # camera panels. At 1.75 the strip is ~313px of a 1080p screen, leaving the
+    # video ~713 - still the large majority of the window, and the text is
+    # readable standing back from the panel rather than leaning into it.
+    LARGE_K = 1.75
 
     def __init__(self):
         super().__init__()
         self.setObjectName("inputsPanel")
+        # Mirrors the top bar's gradient - that one runs white at the top to
+        # #e8edf6 at the bottom, so running this one the other way puts the two
+        # deepest edges against the video and frames it, instead of two flat
+        # slabs bolted either side of it.
+        #
+        # The gradient has to stay on ONE line: Qt's style sheet parser ends the
+        # value at the newline, so a wrapped qlineargradient(...) silently drops
+        # the whole rule and the strip keeps the app's dark background.
         self.setStyleSheet(
-            f"#inputsPanel {{ background:{FIELD};"
+            f"#inputsPanel {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {FIELD}, stop:1 #ffffff);"
             f"border-top:1px solid {LINE}; }}")
         self._scale = None
 
@@ -615,7 +692,7 @@ class InputsPanel(QFrame):
         joy_col.addStretch(1)
 
         self.pot = PotBar()
-        self.pot_text = _label("—", 12, TEXT, bold=True)
+        self.pot_text = _label("—", 12, INK, bold=True)
 
         # The ADC error belongs here and nowhere else: the joystick and the pot
         # are the only two readings it can break, and a warning parked under the
@@ -630,7 +707,7 @@ class InputsPanel(QFrame):
         pot_col.addWidget(self.status)
         pot_col.addStretch(1)
 
-        drive = Block("DRIVE")
+        drive = Block("DRIVE", DRIVE_TONE)
         drive.add(joy_col)
         drive.add(pot_col, 1)
 
@@ -648,11 +725,11 @@ class InputsPanel(QFrame):
         brush_col.addWidget(self.brush, 0, Qt.AlignLeft)
         brush_col.addStretch(1)
 
-        self.actuator = ActuatorStages()
+        self.actuator = ActuatorStages(TOOLS_TONE)
 
         act_col = QVBoxLayout()
         act_col.setSpacing(4)
-        act_col.addWidget(_caption("ACTUATOR"))
+        act_col.addWidget(_caption("BRUSH HEIGHT"))
         act_col.addWidget(self.actuator)
         act_col.addStretch(1)
 
@@ -660,14 +737,14 @@ class InputsPanel(QFrame):
         # one just parks a hole beside it. Push them to the two ends and let the
         # hole fall between them, where it reads as spacing rather than as a
         # column that failed to fill.
-        tools = Block("TOOLS")
+        tools = Block("TOOLS", TOOLS_TONE)
         tools.add(brush_col)
         tools.add_stretch()
         tools.add(act_col)
 
         # --- block 3: RECORDING ----------------------------------------------
         self.session = SessionView()
-        recording = Block("RECORDING")
+        recording = Block("RECORDING", REC_TONE)
         recording.add(self.session, 1)
 
         # Stretch factors, not natural widths: the strip spans whatever the
