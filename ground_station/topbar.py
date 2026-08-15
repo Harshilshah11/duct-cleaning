@@ -20,10 +20,13 @@ Preview it on its own, with no cameras and no robot:
 """
 
 import os
+import time
 
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
+
+from recorder import hms
 
 MONO = "DejaVu Sans Mono"
 SANS = "DejaVu Sans"
@@ -67,6 +70,10 @@ PILL_STATES = {
     "warn": ("#8a5a06", "#eccf8d", "#fdf3de"),
     "bad":  ("#c02b26", "#f1b3ae", "#fdecea"),
     "idle": ("#6f7c99", "#ccd6e8", "#eef2f9"),
+    # The one saturated chip on the bar, and deliberately so: every other state
+    # here is something you check, whereas "am I recording" is something that
+    # has to reach you when you are looking at the video instead of the bar.
+    "rec":  ("#ffffff", "#a3211d", "#d93a33"),
 }
 
 
@@ -132,13 +139,20 @@ class StatusPill(QLabel):
 
         self._text = None
         self._state = None
+        self._dot = None
         self.set(text, state)
 
-    def set(self, text, state):
-        """Idempotent — safe to call at the UI frame rate."""
-        if text != self._text:
-            self._text = text
-            self.setText(f"●  {text}")
+    def set(self, text, state, dot="●"):
+        """Idempotent — safe to call at the UI frame rate.
+
+        `dot` is swapped rather than the colour when a chip blinks: changing the
+        text is one repaint, while assigning a style sheet forces a full
+        repolish of the widget, and a chip that blinks twice a second would be
+        doing that 4x/second forever.
+        """
+        if (text, dot) != (self._text, self._dot):
+            self._text, self._dot = text, dot
+            self.setText(f"{dot}  {text}")
         if state != self._state:
             self._state = state
             fg, border, bg = PILL_STATES.get(state, PILL_STATES["idle"])
@@ -198,6 +212,11 @@ class TopBar(QWidget):
             pill.setToolTip(url)
             self._camera_pills.append(pill)
 
+        # Recording sits left of the camera chips, not with the robot/temp
+        # group: it answers "is this being kept", which belongs beside the
+        # cameras it is keeping rather than beside the housekeeping.
+        self._rec_pill = StatusPill("STANDBY", "idle", min_width=150)
+
         self._robot_pill = StatusPill("ROBOT  LINKING", "warn", min_width=196)
 
         # This machine's own temperature, so it belongs with the clock rather
@@ -218,6 +237,8 @@ class TopBar(QWidget):
         row.addWidget(logo_label)
         row.addWidget(title_group)
         row.addStretch(1)
+        row.addWidget(self._rec_pill)
+        row.addWidget(_separator())
         for pill in self._camera_pills:
             row.addWidget(pill)
         row.addWidget(_separator())
@@ -249,6 +270,33 @@ class TopBar(QWidget):
             self._camera_pills[index].set(f"{name}  CONNECTING", "warn")
         else:
             self._camera_pills[index].set(f"{name}  NO SIGNAL", "bad")
+
+    def set_recording(self, status):
+        """One recorder.SessionManager.status() dict, or None for no recorder.
+
+        The elapsed time is on the chip rather than only down in the strip
+        because the operator is looking AT the video: this bar is the nearest
+        place to the picture that can carry it, and "how long have I been
+        recording" is the question that follows "am I recording" every time.
+        """
+        if not status:
+            self._rec_pill.set("STANDBY", "idle")
+            return
+
+        state = status.get("state") or "STOPPED"
+        held = hms(status.get("elapsed"))
+        if state == "RECORDING":
+            # Blink at ~1.4Hz off the wall clock, so a busy Pi slows the frame
+            # rate without slowing the blink. Matches inputs_panel.SessionView.
+            lit = int(time.monotonic() * 2.8) % 2 == 0
+            self._rec_pill.set(f"REC  {held}", "rec", "●" if lit else "○")
+        elif state == "PAUSED":
+            # Two bars, not a dot: paused is the state most easily mistaken for
+            # recording at a glance, and the glyph carries that further than the
+            # colour does.
+            self._rec_pill.set(f"PAUSED  {held}", "warn", "❚❚")
+        else:
+            self._rec_pill.set("STANDBY", "idle")
 
     def set_robot(self, connected):
         """connected: True / False / None (no probe result yet)."""
@@ -296,18 +344,27 @@ class TopBar(QWidget):
         # The threshold is the width at which the title fits WHOLE. A QLabel does
         # not elide, it clips, so a title that is 40px short does not look tight —
         # it looks like "GROUND CONTROL STATI".
+        # Every threshold here moved when the REC chip joined the row. They are
+        # the widths at which the REMAINING content fits WHOLE, so they have to
+        # be re-derived whenever a chip is added or its text grows - the old
+        # numbers left CAM 1 reading "CONNECTEI" at 1024.
+        #
+        # These are measured, not estimated: sweep the width down and compare
+        # each chip's width() against its sizeHint().width(), which is what a
+        # QLabel needs to render without clipping. Guessing from character
+        # counts was off by ~100px, because the tracked font and the pill
+        # padding both land outside the obvious arithmetic.
         width = self.width()
-        self._title_group.setVisible(width >= 1150)
-        # The temperature chip goes next. Four chips plus the logo and the clock
-        # need ~940px; below that the ROBOT chip is the one that clips, and a
-        # chip reading "ROBOT  DISCONNEC" is worse than no temperature at all.
-        # The cameras and the robot outrank it — they are what is being watched.
-        self._temp_pill.setVisible(width >= 950)
+        self._title_group.setVisible(width >= 1510)
+        # The temperature chip goes next. Below this the ROBOT chip is the one
+        # that clips, and a chip reading "ROBOT  DISCONNEC" is worse than no
+        # temperature at all. The cameras, the robot and REC all outrank it.
+        self._temp_pill.setVisible(width >= 1225)
         # The logo goes last, and only because it got big: at 42px tall it is
-        # ~188px wide, and on an 800px panel that is the difference between the
+        # ~188px wide, and on a 1024px panel that is the difference between the
         # camera chips fitting and CAM 1 reading "CONNECTEE". Brand loses to
         # data — on a screen that small the chips ARE the interface.
-        self._logo_label.setVisible(width >= 900)
+        self._logo_label.setVisible(width >= 1065)
         super().resizeEvent(event)
 
 

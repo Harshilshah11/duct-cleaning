@@ -14,10 +14,18 @@ Run:
 
 On Windows, launch run_ground_station.pyw instead — same app, no console window.
 
+Recording is on the panel switches, not the keyboard (see recorder.py):
+
+    switch 1, GPIO24 ... START / STOP
+    switch 2, GPIO23 ... PAUSE / RESUME, inside the same file
+    button,   GPIO25 ... SAVE - bank the clip so far and keep rolling
+
 Keys:
-    F        fullscreen toggle        S   snapshot both panels
-    R        reconnect both           1/2 solo a camera, 0 = both
+    F        fullscreen toggle        S       snapshot both panels
+    R        reconnect both           1/2     solo a camera, 0 = both
     Q / Esc  quit
+    Space    start/stop  P  pause     Ctrl+S  save clip   (bench only - these
+             do nothing while the panel switches are readable)
 """
 
 from __future__ import annotations
@@ -58,14 +66,15 @@ MONO = "DejaVu Sans Mono"
 # it, CameraPanel's `stream: RTSPStream` annotation would be evaluated at class
 # definition time, i.e. before the import has happened.
 cv2 = None
-LinkMonitor = RTSPStream = describe_backends = TopBar = None
+LinkMonitor = RTSPStream = SessionManager = describe_backends = TopBar = None
 
 
 def _load_video_stack():
     """Import the heavy half of the app. Idempotent."""
-    global cv2, LinkMonitor, RTSPStream, describe_backends, TopBar
+    global cv2, LinkMonitor, RTSPStream, SessionManager, describe_backends, TopBar
     import cv2
     from link import LinkMonitor
+    from recorder import SessionManager
     from stream import RTSPStream, describe_backends
     from topbar import TopBar
 
@@ -248,6 +257,20 @@ class GroundStationWindow(QWidget):
         self.motors = MotorLink()
         self.motors.start()
 
+        # --- recording -------------------------------------------------------
+        # Driven entirely by the panel switches via inputs.py: switch 1 (GPIO24)
+        # starts and stops, switch 2 (GPIO23) pauses and resumes inside the same
+        # file, and the GPIO25 button banks the clip so far and keeps rolling.
+        # The encoders read the SAME decoded frames the panels are drawing, so
+        # recording opens no second RTSP session and what lands on disk is what
+        # the operator saw. See recorder.py.
+        self.session = SessionManager(self.streams)
+
+        # Keyboard fallback, used only when the reader has no switch state to
+        # give (no gpiod, pins busy, INPUTS_ENABLED=0). Letting the keys fight a
+        # live switch would mean the panel showing STOPPED while a file grows.
+        self._kbd_session = None
+
         # --- video row ------------------------------------------------------
         video_row = QHBoxLayout()
         video_row.setContentsMargins(10, 10, 10, 10)
@@ -303,6 +326,36 @@ class GroundStationWindow(QWidget):
         bind("1", lambda: self.solo(0))
         bind("2", lambda: self.solo(1))
         bind("0", lambda: self.solo(None))
+        # Recording, for a bench with no panel wired to it. Ignored the moment
+        # the switches are readable — see _session_state().
+        bind("Space", self.kbd_start_stop)
+        bind("P", self.kbd_pause)
+        bind("Ctrl+S", self.session_save)
+
+    # -- recording -------------------------------------------------------------
+
+    def kbd_start_stop(self):
+        self._kbd_session = (None if self._kbd_session in ("RECORDING", "PAUSED")
+                             else "RECORDING")
+
+    def kbd_pause(self):
+        if self._kbd_session == "RECORDING":
+            self._kbd_session = "PAUSED"
+        elif self._kbd_session == "PAUSED":
+            self._kbd_session = "RECORDING"
+
+    def session_save(self):
+        self.session.save_clip()
+
+    def _session_state(self, snapshot):
+        """Switch state if the panel is readable, otherwise the keyboard latch.
+
+        One source at a time and the hardware always wins: two of them would let
+        a key press and a lever disagree, and the whole point of the strip is
+        that it shows what the recorder is actually doing.
+        """
+        state = snapshot.get("session")
+        return state if state is not None else (self._kbd_session or "STOPPED")
 
     def solo(self, index):
         for i, panel in enumerate(self.panels):
@@ -354,7 +407,16 @@ class GroundStationWindow(QWidget):
         # and shared: the panel and the motors must act on the SAME sample, or
         # the strip can show a stick position the wheels never got.
         snapshot = self.inputs.latest()
-        self.inputs_panel.set_state(snapshot)
+
+        # Recording before the panel is told anything: on_inputs() applies the
+        # switch state and the save-button edge count, so the status the strip
+        # renders this frame is the one the recorder is already acting on rather
+        # than one frame stale.
+        self.session.set_state(self._session_state(snapshot))
+        self.session.on_save_button(snapshot.get("save_presses"))
+        status = self.session.status()
+        self.inputs_panel.set_state(snapshot, status)
+        self.topbar.set_recording(status)
 
         # Stick -> wheels. This only refreshes the demand; MotorLink keeps
         # transmitting at its own 50 Hz regardless, so a slow UI frame can never
@@ -369,7 +431,7 @@ class GroundStationWindow(QWidget):
         # panel can never show a switch position the actuator did not get.
         self.motors.set_actuator(snapshot.get("actuator"),
                                  (snapshot.get("pot") or {}).get("pct"))
-        self.motors.set_brush((snapshot.get("switches") or {}).get("TOGGLE"))
+        self.motors.set_brush((snapshot.get("switches") or {}).get("BRUSH"))
         # Pot -> light brightness, which is what that knob actually does now.
         self.motors.set_light((snapshot.get("pot") or {}).get("pct"))
 
@@ -380,6 +442,10 @@ class GroundStationWindow(QWidget):
         self.timer.stop()
         self.temp_timer.stop()
         self.link.stop()
+        # First of the workers to go: it is the only one holding a file that is
+        # invalid until it is closed properly, and it needs the streams it is
+        # reading from to still exist while it finishes.
+        self.session.stop()
         # Motors before inputs: stopping the link sends a final STOP, and it
         # should go out while the app is still otherwise alive rather than
         # racing the rest of the teardown.

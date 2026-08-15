@@ -143,3 +143,31 @@ READ_FAIL_LIMIT = 50                           # consecutive bad reads -> reconn
 OPEN_TIMEOUT_S = float(os.environ.get("OPEN_TIMEOUT_S", "4.0"))
 
 SNAPSHOT_DIR = os.path.expanduser(os.environ.get("SNAPSHOT_DIR", "~/snapshots"))
+
+# --- Recording ---------------------------------------------------------------
+# Driven by the two panel switches (see inputs.py): switch 1 on GPIO24 is
+# START/STOP, switch 2 on GPIO23 is PAUSE/RESUME. Each run gets its own
+# directory under RECORD_DIR, with one file per camera inside it.
+RECORD_DIR = os.path.expanduser(os.environ.get("RECORD_DIR", "~/recordings"))
+
+# Frames are re-encoded from the ones already decoded for the screen, so this is
+# a straight CPU cost on top of the decode: ~0.4 of a core per 720p camera at 15.
+# It is also the *wall-clock* sample rate, not just the header value - recorder.py
+# writes one frame per tick whether or not the camera delivered a new one, so an
+# hour of duct run is an hour of video and the timeline stays honest.
+RECORD_FPS = float(os.environ.get("RECORD_FPS", "15"))
+
+# "mp4v" (MPEG-4 Part 2) is the one fourcc the apt OpenCV can always write into
+# a .mp4 without an external encoder. "avc1" gives smaller files where the build
+# has libx264, and dies with a warning where it does not - so it is not default.
+RECORD_FOURCC = os.environ.get("RECORD_FOURCC", "mp4v")
+RECORD_EXT = os.environ.get("RECORD_EXT", ".mp4")
+
+# 0 keeps the camera's native size. Set e.g. 960 to shrink 720p before encoding
+# if the Pi runs out of CPU with both cameras recording.
+RECORD_MAX_WIDTH = int(os.environ.get("RECORD_MAX_WIDTH", "0"))
+
+# Stop writing rather than fill the SD card. A full root filesystem does not
+# just lose the recording - it takes X, the viewer and this SSH session with it,
+# which is a far worse failure than a truncated video.
+RECORD_MIN_FREE_MB = int(os.environ.get("RECORD_MIN_FREE_MB", "512"))
