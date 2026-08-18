@@ -218,6 +218,24 @@ ADC_NOISE_WINDOW = int(os.environ.get("INPUTS_ADC_NOISE_WINDOW", "8"))
 ADC_NOISE_BAND = float(os.environ.get("INPUTS_ADC_NOISE_BAND", "0.04"))
 ADC_NOISE_REVERSALS = int(os.environ.get("INPUTS_ADC_NOISE_REVERSALS", "3"))
 
+# 4. A WIPER THAT LOSES CONTACT MID-TRAVEL READS EXACTLY 0x3FFF - all data
+#    bits floating high - which is 16383, INSIDE the stick's real 0..17600
+#    travel, ~93% deflection. Seen twice on this rig, and it is the mechanism
+#    behind "left and right swap" (reported 2026-08-18): push LEFT, the
+#    marginal wiper blips open, the channel reads 16383 = hard RIGHT, and the
+#    robot turns against the hand. The value is STEADY while floating, so the
+#    reversal gate cannot catch it, and it confirms itself past the jump test
+#    in two samples.
+#
+#    Its fingerprint: a real wiper voltage jitters by LSBs and this rig's true
+#    right endstop measures 17568, a clear 1185 counts above - so a read
+#    within this band of exactly 16383 is rejected outright. Cost: a real
+#    stick held PRECISELY at 93.1% travel (a +-0.3% sliver) reads as no
+#    demand - a dead stop, never a wrong direction. A sweep passes through
+#    the band in one sample, which smoothing already absorbs.
+ADC_FLOAT_RAW = 0x3FFF
+ADC_FLOAT_BAND = int(os.environ.get("INPUTS_ADC_FLOAT_BAND", "48"))
+
 # --- the pot must EARN being believed ----------------------------------------
 # The light follows this channel directly, so a wandering reading IS a blinking
 # lamp - which is exactly what the rig does when the pot's wiper connection goes
@@ -385,7 +403,8 @@ def _blank():
         # poll rate and a phantom stick demand are the two failures here, and
         # neither is visible from the outside without these.
         "adc_hz": 0.0,
-        "adc_rejects": {"range": 0, "agree": 0, "jump": 0, "read": 0, "noise": 0},
+        "adc_rejects": {"range": 0, "agree": 0, "jump": 0, "read": 0,
+                        "noise": 0, "float": 0},
         "switches": {name: None for name, _ in SWITCHES},
         "actuator": None,          # "EXTEND" / "STOP" / "RETRACT" / "FAULT"
         # Raw pin levels behind that decode, so the panel can show the operator
@@ -496,7 +515,8 @@ class InputReader(threading.Thread):
         # difference between "the stick feels laggy" and "the stick is laggy", and
         # the reject counters name which test is firing when a phantom shows up.
         self._adc_hz = 0.0
-        self._rejects = {"range": 0, "agree": 0, "jump": 0, "read": 0, "noise": 0}
+        self._rejects = {"range": 0, "agree": 0, "jump": 0, "read": 0,
+                         "noise": 0, "float": 0}
         self._noise_buf = {}        # ch -> recent accepted raws, for the float test
 
     # -- public ---------------------------------------------------------------
@@ -806,6 +826,12 @@ class InputReader(threading.Thread):
             if not (-ADC_RANGE_MARGIN * FULL_SCALE
                     <= raw <= (1.0 + ADC_RANGE_MARGIN) * FULL_SCALE):
                 self._rejects["range"] += 1
+                good[ch] = None
+                continue
+
+            # -- per channel: the floating-open signature - see ADC_FLOAT_RAW.
+            if abs(raw - ADC_FLOAT_RAW) <= ADC_FLOAT_BAND:
+                self._rejects["float"] += 1
                 good[ch] = None
                 continue
 
