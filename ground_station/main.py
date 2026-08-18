@@ -580,6 +580,11 @@ class GroundStationWindow(QWidget):
                 f"R={m.get('right') or 0:+4d}",
                 f"act={m.get('act') or 0:+2d}",
                 f"brush={m.get('brush') or 0}",
+                # The lamp demand actually leaving in the 5th field - added
+                # 2026-08-18 hunting "the light does not work": the pot column
+                # proved the KNOB was read, but nothing recorded what the Uno
+                # was told, and the flashed sketch cannot be interrogated.
+                f"light={m.get('light') or 0}",
                 f"uno={'ok' if m.get('ok') else 'DOWN'}",
             ]
             # THE RAW ADC COUNTS, and they are the point of this addition. A line

@@ -306,6 +306,26 @@ POT_STABLE_SAMPLES = int(os.environ.get("INPUTS_POT_STABLE_SAMPLES", "3"))
 POT_STABLE_BAND = float(os.environ.get("INPUTS_POT_STABLE_BAND", "0.06"))
 POT_SNAP_BAND = float(os.environ.get("INPUTS_POT_SNAP_BAND", "0.06"))
 
+# THE SUPPLY-DROPOUT HOLD (2026-08-18 evening). The pot's 3.3V/ground feed is
+# intermittent: the reading alternates between the knob's true value and a
+# clean 0 as the supply makes and breaks, dwelling up to a second at each -
+# which the snap path faithfully turned into a lamp strobing at 1 Hz while
+# the operator held the knob still (log: light=255 / light=0 / light=255 on
+# consecutive seconds, p17600 / p0 / p17648 behind it).
+#
+# The discriminator: a HAND turning the knob to zero passes through the
+# middle of the travel on the way down, so the latch has already followed it
+# below POT_ZERO_CLIFF by the time a genuine 0 arrives - whereas a supply
+# drop is a cliff, full straight to 0 in one poll with no intermediates. So a
+# near-zero read arriving while the latch is still high is treated as a
+# dropout and held through, and only a zero SUSTAINED for POT_ZERO_HOLD_S
+# adopts - which keeps "knob at minimum = lamp off" working even on the
+# broken supply, just 2 s late. A real spin-to-off stays instant: the latch
+# tracks the sweep down and is below the cliff before zero lands.
+POT_ZERO_RAW = float(os.environ.get("INPUTS_POT_ZERO_RAW", "0.03"))
+POT_ZERO_CLIFF = float(os.environ.get("INPUTS_POT_ZERO_CLIFF", "0.20"))
+POT_ZERO_HOLD_S = float(os.environ.get("INPUTS_POT_ZERO_HOLD_S", "2.0"))
+
 # How the two session switches behave, because the panel hardware decides this
 # and not us:
 #   1 (default) LATCHING levers - the switch position IS the state. Thrown ==
@@ -529,6 +549,7 @@ class InputReader(threading.Thread):
         self._jump_runs = {}        # ch -> (pending raw, consecutive agreements)
         self._pot_window = []       # recent good pot reads - see POT_STABLE_BAND
         self._pot_latched = None    # last ACCEPTED pot reading - the setting
+        self._pot_zero_since = None # when the current run of cliff-zeros began
         self._kadc = None           # kernel-bus ADS1115, preferred over _bus
         self._adc_thread = None
         # Published so main.py can log it: a poll rate that has collapsed is the
@@ -763,6 +784,19 @@ class InputReader(threading.Thread):
         if raw is None:
             self._pot_window.clear()
             return self._pot_latched
+        # A cliff to zero while the latch is high is the supply dropping, not
+        # the hand - hold the setting unless the zero persists. See POT_ZERO_*.
+        if (raw <= POT_ZERO_RAW * FULL_SCALE
+                and self._pot_latched is not None
+                and self._pot_latched > POT_ZERO_CLIFF * FULL_SCALE):
+            if self._pot_zero_since is None:
+                self._pot_zero_since = time.monotonic()
+            if time.monotonic() - self._pot_zero_since < POT_ZERO_HOLD_S:
+                return self._pot_latched
+            # Sustained: the knob really is at the bottom (or the supply is
+            # dead for good, in which case dark is the honest reading).
+        else:
+            self._pot_zero_since = None
         if (self._pot_latched is not None
                 and abs(raw - self._pot_latched) > POT_SNAP_BAND * FULL_SCALE):
             # A deliberate move - adopt it NOW. _validate() upstream has
