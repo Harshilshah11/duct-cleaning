@@ -159,6 +159,23 @@ AXIS_DEADBAND = float(os.environ.get("INPUTS_AXIS_DEADBAND", "0.08"))
 INVERT_X = os.environ.get("INPUTS_INVERT_X", "0") == "1"
 INVERT_Y = os.environ.get("INPUTS_INVERT_Y", "1") == "1"
 
+# How long a rejected sample may be papered over with the last GOOD reading.
+#
+# The validation gates reject single samples by design - and MotorLink's slew
+# limiter applies FALLS instantly (a stop must never be delayed) while ramping
+# rises over 400 ms. Put together, one rejected 30 ms sample became a full
+# stop plus a 400 ms crawl back up: measured 2026-08-18 night holding the
+# stick at the full-right rail, the log read L=+255, +16, +59, +255 on
+# consecutive seconds ("left right not working properly" - the x wire is the
+# marginal one, so turns stuttered while forward/back felt fine).
+#
+# Bridging a gap this short with the last VALIDATED value cannot drive the
+# robot on garbage - garbage is exactly what was rejected - and a genuine
+# outage still reads None the moment the gap outlives the hold. The stick
+# telling the robot to stop is a VALUE (centre), not a gap, so stopping is
+# never delayed by this either.
+AXIS_HOLD_S = float(os.environ.get("INPUTS_AXIS_HOLD_S", "0.15"))
+
 # Raw reads kept per channel for median smoothing.
 #
 # A single bad transfer on a bit-banged bus produces a wild count, and a wild
@@ -566,6 +583,7 @@ class InputReader(threading.Thread):
         self._pot_window = []       # recent good pot reads - see POT_STABLE_BAND
         self._pot_latched = None    # last ACCEPTED pot reading - the setting
         self._pot_zero_since = None # when the current run of cliff-zeros began
+        self._axis_hold = {}        # ch -> (last good norm, monotonic) - AXIS_HOLD_S
         self._kadc = None           # kernel-bus ADS1115, preferred over _bus
         self._adc_thread = None
         # Published so main.py can log it: a poll rate that has collapsed is the
@@ -653,6 +671,7 @@ class InputReader(threading.Thread):
                     self._last_good.clear()
                     self._jump_runs.clear()
                     self._noise_buf.clear()
+                    self._axis_hold.clear()
                     # The WINDOW resets; _pot_latched does NOT. A reopened bus
                     # invalidates in-flight evidence, but the last accepted knob
                     # setting is a fact about the operator, not the bus - going
@@ -688,6 +707,7 @@ class InputReader(threading.Thread):
             self._last_good.clear()
             self._jump_runs.clear()
             self._noise_buf.clear()
+            self._axis_hold.clear()
             # Window only - the latch survives, same as the kernel branch above.
             self._pot_window.clear()
             return True
@@ -928,6 +948,16 @@ class InputReader(threading.Thread):
 
         return good
 
+    def _hold_axis(self, ch, value, now_m):
+        """The AXIS_HOLD_S bridge: last good value through a brief gap."""
+        if value is not None:
+            self._axis_hold[ch] = (value, now_m)
+            return value
+        prev = self._axis_hold.get(ch)
+        if prev is not None and now_m - prev[1] < AXIS_HOLD_S:
+            return prev[0]
+        return None
+
     def _noise_gate(self, ch, raw):
         """Blank a channel that is floating rather than driven. See ADC_NOISE_*.
 
@@ -1129,6 +1159,12 @@ class InputReader(threading.Thread):
             x_norm = -x_norm
         if y_norm is not None and INVERT_Y:
             y_norm = -y_norm
+        # Bridge single-sample rejections with the last validated value, so
+        # the slew limiter is not slammed to zero by a 30 ms gap - see
+        # AXIS_HOLD_S for the measured failure this removes.
+        now_m = time.monotonic()
+        x_norm = self._hold_axis(0, x_norm, now_m)
+        y_norm = self._hold_axis(1, y_norm, now_m)
         analog["joy"] = {
             "x": x_norm, "y": y_norm,
             "x_raw": x_raw, "y_raw": y_raw,
