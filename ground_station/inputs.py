@@ -197,6 +197,27 @@ ADC_JUMP_CONFIRM = int(os.environ.get("INPUTS_ADC_JUMP_CONFIRM", "2"))
 # end stop is never mistaken for a fault.
 ADC_RANGE_MARGIN = float(os.environ.get("INPUTS_ADC_RANGE_MARGIN", "0.06"))
 
+# 3. A FLOATING INPUT NEVER STOPS CHANGING DIRECTION, and a hand cannot change
+#    direction that fast. Observed 2026-08-18 with the chip answering but its
+#    analog harness loose: every channel wandering the full scale at rest
+#    (x 2752 -> 14192 -> 5984 within seconds), ~27% caught by the jump test and
+#    the remainder walking through as wheel demand, L=+135 R=+201 with nobody
+#    at the panel. The samples that get through drift SMOOTHLY, so no
+#    per-sample test can catch them - but over any short window they reverse
+#    direction over and over, which a spring-centred stick under a hand does
+#    exactly once per push-and-return.
+#
+#    So: over the last ADC_NOISE_WINDOW samples, if the spread exceeds
+#    ADC_NOISE_BAND of full scale AND the deltas flipped sign at least
+#    ADC_NOISE_REVERSALS times, the channel is floating, not driven - blank it.
+#    A resting stick fails the spread test (tens of counts). A sweep fails the
+#    reversal test (deltas all one sign; flips below 32 counts are LSB noise
+#    and not counted). Costs nothing on a healthy channel, and turns a loose
+#    harness into "no ADC" on the strip instead of a twitching robot.
+ADC_NOISE_WINDOW = int(os.environ.get("INPUTS_ADC_NOISE_WINDOW", "8"))
+ADC_NOISE_BAND = float(os.environ.get("INPUTS_ADC_NOISE_BAND", "0.04"))
+ADC_NOISE_REVERSALS = int(os.environ.get("INPUTS_ADC_NOISE_REVERSALS", "3"))
+
 # --- the pot must EARN being believed ----------------------------------------
 # The light follows this channel directly, so a wandering reading IS a blinking
 # lamp - which is exactly what the rig does when the pot's wiper connection goes
@@ -364,7 +385,7 @@ def _blank():
         # poll rate and a phantom stick demand are the two failures here, and
         # neither is visible from the outside without these.
         "adc_hz": 0.0,
-        "adc_rejects": {"range": 0, "agree": 0, "jump": 0, "read": 0},
+        "adc_rejects": {"range": 0, "agree": 0, "jump": 0, "read": 0, "noise": 0},
         "switches": {name: None for name, _ in SWITCHES},
         "actuator": None,          # "EXTEND" / "STOP" / "RETRACT" / "FAULT"
         # Raw pin levels behind that decode, so the panel can show the operator
@@ -475,7 +496,8 @@ class InputReader(threading.Thread):
         # difference between "the stick feels laggy" and "the stick is laggy", and
         # the reject counters name which test is firing when a phantom shows up.
         self._adc_hz = 0.0
-        self._rejects = {"range": 0, "agree": 0, "jump": 0, "read": 0}
+        self._rejects = {"range": 0, "agree": 0, "jump": 0, "read": 0, "noise": 0}
+        self._noise_buf = {}        # ch -> recent accepted raws, for the float test
 
     # -- public ---------------------------------------------------------------
 
@@ -553,6 +575,7 @@ class InputReader(threading.Thread):
                     self._smooth_buf.clear()
                     self._last_good.clear()
                     self._jump_runs.clear()
+                    self._noise_buf.clear()
                     # The WINDOW resets; _pot_latched does NOT. A reopened bus
                     # invalidates in-flight evidence, but the last accepted knob
                     # setting is a fact about the operator, not the bus - going
@@ -587,6 +610,7 @@ class InputReader(threading.Thread):
             # the first good read against a stale reference and reject it.
             self._last_good.clear()
             self._jump_runs.clear()
+            self._noise_buf.clear()
             # Window only - the latch survives, same as the kernel branch above.
             self._pot_window.clear()
             return True
@@ -808,6 +832,35 @@ class InputReader(threading.Thread):
 
         return good
 
+    def _noise_gate(self, ch, raw):
+        """Blank a channel that is floating rather than driven. See ADC_NOISE_*.
+
+        Runs AFTER _validate() (so the window holds only reads that passed the
+        range/agree/jump tests) and BEFORE smoothing, the centre learner and
+        the pot latch - a floating channel must not be allowed to teach the
+        stick a garbage zero or snap the lamp around, it must read as absent.
+
+        A None read leaves the window alone rather than clearing it: on a
+        loose harness Nones and wander arrive interleaved, and forgetting the
+        history on each None would let the channel sneak through on a short,
+        briefly-coherent window.
+        """
+        if raw is None:
+            return None
+        buf = self._noise_buf.setdefault(ch, [])
+        buf.append(raw)
+        del buf[:-ADC_NOISE_WINDOW]
+        if len(buf) >= 3:
+            spread = max(buf) - min(buf)
+            if spread > ADC_NOISE_BAND * FULL_SCALE:
+                deltas = [b - a for a, b in zip(buf, buf[1:])]
+                flips = sum(1 for a, b in zip(deltas, deltas[1:])
+                            if a * b < 0 and abs(b) > 32)
+                if flips >= ADC_NOISE_REVERSALS:
+                    self._rejects["noise"] += 1
+                    return None
+        return raw
+
     def _learn_centre(self, ch, raw):
         """Median of CENTRE_SAMPLES readings, or None if it is not believable.
 
@@ -944,14 +997,16 @@ class InputReader(threading.Thread):
         # buffer. Letting one in would let it go on influencing the output for
         # SMOOTH_SAMPLES more polls after it had already been identified as junk.
         fresh = self._validate({ch: self._sample(ch) for ch in (0, 1, 2)})
-        x_raw = self._smooth(0, fresh[0])
-        y_raw = self._smooth(1, fresh[1])
+        # Then the float test, on what survived - see _noise_gate().
+        gated = {ch: self._noise_gate(ch, fresh[ch]) for ch in (0, 1, 2)}
+        x_raw = self._smooth(0, gated[0])
+        y_raw = self._smooth(1, gated[1])
         # The pot skips the median the axes get: _pot_gate() carries its own
         # noise handling (small changes need agreeing samples), so the median's
         # one-sample delay bought nothing on this channel - and the pot's lag
         # is the one the operator actually feels, on the lamp. Raw and straight
         # into the gate, exactly one poll between hand and latch on a big move.
-        pot_raw = self._pot_gate(fresh[2])
+        pot_raw = self._pot_gate(gated[2])
 
         analog["adc_error"] = None
         # Every channel None repeatedly means the bus is wedged rather than one
