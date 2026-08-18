@@ -143,13 +143,13 @@ CENTRE_TOLERANCE = float(os.environ.get("INPUTS_CENTRE_TOLERANCE", "0.25"))
 # and without this the wheels creep whenever the rig is powered up.
 AXIS_DEADBAND = float(os.environ.get("INPUTS_AXIS_DEADBAND", "0.08"))
 
-# Which way the stick's electrical travel maps onto the robot's motion. Y is
-# inverted by default because the rig's pot is mounted so that pushing the
-# stick FORWARD lowers the wiper voltage - measured 2026-08-18 ("front and
-# back reverse run"): stick forward drove the tyres backward. Flip these, not
-# the mixer or the sketch, if a re-mount ever reverses an axis again - this is
-# the one place that knows about stick orientation.
-INVERT_X = os.environ.get("INPUTS_INVERT_X", "0") == "1"
+# Which way the stick's electrical travel maps onto the robot's motion. BOTH
+# axes are inverted by default because the rig's stick is mounted with both
+# pots reversed relative to the mixer's convention - measured 2026-08-18 on
+# the real robot: forward drove backward, then left turned right. Flip these,
+# not the mixer or the sketch, if a re-mount ever reverses an axis again -
+# this is the one place that knows about stick orientation.
+INVERT_X = os.environ.get("INPUTS_INVERT_X", "1") == "1"
 INVERT_Y = os.environ.get("INPUTS_INVERT_Y", "1") == "1"
 
 # Raw reads kept per channel for median smoothing.
