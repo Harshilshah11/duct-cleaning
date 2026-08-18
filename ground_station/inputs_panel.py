@@ -638,6 +638,30 @@ class SessionView(QWidget):
                     f"{clips} clip{'s' if clips != 1 else ''}"
                     f"  {hms(status.get('pending_held'))}")
             recolour(self.detail, WARN, PT_CAP, bold=True)
+        elif (status.get("usb") or {}).get("state") == "copying":
+            # The USB daemon is mirroring /recordings onto a stick right now.
+            # Shown above everything routine (but below toasts and the confirm
+            # window, which are operator decisions in flight) because the one
+            # mistake this line prevents is pulling the stick mid-copy.
+            usb = status["usb"]
+            total = usb.get("bytes_total") or 0
+            pct = 100.0 * (usb.get("bytes_done") or 0) / total if total else 0.0
+            self.detail.setText(
+                f"USB TRANSFERRING  {pct:.0f}%  ·  {usb.get('file') or ''}"
+                f"  ·  {usb.get('file_i') or 0}/{usb.get('files_total') or 0}"
+                f" files")
+            recolour(self.detail, WARN, PT_CAP, bold=True)
+        elif (status.get("usb") or {}).get("state") == "done":
+            usb = status["usb"]
+            self.detail.setText(
+                f"USB BACKUP DONE  ·  safe to remove  ·  "
+                f"{usb.get('copied') or 0} copied, "
+                f"{usb.get('deleted') or 0} cleared off Pi")
+            recolour(self.detail, TONES["on"][0], PT_CAP, bold=True)
+        elif (status.get("usb") or {}).get("state") == "error":
+            self.detail.setText(
+                f"USB BACKUP FAILED  ·  {(status['usb'].get('detail') or '')}")
+            recolour(self.detail, BAD, PT_CAP, bold=True)
         elif error:
             self.detail.setText(error)
             recolour(self.detail, BAD, PT_CAP, bold=True)

@@ -25,10 +25,35 @@ RTSP_PORT = int(os.environ.get("RTSP_PORT", "8554"))
 CAM1_URL = os.environ.get("CAM1_URL", f"rtsp://{ROBOT_PI_IP}:{RTSP_PORT}/cam1")
 CAM2_URL = os.environ.get("CAM2_URL", f"rtsp://{ROBOT_PI_IP}:{RTSP_PORT}/cam2")
 
+# What each camera IS, not just its number: CAM 1 looks out the FRONT of the
+# robot, CAM 2 out the BACK (operator spec 2026-08-18). The label rides on the
+# panel header, the top-bar chip and the recording file names, so footage from
+# a duct can be told apart without remembering which number faced which way.
+_LABELS_RAW = os.environ.get("CAM_LABELS", "FRONT,BACK")
+CAM_LABELS = [v.strip() for v in _LABELS_RAW.split(",")]
+
+
+def camera_label(index):
+    """FRONT / BACK / '' for camera `index` (0-based)."""
+    return CAM_LABELS[index] if index < len(CAM_LABELS) else ""
+
+
+def camera_name(index):
+    """Display name: 'CAM 1 · FRONT'."""
+    label = camera_label(index)
+    return f"CAM {index + 1} · {label}" if label else f"CAM {index + 1}"
+
+
+def camera_slug(index):
+    """Filename stem: 'cam1_front'. Filesystem-safe, unlike the display name."""
+    label = camera_label(index)
+    return f"cam{index + 1}_{label.lower()}" if label else f"cam{index + 1}"
+
+
 # (label, url) pairs rendered left-to-right in the GUI.
 CAMERAS = [
-    ("CAM 1", CAM1_URL),
-    ("CAM 2", CAM2_URL),
+    (camera_name(0), CAM1_URL),
+    (camera_name(1), CAM2_URL),
 ]
 
 # Simplest way to set your two streams: edit cameras.txt next to this file,
@@ -42,7 +67,7 @@ if os.path.exists(_CAM_FILE):
             if line.strip() and not line.lstrip().startswith("#")
         ]
     if _urls:
-        CAMERAS = [(f"CAM {i + 1}", url) for i, url in enumerate(_urls)]
+        CAMERAS = [(camera_name(i), url) for i, url in enumerate(_urls)]
         CAM1_URL = CAMERAS[0][1]
         CAM2_URL = CAMERAS[1][1] if len(CAMERAS) > 1 else CAM1_URL
 
@@ -275,6 +300,23 @@ RECORD_MIN_FREE_MB = int(os.environ.get("RECORD_MIN_FREE_MB", "512"))
 # window down and the SAVE pill pulses for the whole of it. Set
 # RECORD_CONFIRM_S=0 to go back to keeping everything automatically.
 RECORD_CONFIRM_S = float(os.environ.get("RECORD_CONFIRM_S", "15"))
+
+# Record a third file per clip - full_nnn.mp4 - with BOTH cameras side by side
+# in one frame (front left, back right, each tile labelled). This is what gets
+# handed to whoever asked for "the video" singular; the per-camera files stay
+# because the combined view halves each camera's pixels.
+#
+# Costs one more encoder (~0.4 core at 480p15) on top of the two per-camera
+# ones. If the Pi starts dropping UI frames with everything rolling, set
+# RECORD_COMBINED=0 or lower COMBINED_HEIGHT before touching anything else.
+RECORD_COMBINED = os.environ.get("RECORD_COMBINED", "1") == "1"
+COMBINED_HEIGHT = int(os.environ.get("COMBINED_HEIGHT", "480"))
+
+# Where usb_backup.py (a separate root daemon) publishes its transfer status,
+# and where the viewer reads it from to show "data is transferring" in the
+# strip. /run is tmpfs: root-writable, world-readable, gone on reboot - all
+# three of which are right for live status.
+USB_STATUS_PATH = os.environ.get("USB_STATUS_PATH", "/run/usb_backup_status.json")
 
 # How long the SAVE button must be HELD, after a stop, to claim the recording.
 # A press-and-hold rather than a tap on purpose (operator spec 2026-08-18):

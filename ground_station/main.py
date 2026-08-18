@@ -30,6 +30,7 @@ Keys:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -242,6 +243,10 @@ class GroundStationWindow(QWidget):
             )
             for index, (name, url) in enumerate(cameras)
         ]
+        # Filename identity, distinct from the display name: 'CAM 1 · FRONT'
+        # on screen is cam1_front on disk. SessionManager reads .slug.
+        for index, stream in enumerate(self.streams):
+            stream.slug = config.camera_slug(index)
         self.panels = [CameraPanel(s) for s in self.streams]
 
         # --- top bar --------------------------------------------------------
@@ -292,6 +297,12 @@ class GroundStationWindow(QWidget):
         # give (no gpiod, pins busy, INPUTS_ENABLED=0). Letting the keys fight a
         # live switch would mean the panel showing STOPPED while a file grows.
         self._kbd_session = None
+
+        # The USB backup daemon's status file, re-read at most once a second.
+        # A missing or stale file is simply "no transfer" - the daemon is a
+        # separate root process and the viewer must not care whether it is up.
+        self._usb = {}
+        self._usb_read_at = 0.0
 
         # --- video row ------------------------------------------------------
         video_row = QHBoxLayout()
@@ -386,6 +397,28 @@ class GroundStationWindow(QWidget):
         if not self.session.finalize():
             self.session.save_clip()
 
+    def _usb_status(self):
+        """The backup daemon's published state, or {} when there is none.
+
+        Re-read at most once a second - it is a tmpfs file, but 30 reads a
+        second for a value that changes every two is still noise. A file whose
+        daemon has stopped stamping it is treated as absent rather than shown:
+        a strip stuck on "transferring" after the daemon died would have the
+        operator waiting on a copy that is not happening.
+        """
+        now = time.monotonic()
+        if now - self._usb_read_at >= 1.0:
+            self._usb_read_at = now
+            try:
+                with open(config.USB_STATUS_PATH, encoding="utf-8") as fh:
+                    usb = json.load(fh) or {}
+            except (OSError, ValueError):
+                usb = {}
+            if time.time() - (usb.get("updated") or 0) > 10.0:
+                usb = {}
+            self._usb = usb
+        return self._usb
+
     def _session_state(self, snapshot):
         """Switch state if the panel is readable, otherwise the keyboard latch.
 
@@ -473,6 +506,10 @@ class GroundStationWindow(QWidget):
         # landing on the last frame of the window is honoured rather than raced.
         self.session.poll()
         status = self.session.status()
+        # The USB transfer rides in the same status dict the strip renders, so
+        # "data is transferring" appears exactly where the operator already
+        # looks for recording state.
+        status["usb"] = self._usb_status()
         # Drawing the strip must never be able to strand the motors. Everything
         # below this block is the demand the Uno keeps transmitting at 50Hz, so
         # an exception raised in here used to skip the rest of tick() and leave
@@ -659,7 +696,7 @@ def main():
     _load_video_stack()
 
     cameras = (
-        [(f"CAM {i + 1}", url) for i, url in enumerate(urls)]
+        [(config.camera_name(i), url) for i, url in enumerate(urls)]
         if urls else config.CAMERAS
     )
 

@@ -56,13 +56,16 @@ import config
 # second of it spent before the splash can paint. Only the encoder thread needs
 # it, and by the time that runs main.py has loaded the video stack anyway.
 cv2 = None
+np = None
 
 
 def _load_cv2():
-    global cv2
+    global cv2, np
     if cv2 is None:
         import cv2 as _cv2
+        import numpy as _np
         cv2 = _cv2
+        np = _np
 
 # inputs.py owns the vocabulary; importing it here keeps one definition of the
 # three state strings rather than a second set that can drift.
@@ -121,6 +124,67 @@ def free_mb(path):
         return shutil.disk_usage(probe).free / (1024 * 1024)
     except OSError:
         return None
+
+
+class CombinedView:
+    """A pseudo-stream: every real camera side by side in ONE frame.
+
+    Quacks exactly like RTSPStream where CameraRecorder is concerned - .name,
+    .slug, .latest() -> (frame, seq) - so the recorder that encodes it is the
+    same code that encodes a camera, and the full view inherits the wall-clock
+    timeline, the disk-space guard and the error reporting for free.
+
+    Composition happens INSIDE latest(), i.e. on the encoder thread at
+    RECORD_FPS, not per decoded frame: two resizes to COMBINED_HEIGHT plus an
+    hstack ~ a millisecond, and doing it 15x/s instead of 25x/s per camera is
+    the cheap direction. The GUI never sees this object.
+
+    A camera that has not delivered yet gets its LAST frame, then a black tile,
+    so one dead camera cannot black out the other's half of the record - the
+    same hold-the-last-frame honesty the per-camera files have.
+    """
+
+    def __init__(self, streams, height=None):
+        self.streams = streams
+        self.name = "FULL VIEW"
+        self.slug = "full"
+        self.height = height or config.COMBINED_HEIGHT
+        self._last = [None] * len(streams)
+        self._seq = 0
+
+    def _tile(self, index, frame):
+        h = self.height
+        if frame is None:
+            frame = self._last[index]
+        if frame is None:
+            # Nothing ever decoded: a black 16:9 placeholder keeps the canvas
+            # geometry stable until the camera shows up.
+            return np.zeros((h, h * 16 // 9, 3), dtype=np.uint8)
+        self._last[index] = frame
+        fh, fw = frame.shape[:2]
+        tile = cv2.resize(frame, (max(2, int(round(fw * h / fh))) // 2 * 2, h),
+                          interpolation=cv2.INTER_AREA)
+        label = config.camera_label(index) or f"CAM {index + 1}"
+        # Label burned into the pixels, not into metadata: the file gets copied
+        # to USB and watched anywhere, so FRONT/BACK has to travel inside it.
+        cv2.putText(tile, label, (8, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(tile, label, (8, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (255, 255, 255), 1, cv2.LINE_AA)
+        return tile
+
+    def latest(self):
+        frames, seq_sum = [], 0
+        for stream in self.streams:
+            frame, seq = stream.latest()
+            frames.append(frame)
+            seq_sum += seq or 0
+        if all(f is None for f in frames) and all(f is None for f in self._last):
+            return None, 0
+        canvas = np.hstack([self._tile(i, f) for i, f in enumerate(frames)])
+        # Monotonic even if a camera reconnects and its seq resets.
+        self._seq = max(self._seq + 1, seq_sum)
+        return canvas, self._seq
 
 
 class CameraRecorder(threading.Thread):
@@ -338,11 +402,13 @@ class SessionManager:
     back out. Everything below the API is idempotent, so calling set_state()
     thirty times a second with the same value costs nothing.
 
-    Layout on disk - one directory per session, one file per camera per clip:
+    Layout on disk - one directory per session, one file per camera per clip,
+    plus the side-by-side FULL VIEW (see CombinedView):
 
-        /recordings/20260815_134500_SESSION001/cam1_001.mp4
-                                               cam2_001.mp4
-                                               cam1_002.mp4  <- after a SAVE press
+        /recordings/20260815_134500_SESSION001/cam1_front_001.mp4
+                                               cam2_back_001.mp4
+                                               full_001.mp4
+                                               cam1_front_002.mp4  <- after SAVE
     """
 
     # How long the SAVED confirmation stays on screen. Long enough to read
@@ -351,8 +417,16 @@ class SessionManager:
 
     def __init__(self, streams, root=None):
         self.root = root or config.RECORD_DIR
+        sources = list(streams)
+        # The FULL VIEW is a session output, so it is created here rather than
+        # by main.py: anything that records through a SessionManager gets the
+        # combined file with no extra wiring, the headless test included.
+        if config.RECORD_COMBINED and len(sources) > 1:
+            sources.append(CombinedView(sources[:]))
         self.recorders = [
-            CameraRecorder(s, s.name.lower().replace(" ", "")) for s in streams
+            CameraRecorder(
+                s, getattr(s, "slug", None) or s.name.lower().replace(" ", ""))
+            for s in sources
         ]
         for rec in self.recorders:
             rec.start()
