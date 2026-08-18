@@ -143,6 +143,15 @@ CENTRE_TOLERANCE = float(os.environ.get("INPUTS_CENTRE_TOLERANCE", "0.25"))
 # and without this the wheels creep whenever the rig is powered up.
 AXIS_DEADBAND = float(os.environ.get("INPUTS_AXIS_DEADBAND", "0.08"))
 
+# Which way the stick's electrical travel maps onto the robot's motion. Y is
+# inverted by default because the rig's pot is mounted so that pushing the
+# stick FORWARD lowers the wiper voltage - measured 2026-08-18 ("front and
+# back reverse run"): stick forward drove the tyres backward. Flip these, not
+# the mixer or the sketch, if a re-mount ever reverses an axis again - this is
+# the one place that knows about stick orientation.
+INVERT_X = os.environ.get("INPUTS_INVERT_X", "0") == "1"
+INVERT_Y = os.environ.get("INPUTS_INVERT_Y", "1") == "1"
+
 # Raw reads kept per channel for median smoothing.
 #
 # A single bad transfer on a bit-banged bus produces a wild count, and a wild
@@ -1046,8 +1055,17 @@ class InputReader(threading.Thread):
         else:
             self._dead_reads = 0
 
+        x_norm = self._norm_axis(0, x_raw)
+        y_norm = self._norm_axis(1, y_raw)
+        # Orientation applied AFTER normalisation, so the centre learner and
+        # every validation gate reason about raw electrical travel and only
+        # the demand the motors see is flipped. See INVERT_X / INVERT_Y.
+        if x_norm is not None and INVERT_X:
+            x_norm = -x_norm
+        if y_norm is not None and INVERT_Y:
+            y_norm = -y_norm
         analog["joy"] = {
-            "x": self._norm_axis(0, x_raw), "y": self._norm_axis(1, y_raw),
+            "x": x_norm, "y": y_norm,
             "x_raw": x_raw, "y_raw": y_raw,
         }
         analog["pot"] = (
