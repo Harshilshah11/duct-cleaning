@@ -625,9 +625,18 @@ class SessionView(QWidget):
             recolour(self.detail, TONES[tone_key][0], PT_CAP, bold=True)
         elif left is not None:
             clips = status.get("pending_clips") or 0
-            self.detail.setText(
-                f"press SAVE to keep  ·  {clips} clip{'s' if clips != 1 else ''}"
-                f"  {hms(status.get('pending_held'))}")
+            hold = status.get("save_hold") or 0.0
+            need = status.get("save_hold_need") or 3.0
+            if hold > 0.0:
+                # Mid-hold the only number that matters is how much longer -
+                # counted down live so the operator never guesses at 3 seconds.
+                self.detail.setText(
+                    f"keep holding SAVE  ·  {max(0.0, need - hold):.1f}s")
+            else:
+                self.detail.setText(
+                    f"hold SAVE {need:.0f}s to keep  ·  "
+                    f"{clips} clip{'s' if clips != 1 else ''}"
+                    f"  {hms(status.get('pending_held'))}")
             recolour(self.detail, WARN, PT_CAP, bold=True)
         elif error:
             self.detail.setText(error)

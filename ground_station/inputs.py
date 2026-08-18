@@ -358,6 +358,10 @@ def _blank():
         "session_pins": {REC_PIN: None, PAUSE_PIN: None},
         # Total open->closed edges seen on the save button since start-up.
         "save_presses": 0,
+        # Seconds the save button has been continuously held closed, 0.0 while
+        # open. The recorder's post-stop claim is a press-AND-HOLD, so the
+        # consumer needs the level's duration as well as the edge count above.
+        "save_held_s": 0.0,
         "joy": {"x": None, "y": None, "x_raw": None, "y_raw": None},
         "pot": {"pct": None, "raw": None, "volts": None},
         "updated": 0.0,
@@ -438,6 +442,7 @@ class InputReader(threading.Thread):
         self._session = SessionDecode()
         self._save_presses = 0
         self._save_was = None
+        self._save_down_since = None   # monotonic when the hold began
         self._stable = {}           # pin -> last believed `closed`
         self._candidate = {}        # pin -> (value, consecutive samples seen)
         self._dead_reads = 0        # consecutive all-None ADC polls
@@ -877,6 +882,16 @@ class InputReader(threading.Thread):
             self._save_presses += 1
         self._save_was = closed[SAVE_PIN]
         state["save_presses"] = self._save_presses
+
+        # Hold duration, measured off the DEBOUNCED level so the 43ms glitches
+        # that forced DEBOUNCE_SAMPLES cannot restart the clock mid-hold.
+        if closed[SAVE_PIN]:
+            if self._save_down_since is None:
+                self._save_down_since = time.monotonic()
+            state["save_held_s"] = time.monotonic() - self._save_down_since
+        else:
+            self._save_down_since = None
+            state["save_held_s"] = 0.0
 
         state["ok"] = True
         state["switch_error"] = None

@@ -10,7 +10,10 @@ WHAT DRIVES IT (inputs.py decodes the pins, this acts on the decode):
 
     switch 1, red leg, GPIO24 .... START / STOP
     switch 2, green leg, GPIO23 .. PAUSE / RESUME
-    button,   GPIO25 ............. SAVE - cut the current clip, keep rolling
+    button,   GPIO25 ............. SAVE - while rolling, a tap cuts the clip
+                                   and keeps rolling; after STOP, HOLDING it
+                                   for RECORD_SAVE_HOLD_S (3s) finalizes the
+                                   session into RECORD_DIR (/recordings)
 
 WHY IT RE-ENCODES THE DECODED FRAMES rather than copying the RTSP stream with
 ffmpeg, which would be nearly free:
@@ -73,7 +76,28 @@ PENDING = "SAVE?"
 
 
 def _stamp(when=None):
-    return (when or datetime.now()).strftime("%Y%m%d-%H%M%S")
+    # YYYYMMDD_HHMMSS - the operator-specified convention for session names.
+    return (when or datetime.now()).strftime("%Y%m%d_%H%M%S")
+
+
+def _next_session_no(root):
+    """1 + the highest SESSIONnnn already in `root`, so numbers never repeat.
+
+    Scanned from disk on every start rather than counted in memory: the counter
+    has to survive viewer restarts, and the directory listing IS the durable
+    record of how many sessions exist. An unreadable root (first boot, no
+    /recordings yet) starts at 1.
+    """
+    import re
+    highest = 0
+    try:
+        for name in os.listdir(root):
+            m = re.search(r"_SESSION(\d+)$", name)
+            if m:
+                highest = max(highest, int(m.group(1)))
+    except OSError:
+        pass
+    return highest + 1
 
 
 def hms(seconds):
@@ -316,9 +340,9 @@ class SessionManager:
 
     Layout on disk - one directory per session, one file per camera per clip:
 
-        ~/recordings/20260815-134500/cam1_001.mp4
-                                     cam2_001.mp4
-                                     cam1_002.mp4   <- after a SAVE press
+        /recordings/20260815_134500_SESSION001/cam1_001.mp4
+                                               cam2_001.mp4
+                                               cam1_002.mp4  <- after a SAVE press
     """
 
     # How long the SAVED confirmation stays on screen. Long enough to read
@@ -348,6 +372,7 @@ class SessionManager:
 
         self._toast = None          # (text, detail, monotonic_expiry)
         self._last_saves = None     # last save_presses count acted on
+        self._hold_s = 0.0          # how long SAVE is currently held (pushed in)
 
         # Every file this session has handed to a recorder, so a discard can
         # remove exactly what was written and nothing else - see _discard().
@@ -407,7 +432,10 @@ class SessionManager:
             self._resolve_pending(keep=False, reason="superseded")
 
         self.session_started = datetime.now()
-        self.session_dir = os.path.join(self.root, _stamp(self.session_started))
+        self.session_dir = os.path.join(
+            self.root,
+            f"{_stamp(self.session_started)}"
+            f"_SESSION{_next_session_no(self.root):03d}")
         os.makedirs(self.session_dir, exist_ok=True)
         self.clip = 0
         self._written = []
@@ -573,13 +601,17 @@ class SessionManager:
         and let the run continue, rather than having to stop and lose whatever
         comes next down the duct.
 
-        In the window after STOP, it claims the whole recording. Same button,
-        same meaning to the operator ("keep that"), so it needs no second
-        control and no explaining.
+        In the window after STOP, a tap only HINTS: claiming the whole session
+        is a press-and-hold (RECORD_SAVE_HOLD_S, see on_save_hold), so a stray
+        tap of the same button that banks clips mid-run cannot silently commit
+        a whole recording. The hint teaches the gesture at the exact moment it
+        is needed.
         """
         if self._pending:
-            self._resolve_pending(keep=True)
-            return True
+            # No toast: the strip's pending line already reads "hold SAVE ...",
+            # and a toast would sit on top of the live keep-holding countdown
+            # for TOAST_S - exactly the seconds the operator needs to see it.
+            return False
 
         if self.state == STOPPED or self.session_dir is None:
             self._toast_now("NOTHING TO SAVE", "not recording")
@@ -611,6 +643,38 @@ class SessionManager:
             self._last_saves = presses
             if fire:
                 self.save_clip()
+
+    def finalize(self):
+        """Claim the unclaimed recording NOW. True if there was one to claim.
+
+        The programmatic form of the 3s hold - the keyboard fallback and
+        shutdown use it, the GPIO path arrives via on_save_hold().
+        """
+        if not self._pending:
+            return False
+        self._resolve_pending(keep=True)
+        return True
+
+    def on_save_hold(self, held_s):
+        """Push how long GPIO25 has been held. main.py calls this every frame.
+
+        The press-and-hold that finalizes a stopped recording (operator spec
+        2026-08-18): after STOP, holding SAVE for RECORD_SAVE_HOLD_S claims the
+        session into RECORD_DIR. Level-driven rather than edge-driven because a
+        hold IS a level - and while the button is down the confirm window is
+        pushed back, so a hold that starts on the window's last second is
+        honoured instead of the countdown deleting the files mid-hold.
+        """
+        self._hold_s = held_s or 0.0
+        if not self._pending or self._hold_s <= 0.0:
+            return
+        if self._hold_s >= config.RECORD_SAVE_HOLD_S:
+            self._resolve_pending(keep=True)
+            return
+        self._pending["until"] = max(
+            self._pending["until"],
+            time.monotonic()
+            + (config.RECORD_SAVE_HOLD_S - self._hold_s) + 1.0)
 
     def on_inputs(self, snapshot):
         """Apply one whole inputs.py snapshot. Convenience for callers with no
@@ -645,6 +709,10 @@ class SessionManager:
             "pending_left": left,
             "pending_held": self._pending["held"] if self._pending else None,
             "pending_clips": self._pending["clips"] if self._pending else None,
+            # Progress of the press-and-hold, so the strip can count it down
+            # live instead of the operator guessing when 3 seconds is up.
+            "save_hold": self._hold_s if self._pending else None,
+            "save_hold_need": config.RECORD_SAVE_HOLD_S,
             "elapsed": self._elapsed(),
             "clip": self.clip,
             "clip_elapsed": self._clip_elapsed(),

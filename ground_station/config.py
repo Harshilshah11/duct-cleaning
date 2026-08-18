@@ -235,8 +235,14 @@ SNAPSHOT_DIR = os.path.expanduser(os.environ.get("SNAPSHOT_DIR", "~/snapshots"))
 # --- Recording ---------------------------------------------------------------
 # Driven by the two panel switches (see inputs.py): switch 1 on GPIO24 is
 # START/STOP, switch 2 on GPIO23 is PAUSE/RESUME. Each run gets its own
-# directory under RECORD_DIR, with one file per camera inside it.
-RECORD_DIR = os.path.expanduser(os.environ.get("RECORD_DIR", "~/recordings"))
+# directory under RECORD_DIR, named YYYYMMDD_HHMMSS_SESSIONnnn, with one file
+# per camera inside it.
+#
+# /recordings (not ~/recordings) is the spec: ONE fixed folder on the Pi that
+# the USB backup daemon (usb_backup.py) mirrors verbatim onto any stick that
+# is plugged in. Created root-side with `sudo mkdir /recordings && sudo chown
+# arnobot:arnobot /recordings`.
+RECORD_DIR = os.path.expanduser(os.environ.get("RECORD_DIR", "/recordings"))
 
 # Frames are re-encoded from the ones already decoded for the screen, so this is
 # a straight CPU cost on top of the decode: ~0.4 of a core per 720p camera at 15.
@@ -269,3 +275,11 @@ RECORD_MIN_FREE_MB = int(os.environ.get("RECORD_MIN_FREE_MB", "512"))
 # window down and the SAVE pill pulses for the whole of it. Set
 # RECORD_CONFIRM_S=0 to go back to keeping everything automatically.
 RECORD_CONFIRM_S = float(os.environ.get("RECORD_CONFIRM_S", "15"))
+
+# How long the SAVE button must be HELD, after a stop, to claim the recording.
+# A press-and-hold rather than a tap on purpose (operator spec 2026-08-18):
+# the same physical button banks clips mid-run on a tap, so the gesture that
+# permanently keeps a whole session is made deliberate. The confirm window
+# above is extended while the button is down, so a hold started on the last
+# second still lands.
+RECORD_SAVE_HOLD_S = float(os.environ.get("RECORD_SAVE_HOLD_S", "3.0"))

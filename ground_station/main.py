@@ -380,7 +380,11 @@ class GroundStationWindow(QWidget):
             self._kbd_session = "RECORDING"
 
     def session_save(self):
-        self.session.save_clip()
+        # Bench-only key, so it stands in for the whole gesture: a held key
+        # does not deliver a measurable 3s level the way GPIO25 does, so in the
+        # post-stop window Ctrl+S claims the recording directly.
+        if not self.session.finalize():
+            self.session.save_clip()
 
     def _session_state(self, snapshot):
         """Switch state if the panel is readable, otherwise the keyboard latch.
@@ -461,9 +465,12 @@ class GroundStationWindow(QWidget):
         # than one frame stale.
         self.session.set_state(self._session_state(snapshot))
         self.session.on_save_button(snapshot.get("save_presses"))
+        # The hold level as well as the press edges: holding SAVE for 3s after
+        # a stop is what finalizes the recording into /recordings.
+        self.session.on_save_hold(snapshot.get("save_held_s"))
         # Expires the post-stop confirm window, which can delete the recording.
-        # After the save button, so a press landing on the last frame of the
-        # window is honoured rather than raced.
+        # After the save button and the hold, so a press or a completed hold
+        # landing on the last frame of the window is honoured rather than raced.
         self.session.poll()
         status = self.session.status()
         # Drawing the strip must never be able to strand the motors. Everything
