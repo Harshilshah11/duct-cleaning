@@ -154,8 +154,10 @@ AXIS_DEADBAND = float(os.environ.get("INPUTS_AXIS_DEADBAND", "0.08"))
 # polarity is a property of the WIRING, so re-verify all four directions on
 # the real robot after any analog rework, and expect to touch only these two
 # values when it changes.
+# Final orientation confirmed on the robot 2026-08-18 night: left/right true,
+# forward/back reversed - so Y alone is flipped.
 INVERT_X = os.environ.get("INPUTS_INVERT_X", "0") == "1"
-INVERT_Y = os.environ.get("INPUTS_INVERT_Y", "0") == "1"
+INVERT_Y = os.environ.get("INPUTS_INVERT_Y", "1") == "1"
 
 # Raw reads kept per channel for median smoothing.
 #
