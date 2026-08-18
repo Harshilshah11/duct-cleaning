@@ -143,14 +143,19 @@ CENTRE_TOLERANCE = float(os.environ.get("INPUTS_CENTRE_TOLERANCE", "0.25"))
 # and without this the wheels creep whenever the rig is powered up.
 AXIS_DEADBAND = float(os.environ.get("INPUTS_AXIS_DEADBAND", "0.08"))
 
-# Which way the stick's electrical travel maps onto the robot's motion. BOTH
-# axes are inverted by default because the rig's stick is mounted with both
-# pots reversed relative to the mixer's convention - measured 2026-08-18 on
-# the real robot: forward drove backward, then left turned right. Flip these,
-# not the mixer or the sketch, if a re-mount ever reverses an axis again -
-# this is the one place that knows about stick orientation.
-INVERT_X = os.environ.get("INPUTS_INVERT_X", "1") == "1"
-INVERT_Y = os.environ.get("INPUTS_INVERT_Y", "1") == "1"
+# Which way the stick's electrical travel maps onto the robot's motion. Flip
+# these, not the mixer or the sketch, if a re-mount ever reverses an axis
+# again - this is the one place that knows about stick orientation.
+#
+# History, because this has now flipped TWICE in one day (2026-08-18): both
+# axes were inverted in the evening after the robot drove against the hand -
+# then the ADC harness was rewired later that night and both axes came out
+# reversed AGAIN, so the defaults went back to 0. The lesson: the stick's
+# polarity is a property of the WIRING, so re-verify all four directions on
+# the real robot after any analog rework, and expect to touch only these two
+# values when it changes.
+INVERT_X = os.environ.get("INPUTS_INVERT_X", "0") == "1"
+INVERT_Y = os.environ.get("INPUTS_INVERT_Y", "0") == "1"
 
 # Raw reads kept per channel for median smoothing.
 #
@@ -197,7 +202,14 @@ ADC_AGREE_REJECT = float(os.environ.get("INPUTS_ADC_AGREE_REJECT", "0.01"))
 #    confirmation is already there in the next sample, so this costs one poll
 #    (~30 ms) on a fast flick and nothing at all on a steady deflection -- and it
 #    makes it arithmetically impossible for ONE bad transfer to reach the wheels.
-ADC_JUMP_LIMIT = float(os.environ.get("INPUTS_ADC_JUMP_LIMIT", "0.35"))
+#    Raised 0.35 -> 0.50 on 2026-08-18 night: during fast continuous shaking
+#    every direction change re-tripped the 35% limit (a hard flick covers
+#    ~5000-7000 counts per 35 Hz sample, right at the old threshold) and the
+#    constant one-sample rejections compounded with the noise gate into "the
+#    stick is stuck". At 50% only a genuinely impossible move trips it - a
+#    single wild transfer like 0 -> 16383 still cannot pass - and a hand no
+#    longer can.
+ADC_JUMP_LIMIT = float(os.environ.get("INPUTS_ADC_JUMP_LIMIT", "0.50"))
 ADC_JUMP_CONFIRM = int(os.environ.get("INPUTS_ADC_JUMP_CONFIRM", "2"))
 
 # Outside the rail is not a reading at all. The ADS1115 is signed and a shifted or
@@ -224,18 +236,20 @@ ADC_RANGE_MARGIN = float(os.environ.get("INPUTS_ADC_RANGE_MARGIN", "0.06"))
 #    counted). Costs nothing on a healthy channel, and turns a loose harness
 #    into "no ADC" on the strip instead of a twitching robot.
 #
-#    REVERSALS is 4 and the flip floor 96 counts, retuned 2026-08-18 evening
-#    from 3/32 after the first cut blanked the stick under deliberate FAST
-#    up-down shaking ("data is stuck"): a vigorous ~5 Hz wiggle at the ~35 Hz
-#    poll reverses every ~4 samples, i.e. 2-3 flips per window, and tremor
-#    around each turnaround pushed it over the old floor. 4 large flips in 7
-#    deltas needs a ~9 Hz full-band oscillation, which a hand cannot do and a
-#    random-walk float does constantly. Do not raise further without watching
-#    rej=noise against a real float - every notch up is margin the float
-#    needs to walk through.
+#    REVERSALS retuned twice on 2026-08-18, both times against a real hand on
+#    the real rig: 3 -> 4 after ~5 Hz up-down shaking blanked (2-3 flips per
+#    window plus turnaround tremor over the 32-count floor), then 4 -> 5 with
+#    the floor at 96 after fast four-direction stick work STILL stuck
+#    (rej=noise reached 5340 in one session; at genuinely fast shakes the
+#    turnaround legs are large, so the floor cannot separate them). At 5 of 7
+#    deltas only near-every-sample jitter trips - which is exactly what a
+#    float's random walk does and a hand at any speed measured so far does
+#    not. This is the LAST notch: at 6 the gate cannot fire at all inside an
+#    8-sample window with the floor applied, so if a hand ever hits 5, shrink
+#    the demand another way (lower ADC_NOISE_BAND) rather than raising this.
 ADC_NOISE_WINDOW = int(os.environ.get("INPUTS_ADC_NOISE_WINDOW", "8"))
 ADC_NOISE_BAND = float(os.environ.get("INPUTS_ADC_NOISE_BAND", "0.04"))
-ADC_NOISE_REVERSALS = int(os.environ.get("INPUTS_ADC_NOISE_REVERSALS", "4"))
+ADC_NOISE_REVERSALS = int(os.environ.get("INPUTS_ADC_NOISE_REVERSALS", "5"))
 ADC_NOISE_FLIP_MIN = int(os.environ.get("INPUTS_ADC_NOISE_FLIP_MIN", "96"))
 
 # 4. A WIPER THAT LOSES CONTACT MID-TRAVEL READS EXACTLY 0x3FFF - all data
