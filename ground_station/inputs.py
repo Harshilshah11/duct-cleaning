@@ -220,12 +220,23 @@ ADC_RANGE_MARGIN = float(os.environ.get("INPUTS_ADC_RANGE_MARGIN", "0.06"))
 #    ADC_NOISE_BAND of full scale AND the deltas flipped sign at least
 #    ADC_NOISE_REVERSALS times, the channel is floating, not driven - blank it.
 #    A resting stick fails the spread test (tens of counts). A sweep fails the
-#    reversal test (deltas all one sign; flips below 32 counts are LSB noise
-#    and not counted). Costs nothing on a healthy channel, and turns a loose
-#    harness into "no ADC" on the strip instead of a twitching robot.
+#    reversal test (deltas all one sign; small flips are LSB noise and not
+#    counted). Costs nothing on a healthy channel, and turns a loose harness
+#    into "no ADC" on the strip instead of a twitching robot.
+#
+#    REVERSALS is 4 and the flip floor 96 counts, retuned 2026-08-18 evening
+#    from 3/32 after the first cut blanked the stick under deliberate FAST
+#    up-down shaking ("data is stuck"): a vigorous ~5 Hz wiggle at the ~35 Hz
+#    poll reverses every ~4 samples, i.e. 2-3 flips per window, and tremor
+#    around each turnaround pushed it over the old floor. 4 large flips in 7
+#    deltas needs a ~9 Hz full-band oscillation, which a hand cannot do and a
+#    random-walk float does constantly. Do not raise further without watching
+#    rej=noise against a real float - every notch up is margin the float
+#    needs to walk through.
 ADC_NOISE_WINDOW = int(os.environ.get("INPUTS_ADC_NOISE_WINDOW", "8"))
 ADC_NOISE_BAND = float(os.environ.get("INPUTS_ADC_NOISE_BAND", "0.04"))
-ADC_NOISE_REVERSALS = int(os.environ.get("INPUTS_ADC_NOISE_REVERSALS", "3"))
+ADC_NOISE_REVERSALS = int(os.environ.get("INPUTS_ADC_NOISE_REVERSALS", "4"))
+ADC_NOISE_FLIP_MIN = int(os.environ.get("INPUTS_ADC_NOISE_FLIP_MIN", "96"))
 
 # 4. A WIPER THAT LOSES CONTACT MID-TRAVEL READS EXACTLY 0x3FFF - all data
 #    bits floating high - which is 16383, INSIDE the stick's real 0..17600
@@ -889,8 +900,12 @@ class InputReader(threading.Thread):
             spread = max(buf) - min(buf)
             if spread > ADC_NOISE_BAND * FULL_SCALE:
                 deltas = [b - a for a, b in zip(buf, buf[1:])]
+                # A flip counts only when BOTH legs are substantial: a hand
+                # reversing direction dwells at the turnaround (tiny deltas),
+                # a float's random walk reverses at full stride.
                 flips = sum(1 for a, b in zip(deltas, deltas[1:])
-                            if a * b < 0 and abs(b) > 32)
+                            if a * b < 0 and abs(a) > ADC_NOISE_FLIP_MIN
+                            and abs(b) > ADC_NOISE_FLIP_MIN)
                 if flips >= ADC_NOISE_REVERSALS:
                     self._rejects["noise"] += 1
                     return None
