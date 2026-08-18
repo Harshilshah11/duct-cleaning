@@ -319,9 +319,12 @@ class JoystickView(QWidget):
 
         r = 5.0
         half = (box.width() - 14) / 2.0
-        # Screen Y grows downward, so the axis is negated: pushing the stick
-        # "up" has to move the dot up, not down.
-        dx, dy = cx + self._x * half, cy - self._y * half
+        # The one rule here: pushing the stick "up" must move the dot up.
+        # Which SIGN that takes depends on the stick wiring and INVERT_Y, so
+        # it was set empirically on the rig (2026-08-18: the dot mirrored the
+        # hand vertically after the harness rework settled on INVERT_Y=1).
+        # If a future rewire flips the dot again, flip this + back to -.
+        dx, dy = cx + self._x * half, cy + self._y * half
         p.setPen(QPen(QColor(ACCENT), 1))
         p.setBrush(QColor(ACCENT))
         p.drawEllipse(QRectF(dx - r, dy - r, r * 2, r * 2))
