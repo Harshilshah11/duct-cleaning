@@ -8,9 +8,9 @@ touches Qt.
 
 WHAT DRIVES IT (inputs.py decodes the pins, this acts on the decode):
 
-    switch 1, red leg, GPIO24 .... START / STOP
-    switch 2, green leg, GPIO23 .. PAUSE / RESUME
-    button,   GPIO25 ............. SAVE - while rolling, a tap cuts the clip
+    switch 1, red leg, GPIO22 .... START / STOP
+    switch 2, green leg, GPIO11 .. PAUSE / RESUME
+    button,   GPIO9 .............. SAVE - while rolling, a tap cuts the clip
                                    and keeps rolling; after STOP, HOLDING it
                                    for RECORD_SAVE_HOLD_S (3s) finalizes the
                                    session into RECORD_DIR (/recordings)

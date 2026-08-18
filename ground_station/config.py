@@ -258,8 +258,8 @@ OPEN_TIMEOUT_S = float(os.environ.get("OPEN_TIMEOUT_S", "4.0"))
 SNAPSHOT_DIR = os.path.expanduser(os.environ.get("SNAPSHOT_DIR", "~/snapshots"))
 
 # --- Recording ---------------------------------------------------------------
-# Driven by the two panel switches (see inputs.py): switch 1 on GPIO24 is
-# START/STOP, switch 2 on GPIO23 is PAUSE/RESUME. Each run gets its own
+# Driven by the two panel switches (see inputs.py): switch 1 on GPIO22 is
+# START/STOP, switch 2 on GPIO11 is PAUSE/RESUME. Each run gets its own
 # directory under RECORD_DIR, named YYYYMMDD_HHMMSS_SESSIONnnn, with one file
 # per camera inside it.
 #

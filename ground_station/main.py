@@ -16,9 +16,9 @@ On Windows, launch run_ground_station.pyw instead — same app, no console windo
 
 Recording is on the panel switches, not the keyboard (see recorder.py):
 
-    switch 1, GPIO24 ... START / STOP
-    switch 2, GPIO23 ... PAUSE / RESUME, inside the same file
-    button,   GPIO25 ... SAVE - bank the clip so far and keep rolling
+    switch 1, GPIO22 ... START / STOP
+    switch 2, GPIO11 ... PAUSE / RESUME, inside the same file
+    button,   GPIO9 .... SAVE - bank the clip so far and keep rolling
 
 Keys:
     F        fullscreen toggle        S       snapshot both panels
@@ -285,9 +285,9 @@ class GroundStationWindow(QWidget):
         self.motors.start()
 
         # --- recording -------------------------------------------------------
-        # Driven entirely by the panel switches via inputs.py: switch 1 (GPIO24)
-        # starts and stops, switch 2 (GPIO23) pauses and resumes inside the same
-        # file, and the GPIO25 button banks the clip so far and keeps rolling.
+        # Driven entirely by the panel switches via inputs.py: switch 1 (GPIO22)
+        # starts and stops, switch 2 (GPIO11) pauses and resumes inside the same
+        # file, and the GPIO9 button banks the clip so far and keeps rolling.
         # The encoders read the SAME decoded frames the panels are drawing, so
         # recording opens no second RTSP session and what lands on disk is what
         # the operator saw. See recorder.py.

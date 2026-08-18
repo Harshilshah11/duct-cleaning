@@ -167,7 +167,7 @@ def act_demand(state, pot_pct):
 
 
 def brush_demand(toggle_closed):
-    """Panel TOGGLE (Pi GPIO13) -> brush motor demand, 255 or 0.
+    """Panel TOGGLE (Pi GPIO27) -> brush motor demand, 255 or 0.
 
     TOGGLE ONLY, AT FULL SCALE. The brush briefly took its speed from the
     light's pot on 2026-08-17 and it lasted one evening: one knob feeding two

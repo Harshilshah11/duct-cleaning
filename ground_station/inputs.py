@@ -275,33 +275,36 @@ FULL_SCALE = 3.3 * COUNTS_PER_VOLT
 # (never moved) across a 30 s window in which GPIO25 moved 56 times, so the
 # updated toggle is on 25 and nothing is wired to 12.
 #
-# 23/24 are the recording controls, confirmed with Harshil 2026-08-15. They are
-# two INDEPENDENT switches, not the interlocked pair the earlier comment here
-# guessed at - measured both reading `hi` (open) at rest on 2026-08-15, whereas
-# an interlocked ON-OFF-ON pair always has one leg down. So they are decoded
-# together into a session state but each keeps its own meaning:
-#   switch 1, RED   leg, GPIO24 ... START / STOP
-#   switch 2, GREEN leg, GPIO23 ... PAUSE / RESUME
+# The recording controls are two INDEPENDENT switches, not an interlocked
+# pair - measured both reading `hi` (open) at rest on 2026-08-15 (then on
+# GPIO24/23), whereas an interlocked ON-OFF-ON pair always has one leg down.
+# They are decoded together into a session state but each keeps its own
+# meaning. Rewired to 22/11 on 2026-08-18 - see REC_PIN below:
+#   switch 1, RED   leg, GPIO22 ... START / STOP
+#   switch 2, GREEN leg, GPIO11 ... PAUSE / RESUME
 SWITCHES = [
-    ("BRUSH", 13),
-    ("SAVE", 25),
-    ("START / STOP", 24),
-    ("PAUSE / RESUME", 23),
+    ("BRUSH", 27),
+    ("SAVE", 9),
+    ("START / STOP", 22),
+    ("PAUSE / RESUME", 11),
 ]
 ACT_EXTEND_PIN = 16
 ACT_RETRACT_PIN = 19
 
 # Named separately from SWITCHES so the panel and the recorder can reference the
 # roles without matching on a display string.
-BRUSH_PIN = 13          # brush motor on / off
+# Moved 13 -> 27 on the operator's order 2026-08-18; nothing is on 13 now.
+BRUSH_PIN = 27          # brush motor on / off
 
 # Switches whose OPEN state means ON - the reverse of every other switch here.
 #
 # THE BRUSH TOGGLE IS INVERTED ON THE OPERATOR'S EXPLICIT ORDER (2026-08-17,
 # "high -> brush on, low -> brush off"): the lever is mounted so that the throw
-# Harshil uses as ON leaves GPIO13 open, and the throw used as OFF closes it to
+# Harshil uses as ON leaves the pin open, and the throw used as OFF closes it to
 # ground. Decoding it active-low therefore ran the brush in the OFF position -
-# diagnosed live, with the pad register and the wire log side by side.
+# diagnosed live, with the pad register and the wire log side by side. That was
+# measured on the OLD pin (GPIO13); the orientation carried over to GPIO27
+# unverified, so if the brush now runs with the lever OFF, empty this set.
 #
 # KNOW WHAT THIS COSTS. With the pull-up, an UNPLUGGED OR BROKEN WIRE floats
 # HIGH, and high now reads ON: a snapped toggle wire is a running brush that
@@ -311,8 +314,12 @@ BRUSH_PIN = 13          # brush motor on / off
 # switch's other outer terminal, then emptying this set, restores the fail-safe
 # orientation without any code change.
 OPEN_IS_ON = {BRUSH_PIN}
-REC_PIN = 24            # switch 1 - START / STOP
-PAUSE_PIN = 23          # switch 2 - PAUSE / RESUME
+# Rewired 2026-08-18 on the operator's order: the pair moved 24/23 -> 22/11
+# (red kept START/STOP, green kept PAUSE/RESUME - if the strip shows the two
+# levers swapped, exchange these two numbers, nothing else references them).
+# GPIO11 is SPI SCLK by default; SPI is unused on this rig, plain input here.
+REC_PIN = 22            # switch 1, RED   leg - START / STOP
+PAUSE_PIN = 11          # switch 2, GREEN leg - PAUSE / RESUME
 SESSION_PINS = (REC_PIN, PAUSE_PIN)
 
 # The three session states, in the order the operator moves through them.
@@ -321,13 +328,15 @@ RECORDING, PAUSED, STOPPED = "RECORDING", "PAUSED", "STOPPED"
 ALL_PINS = [p for _, p in SWITCHES] + [ACT_EXTEND_PIN, ACT_RETRACT_PIN]
 
 
-# The save button. GPIO25 was measured pulsing low for ~0.18 s per press, i.e.
-# it is momentary, not latching -- so its LEVEL is useless to a 30 fps UI that
-# can sample between two frames of the pulse. The reader counts edges instead
-# and publishes a running total; a consumer remembers the last count it acted on
-# and fires once per increment. That makes a missed press impossible as long as
-# the 20 Hz poll catches the pulse, which it does with ~3 samples to spare.
-SAVE_PIN = 25
+# The save button. Measured (on its old pin) pulsing low for ~0.18 s per press,
+# i.e. it is momentary, not latching -- so its LEVEL is useless to a 30 fps UI
+# that can sample between two frames of the pulse. The reader counts edges
+# instead and publishes a running total; a consumer remembers the last count it
+# acted on and fires once per increment. That makes a missed press impossible as
+# long as the 20 Hz poll catches the pulse, which it does with ~3 samples to
+# spare. Moved 25 -> 9 on the operator's order 2026-08-18 (GPIO9 is SPI MISO by
+# default, but nothing on this rig uses SPI, so it is a plain input here).
+SAVE_PIN = 9
 
 
 def _blank():
