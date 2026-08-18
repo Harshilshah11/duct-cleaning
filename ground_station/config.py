@@ -116,7 +116,39 @@ UI_FPS = int(os.environ.get("UI_FPS", "30"))  # GUI repaint rate
 # It is a *crop*, not a zoom out of thin air: whatever this hides, the operator
 # never sees. Raise it for a fuller screen, drop it to 0 to see everything the
 # camera does.
-VIDEO_ZOOM = max(0.0, min(1.0, float(os.environ.get("VIDEO_ZOOM", "0.2"))))
+# Default raised 0.2 -> 1.0 so the picture COVERS its panel with no black bands.
+# This matters much more now the cameras are rotated: a 90-degree rotation makes
+# the frame portrait inside a landscape panel, and at 0.2 that left roughly half
+# the panel black down both sides. Covering crops instead - at 1.0 nothing is
+# letterboxed but the parts of the frame outside the panel's aspect are not
+# shown. Set VIDEO_ZOOM=0 to see the whole frame again, bands and all.
+VIDEO_ZOOM = max(0.0, min(1.0, float(os.environ.get("VIDEO_ZOOM", "1.0"))))
+
+# Rotate every decoded frame, clockwise degrees: 0, 90, 180 or 270.
+#
+# The cameras are mounted on their sides on this rig, so the default is 90.
+# Applied in the capture thread with cv2.rotate (an optimised transpose) rather
+# than as a QPainter transform per panel per frame: doing it once at the source
+# keeps it off the GUI thread on a Pi that is already software-decoding two
+# streams, and means the RECORDER writes the same orientation you are looking
+# at. Rotating in the GUI would leave recordings sideways.
+#
+# 90 and 270 swap width and height, which VIDEO_ZOOM's geometry picks up on its
+# own because it reads the frame's real dimensions.
+# One value rotates every camera the same way; a comma-separated list sets them
+# individually in cameras.txt order, so "180,90" is CAM 1 upside down and CAM 2
+# on its side. A short list reuses its last value for the remaining cameras,
+# which keeps a single value working when a third camera is added.
+_ROT_RAW = os.environ.get("VIDEO_ROTATE", "180,90")
+VIDEO_ROTATE_LIST = [int(v) % 360 for v in _ROT_RAW.split(",") if v.strip()]
+VIDEO_ROTATE = VIDEO_ROTATE_LIST[0] if VIDEO_ROTATE_LIST else 0
+
+
+def rotate_for(index):
+    """Clockwise degrees for camera `index` (0-based). See VIDEO_ROTATE."""
+    if not VIDEO_ROTATE_LIST:
+        return 0
+    return VIDEO_ROTATE_LIST[min(index, len(VIDEO_ROTATE_LIST) - 1)]
 
 # Wordmark in the top bar, next to the logo.
 TITLE = os.environ.get("GS_TITLE", "GROUND CONTROL STATION")
@@ -135,6 +167,62 @@ SPLASH_MAX_S = float(os.environ.get("SPLASH_MAX_S", "8.0"))   # hand over regard
 SPLASH_PARTIAL_S = float(os.environ.get("SPLASH_PARTIAL_S", "3.5"))
 RECONNECT_DELAY_S = 2.0                        # wait before retrying a dead stream
 READ_FAIL_LIMIT = 50                           # consecutive bad reads -> reconnect
+
+# Ceiling for the exponential backoff between failed connection attempts.
+#
+# THIS IS THE SETTING THAT MAKES TWO CAMERAS WORK AT ONCE. Retrying a dead
+# camera every RECONNECT_DELAY_S forever is what broke the rig: each attempt
+# opens three separate TCP connections to the camera (reachability probe, codec
+# DESCRIBE, then rtspsrc itself), so a flat 2s retry is ~90 connections/minute
+# per camera. Measured on the real rig with both cameras configured, tcpdump
+# counted 22 new connections to :554 in 30s across the pair. These cameras run a
+# tiny embedded TCP stack and stop answering *even ARP* under that, which shows
+# up as ICMP loss and "host unreachable" - so the retry storm was manufacturing
+# the very outage it was retrying against, and each stall triggered more
+# retries. One camera stayed under the threshold; two did not, which is exactly
+# why it only ever failed with both configured.
+RECONNECT_MAX_DELAY_S = float(os.environ.get("RECONNECT_MAX_DELAY_S", "20.0"))
+
+# Backoff ceiling for the case where the camera is not on the wire at all.
+#
+# Deliberately much shorter than RECONNECT_MAX_DELAY_S, because the two failures
+# want opposite treatment and lumping them together made outages longer than
+# they needed to be:
+#
+#   camera ABSENT (no TCP connect, ARP fails) - it is powered down or rebooting.
+#     Retrying costs ONE SYN that nothing answers, so it cannot overload anything,
+#     and the only thing a long backoff buys is up to 20s of extra black panel
+#     after the camera is already back. Poll briskly.
+#   camera PRESENT but refusing RTSP - this is the session-limit case, and every
+#     attempt is a real connection the camera has to service. This is the one
+#     that needs the long backoff (see SESSION_WAIT_S).
+#
+# Measured: CAM 1 sat on "no signal - retrying" long after the camera answered.
+UNREACHABLE_MAX_DELAY_S = float(os.environ.get("UNREACHABLE_MAX_DELAY_S", "4.0"))
+
+# Minimum spacing between connection attempts across ALL cameras. The cameras
+# share one tether, so two of them opening RTSP sessions simultaneously is the
+# worst case; this staggers them instead. 0 disables the gate.
+CONNECT_STAGGER_S = float(os.environ.get("CONNECT_STAGGER_S", "1.0"))
+
+# How long to wait for a previous, abandoned RTSP session to actually die before
+# opening a new one to the same camera.
+#
+# NEVER set this to 0. These cameras accept only a very small number of
+# concurrent RTSP sessions, and a stalled reader keeps its session open until
+# rtspsrc's tcp-timeout expires (~5s). Reconnecting inside that window asks the
+# camera for a second session it cannot give, and it answers by resetting the
+# connection - "Could not write to resource" in the GStreamer log. Measured on
+# the rig: both cameras cycling connect/drop, CAM 1 live only 32% of the time
+# with 17 reconnects in 3 minutes. Waiting for the old session first is what
+# makes the reconnect land.
+SESSION_WAIT_S = float(os.environ.get("SESSION_WAIT_S", "8.0"))
+# Wall-clock seconds with no decoded frame before forcing a reconnect. Backstops
+# the case where a camera half-closes its RTSP socket (CLOSE-WAIT) and cap.read()
+# blocks forever, so READ_FAIL_LIMIT never trips and the panel freezes. Seen when
+# a camera reboots/flaps under the viewer. Keep a couple of seconds above the
+# real inter-frame gap so a momentarily slow camera is not torn down needlessly.
+READ_STALL_TIMEOUT_S = float(os.environ.get("READ_STALL_TIMEOUT_S", "5.0"))
 
 # How long to wait for the RTSP port to accept a TCP connection before declaring
 # NO SIGNAL. On a direct LAN the round trip is sub-millisecond, so 4s is generous.

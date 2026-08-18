@@ -39,11 +39,15 @@ MONO = SANS
 # air top and bottom. Those 16px over the original 38 come straight out of the
 # video panels, which is the trade — the logo is the one thing on the bar that
 # is brand rather than data, and at 18px it read as a smudge from any distance.
-BAR_HEIGHT = 54
+# Scaled up 15% from 54/42/20 with the type and the pill widths moved to match -
+# raising the bar alone would just have added white space around the same small
+# text. The pill min-widths went up with the font size for the same reason
+# resizeEvent() cares: a wider glyph in an unchanged floor clips the label.
+BAR_HEIGHT = 62
 # The source is 4.47:1, so every pixel of height costs ~4.5px of width on the
 # left group; check the narrow widths in resizeEvent() if you go further.
-LOGO_HEIGHT = 42
-PILL_HEIGHT = 20
+LOGO_HEIGHT = 48
+PILL_HEIGHT = 23
 
 # --- palette -----------------------------------------------------------------
 # The bar wears the boot theme, so the handover from Plymouth -> splash.py ->
@@ -165,7 +169,7 @@ class StatusPill(QLabel):
             self.setStyleSheet(
                 f"QLabel#pill {{ color: {fg}; background: {bg};"
                 f" border: 1px solid {border}; border-radius: {PILL_HEIGHT // 2}px;"
-                f" padding: 0 10px; font-size: 11px; font-weight: bold; }}"
+                f" padding: 0 12px; font-size: 13px; font-weight: bold; }}"
             )
 
 
@@ -212,27 +216,27 @@ class TopBar(QWidget):
         # --- status ---------------------------------------------------------
         self._camera_pills = []
         for name, url in cameras:
-            pill = StatusPill(f"{name}  —", "idle", min_width=150)
+            pill = StatusPill(f"{name}  —", "idle", min_width=173)
             pill.setToolTip(url)
             self._camera_pills.append(pill)
 
         # Recording sits left of the camera chips, not with the robot/temp
         # group: it answers "is this being kept", which belongs beside the
         # cameras it is keeping rather than beside the housekeeping.
-        self._rec_pill = StatusPill("STANDBY", "idle", min_width=150)
+        self._rec_pill = StatusPill("STANDBY", "idle", min_width=173)
 
-        self._robot_pill = StatusPill("ROBOT  LINKING", "warn", min_width=196)
+        self._robot_pill = StatusPill("ROBOT  LINKING", "warn", min_width=225)
 
         # This machine's own temperature, so it belongs with the clock rather
         # than with the robot. See thermal.py for why it cannot be the robot's.
-        self._temp_pill = StatusPill("TEMPERATURE  —", "idle", min_width=150)
+        self._temp_pill = StatusPill("TEMPERATURE  —", "idle", min_width=173)
 
         self._clock_label = QLabel("--:--:--")
         self._clock_label.setObjectName("clock")
         # Ticks once a second in a proportional face, so pin the width to its
         # widest reading or the separator beside it steps sideways all day.
         self._clock_label.setFixedWidth(
-            QFontMetrics(QFont(SANS, 9)).horizontalAdvance("00:00:00") + 18)
+            QFontMetrics(QFont(SANS, 10)).horizontalAdvance("00:00:00") + 20)
         self._clock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         # --- layout ---------------------------------------------------------
@@ -395,11 +399,11 @@ STYLESHEET = f"""
    QWidget as far as that rule is concerned — without this, each piece of the
    bar would sit in its own dark box on the light field. */
 #logo, #titlegroup, #title, #wordmark, #clock {{ background: transparent; }}
-#title     {{ color: {ACCENT}; font-size: 13px; font-weight: bold;
+#title     {{ color: {ACCENT}; font-size: 15px; font-weight: bold;
               font-family: "{SANS}", sans-serif; }}
-#wordmark  {{ color: {INK}; font-size: 15px; font-weight: bold;
+#wordmark  {{ color: {INK}; font-size: 17px; font-weight: bold;
               font-family: "{SANS}", sans-serif; }}
-#clock     {{ color: {MUTED}; font-size: 12px; font-family: "{MONO}", monospace; }}
+#clock     {{ color: {MUTED}; font-size: 14px; font-family: "{MONO}", monospace; }}
 """
 
 

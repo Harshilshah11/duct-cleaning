@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import traceback
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QRectF, QTimer
@@ -52,6 +53,17 @@ import thermal
 from inputs_panel import InputsPanel
 from splash import SplashScreen
 from uno_motors import MotorLink
+
+# How old the ANALOG sample may be before the stick is treated as unknown.
+#
+# Sized off the measured analog poll rate, not guessed: inputs.py bit-bangs three
+# ADS channels in ~32 ms and is capped at 25 Hz, so a healthy sample is never more
+# than ~40 ms old and 0.4 s is ten poll periods of slack. Comfortably above any
+# real jitter on a Pi that is also decoding two camera streams, and far below the
+# point where a driving robot has gone anywhere - the wheels stop within half a
+# second of the reader going quiet. See the block in tick() for why this cannot be
+# left to MotorLink's own SAMPLE_STALE_S.
+ANALOG_STALE_S = float(os.environ.get("ANALOG_STALE_S", "0.4"))
 
 SANS = "DejaVu Sans"
 # One typeface across the app. The panel headers and the NO SIGNAL placeholder
@@ -221,8 +233,14 @@ class GroundStationWindow(QWidget):
                 hw_decode=config.USE_HW_DECODE,
                 reconnect_delay=config.RECONNECT_DELAY_S,
                 read_fail_limit=config.READ_FAIL_LIMIT,
+                stall_timeout=config.READ_STALL_TIMEOUT_S,
+                reconnect_max_delay=config.RECONNECT_MAX_DELAY_S,
+                connect_stagger=config.CONNECT_STAGGER_S,
+                session_wait=config.SESSION_WAIT_S,
+                unreachable_max_delay=config.UNREACHABLE_MAX_DELAY_S,
+                rotate=config.rotate_for(index),
             )
-            for name, url in cameras
+            for index, (name, url) in enumerate(cameras)
         ]
         self.panels = [CameraPanel(s) for s in self.streams]
 
@@ -315,6 +333,19 @@ class GroundStationWindow(QWidget):
         self.temp_timer.start(max(200, int(config.TEMP_POLL_S * 1000)))
         self.refresh_temp()
 
+        # Always-on correlation log: what the motors were asked to do, next to
+        # what each camera was doing, once a second.
+        #
+        # This exists because the interesting failure - "the cameras stall while
+        # I drive" - only happens with a human on the stick, and a diagnostic
+        # that needs the operator and the investigator online simultaneously
+        # never gets captured. Logging it continuously means the next drive
+        # records its own evidence. Reads MotorLink's published state rather
+        # than sniffing the wire, so it needs no root and no tcpdump.
+        self.corr_timer = QTimer(self)
+        self.corr_timer.timeout.connect(self.log_correlation)
+        self.corr_timer.start(1000)
+
     # -- actions -------------------------------------------------------------
 
     def _install_shortcuts(self):
@@ -400,10 +431,22 @@ class GroundStationWindow(QWidget):
                 index, stream.connected, stream.fps, stream.status_text
             )
 
-        # The chip reports what the probe found and nothing else - no inferring
-        # a healthy robot from healthy video, because they are now different
-        # machines on different addresses.
-        self.topbar.set_robot(self.link.connected)
+        # The chip reports a real measurement and nothing else - no inferring a
+        # healthy robot from healthy video, because they are different machines
+        # on different addresses.
+        #
+        # That measurement is now the Uno command link, not LinkMonitor's TCP
+        # probe. LinkMonitor still points at ROBOT_LINK_HOST:PORT, which defaults
+        # to the guide's robot-Pi RTSP port (192.168.1.30:8554) - a host that
+        # does not exist on this rig, so the chip read DISCONNECTED forever even
+        # with the Arduino answering every packet. The Arduino link is UDP, so it
+        # cannot be probed by connecting a TCP socket to it either; the honest
+        # test is whether it is ACKing the commands we send, which MotorLink
+        # already tracks over a rolling window (see uno_motors.ACK_MIN_PCT).
+        # If ROBOT_LINK_HOST is ever pointed at something real that speaks TCP,
+        # that probe counts too - either being up means the robot is reachable.
+        motor_state = self.motors.latest() or {}
+        self.topbar.set_robot(bool(motor_state.get("ok")) or self.link.connected)
         self.topbar.set_clock(datetime.now().strftime("%H:%M:%S"))
 
         # Same push model as the top bar - latest() is a cheap dict copy off the
@@ -423,25 +466,121 @@ class GroundStationWindow(QWidget):
         # window is honoured rather than raced.
         self.session.poll()
         status = self.session.status()
-        self.inputs_panel.set_state(snapshot, status)
-        self.topbar.set_recording(status)
+        # Drawing the strip must never be able to strand the motors. Everything
+        # below this block is the demand the Uno keeps transmitting at 50Hz, so
+        # an exception raised in here used to skip the rest of tick() and leave
+        # MotorLink repeating the LAST demand forever - the wheels kept driving
+        # on a stale stick position. That is not hypothetical: a partial ADC read
+        # left joy['y'] None and inputs_panel's f-string raised on every frame.
+        # The panel is display; the motor demand below is safety. Never let the
+        # first take out the second.
+        try:
+            self.inputs_panel.set_state(snapshot, status)
+            self.topbar.set_recording(status)
+        except Exception:
+            traceback.print_exc()
 
         # Stick -> wheels. This only refreshes the demand; MotorLink keeps
         # transmitting at its own 50 Hz regardless, so a slow UI frame can never
         # starve the Uno into tripping its 300 ms failsafe. With no ADC the axes
         # are None, which mixes to a dead stop rather than a stale demand.
+        #
+        # THE ANALOG SAMPLE'S OWN AGE IS CHECKED HERE, and it has to be. This push
+        # is what resets MotorLink's staleness timer, so pushing a value that the
+        # ADC thread stopped updating would re-assert the last stick position as
+        # "fresh" 30 times a second - the wheels would keep driving on a reading
+        # nobody had taken since the reader died. Past the limit the axes are
+        # forced to None, which mixes to a dead stop. inputs.py stamps
+        # adc_updated on every pass including all-rejected ones, so this fires
+        # only for a reader that has genuinely stopped, not for a noisy one.
         joy = snapshot.get("joy") or {}
+        pot_pct = (snapshot.get("pot") or {}).get("pct")
+        adc_age = time.time() - (snapshot.get("adc_updated") or 0.0)
+        if adc_age > ANALOG_STALE_S:
+            joy, pot_pct = {}, None
         self.motors.set_joystick(joy.get("x"), joy.get("y"))
 
         # Actuator switch -> rod direction. The pot argument is vestigial: the
         # rod has no speed input since D5 became the light, and act_demand()
         # ignores it. Deliberately the SAME snapshot as the stick above, so the
         # panel can never show a switch position the actuator did not get.
-        self.motors.set_actuator(snapshot.get("actuator"),
-                                 (snapshot.get("pot") or {}).get("pct"))
+        #
+        # NOT gated on adc_age: the rod is driven by the SWITCH pins, which are on
+        # their own thread and keep working with a dead ADC. Stopping the rod
+        # because an unrelated analog bus wedged would be a failsafe firing on the
+        # wrong evidence.
+        self.motors.set_actuator(snapshot.get("actuator"), pot_pct)
+        # Toggle -> brush, on/off at full scale. The brush briefly took its
+        # speed from the pot (2026-08-17, one evening): one knob feeding two
+        # mechanisms meant dimming the lamp also slowed the brush, and a knob
+        # at zero made an armed brush look broken. See brush_demand().
         self.motors.set_brush((snapshot.get("switches") or {}).get("BRUSH"))
-        # Pot -> light brightness, which is what that knob actually does now.
-        self.motors.set_light((snapshot.get("pot") or {}).get("pct"))
+        # Pot -> light brightness, which is the knob's ONLY job again.
+        self.motors.set_light(pot_pct)
+
+    def log_correlation(self):
+        """One line a second pairing motor demand with camera state.
+
+        Never allowed to raise: this is instrumentation, and instrumentation
+        that can take down the viewer is worse than no instrumentation.
+        """
+        try:
+            m = self.motors.latest() or {}
+            snap = self.inputs.latest()
+            joy = snap.get("joy") or {}
+            pot = snap.get("pot") or {}
+            rej = snap.get("adc_rejects") or {}
+            parts = [
+                time.strftime("%H:%M:%S"),
+                f"L={m.get('left') or 0:+4d}",
+                f"R={m.get('right') or 0:+4d}",
+                f"act={m.get('act') or 0:+2d}",
+                f"brush={m.get('brush') or 0}",
+                f"uno={'ok' if m.get('ok') else 'DOWN'}",
+            ]
+            # THE RAW ADC COUNTS, and they are the point of this addition. A line
+            # reading `L=+237 R=+237` is indistinguishable from an operator pushing
+            # the stick forward unless the counts behind it are recorded too: three
+            # channels sitting on the same value is a dead bus, whereas three
+            # unrelated values is a hand. Diagnosing the phantom demand of
+            # 2026-08-17 needed exactly this and had to infer it from the wire.
+            def _c(v):
+                return "----" if v is None else f"{v:5d}"
+            parts.append(f"raw=x{_c(joy.get('x_raw'))},y{_c(joy.get('y_raw'))}"
+                         f",p{_c(pot.get('raw'))}")
+            parts.append(f"adc={snap.get('adc_hz') or 0:.1f}Hz")
+            # Only when non-zero, so a healthy run does not carry four counters
+            # that never move and the ones that DO move are conspicuous.
+            fired = " ".join(f"{k}{v}" for k, v in sorted(rej.items()) if v)
+            if fired:
+                parts.append(f"rej={fired}")
+            for s in self.streams:
+                tag = s.name.replace(" ", "")
+                parts.append(
+                    f"{tag}={'up' if s.connected else 'DOWN'}"
+                    f"/{s.fps:.0f}fps/r{s.reconnects}"
+                )
+            path = os.path.expanduser(
+                os.environ.get("MOTOR_CAM_LOG", "~/motor_cam.log"))
+            # Cap it rather than filling the SD card - a full root filesystem
+            # takes X, the viewer and any ssh session with it.
+            try:
+                if os.path.getsize(path) > 5_000_000:
+                    os.replace(path, path + ".1")
+            except OSError:
+                pass
+            # buffering=1 (line buffered) and a flush, because this log was found
+            # holding 1580 NUL bytes mid-file on 2026-08-17. That is the ext4
+            # delayed-allocation signature of an unclean exit: the inode's size had
+            # been committed but the data blocks had not, so the gap reads back as
+            # zeros. It matters beyond tidiness - a single NUL makes grep treat the
+            # whole file as binary and silently refuse to print matches, which is
+            # how a correlator nobody can grep stops being a correlator.
+            with open(path, "a", encoding="utf-8", buffering=1) as fh:
+                fh.write(" ".join(parts) + "\n")
+                fh.flush()
+        except Exception:
+            pass
 
     def refresh_temp(self):
         self.topbar.set_temp(thermal.read_c())

@@ -167,7 +167,20 @@ def act_demand(state, pot_pct):
 
 
 def brush_demand(toggle_closed):
-    """Panel TOGGLE (Pi GPIO13) -> brush motor 0/1.
+    """Panel TOGGLE (Pi GPIO13) -> brush motor demand, 255 or 0.
+
+    TOGGLE ONLY, AT FULL SCALE. The brush briefly took its speed from the
+    light's pot on 2026-08-17 and it lasted one evening: one knob feeding two
+    mechanisms meant dimming the lamp also slowed the brush, and a knob parked
+    at zero made an armed brush look broken (it cost a live debugging round on
+    the rig). The operator's verdict was "Pwm->A1, keep 255" - the brush is an
+    on/off tool.
+
+    255 rather than 1 because the wire field is a DUTY now: uno_eth_link.ino
+    soft-PWMs A1 at whatever magnitude arrives, so full speed must be SAID
+    (255), not implied. A board still running the pre-duty build treats any
+    non-zero as ON and behaves identically, so this value is right on every
+    sketch this rig has ever flashed.
 
     inputs.py has already done the active-LOW inversion, so what arrives here is
     a plain "is the switch closed" boolean and True means ON. Doing that
@@ -178,7 +191,7 @@ def brush_demand(toggle_closed):
     unavailable), and that is treated as OFF -- an unknown switch must never
     start a brush.
     """
-    return 1 if toggle_closed else 0
+    return 255 if toggle_closed else 0
 
 
 def light_demand(pot_pct):

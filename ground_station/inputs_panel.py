@@ -25,9 +25,9 @@ HEIGHT IS THE BINDING CONSTRAINT, and it is a budget, not an outcome. The bar
 above is 54px; this one is capped at STRIP_HEIGHT and every pixel it takes comes
 straight off the camera panels, which are the only reason the machine exists. So
 the layout spends WIDTH - which is free, the strip spans the screen - and hoards
-height: readouts sit beside their captions rather than under them, the actuator
-lever is horizontal instead of a three-row column, and the save confirmation
-replaces the status line rather than adding a row.
+height: every block is a CENTRED title with its control directly under it, the
+actuator lever is a horizontal track rather than a three-row column, and the
+save confirmation replaces the status line rather than adding a row.
 
 That budget is also why there is no font scaling any more. An earlier version
 grew everything 1.75x on a wide screen, which read well and cost 313px - most of
@@ -59,6 +59,13 @@ from recorder import hms
 
 PIN_TO_NAME = {pin: name for name, pin in SWITCHES}
 
+# How long the stick display may coast on its last known position when a sample
+# is rejected - see the display-hold note in set_state(). Half a second spans
+# any single-sample validation blank (~40 ms at the 25 Hz analog poll) and the
+# centre relearn after an ADC reopen (~360 ms), while a genuinely dead ADC
+# still turns to a dash before the operator has finished noticing.
+JOY_DISPLAY_HOLD_S = 0.5
+
 # A normal UI typeface, not the terminal mono the strip used to be set in. The
 # numbers that change every frame are given a fixed width in code instead, which
 # is what mono was really being used for.
@@ -81,10 +88,13 @@ def font(points, bold=False):
     return f
 
 
-# 124px against the top bar's 54 - 2.3x, inside the 2.5x this is allowed to
-# spend. Everything below is sized to fill exactly that and no more; if any of
-# it grows, something else has to give rather than the bar.
-STRIP_HEIGHT = 124
+# Everything below is sized to fill exactly this and no more; if any of it
+# grows, something else has to give rather than the bar above.
+# 150 is set by the tallest column: the joystick's caption + 84px box + x/y
+# readout. The strip briefly ran 130 with captions beside their controls, but
+# the operator wants titles on top and centred everywhere, so the three rows
+# are back and so is the height that carries them.
+STRIP_HEIGHT = 150
 
 # --- palette -----------------------------------------------------------------
 # The top bar's colours, so the two light surfaces are the same light. Keep them
@@ -95,6 +105,7 @@ LINE = "#c3cee2"
 INK = "#241f7a"       # headings and the numbers that get read
 TEXT = "#2c3a52"      # body
 MUTED = "#8590ab"
+CAP_INK = "#4a5573"   # card titles - darker than MUTED so they actually read
 ACCENT = "#3f6fb5"    # the brand blue - bars, the joystick dot
 TRACK = "#dde5f2"     # empty bar / inactive detent
 
@@ -140,10 +151,15 @@ PILL_TONE = {"START / STOP": "rec", "PAUSE / RESUME": "pause",
 # --- type scale --------------------------------------------------------------
 # Four sizes, no more. CAP labels a thing, VALUE is the thing, BIG is the one
 # number per card worth reading across the room, PILL is a control.
-PT_CAP = 8
-PT_VALUE = 11
-PT_BIG = 16
-PT_PILL = 10
+# Raised from 8/11/16/10: at the old scale the captions and the small readouts
+# were not legible on the real screen - the strip is read at arm's length on a
+# 1024x768 panel, not on a desktop monitor two feet away. PILL now equals VALUE
+# so every control in the strip is set at one size; a brush pill a point larger
+# than the recording pills read as an accident rather than a hierarchy.
+PT_CAP = 10
+PT_VALUE = 12
+PT_BIG = 17
+PT_PILL = 12
 
 
 def wash(colour, amount):
@@ -196,7 +212,12 @@ def recolour(lb, colour, points, bold=False, extra=""):
 
 
 def caption(text):
-    return label(text, PT_CAP, MUTED, bold=True, extra="letter-spacing:1px;")
+    """Every card's title, and they must all be identical.
+
+    CAP_INK rather than MUTED: at #8590ab on a white card these washed out at
+    arm's length, and a title you cannot read is not labelling anything.
+    """
+    return label(text, PT_CAP, CAP_INK, bold=True, extra="letter-spacing:1px;")
 
 
 class Pill(QLabel):
@@ -258,11 +279,13 @@ class JoystickView(QWidget):
 
     A 2D dot is the whole point: two separate bars make you reconstruct the
     diagonal in your head, which is the one thing an operator reads at a glance.
-    Sized to the strip's height budget rather than to comfort - at 62px it is
-    still an unambiguous 2D position, which is all it has to be.
+
+    84px is what the 150px strip can actually give: the card spends ~17px on its
+    caption and ~17px on the x/y readout under the box, leaving ~85. Asking for
+    more does not make it bigger, it makes Qt squeeze the readout out.
     """
 
-    SIDE = 62
+    SIDE = 84
 
     def __init__(self):
         super().__init__()
@@ -305,13 +328,29 @@ class JoystickView(QWidget):
 
 
 class PotBar(QWidget):
-    """Horizontal fill bar, 0-100%."""
+    """Circular gauge, 0-100%, with the reading in the middle.
+
+    A dial rather than a bar because the control it mirrors IS a knob - the
+    operator turns a round thing, so a round thing should move. It also carries
+    its own number in the hole, which buys back the width the separate readout
+    used to take beside the bar.
+
+    The sweep starts at the bottom-left and runs 270 degrees clockwise, the way
+    a physical knob is marked, so "off" and "full" sit where the hand expects.
+    """
+
+    # 92/10 rather than 84/11 so the number clears the ring. The hole is
+    # SIDE - 2*THICK, and it has to fit "100%" at PT_BIG, not just "68%" -
+    # at 84/11 the widest real value would have run into the arc. This column
+    # has no readout under it, unlike the joystick, so it can afford the height.
+    SIDE = 92
+    THICK = 10.0
+    START_ANGLE = 225      # bottom-left, in Qt's degrees-from-3-o'clock
+    SWEEP = -270           # negative = clockwise
 
     def __init__(self):
         super().__init__()
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setFixedHeight(20)
-        self.setMinimumWidth(110)
+        self.setFixedSize(self.SIDE, self.SIDE)
         self._pct = None
 
     def set_pct(self, pct):
@@ -322,50 +361,51 @@ class PotBar(QWidget):
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        box = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
-        p.setPen(QPen(QColor(LINE), 1))
-        p.setBrush(QColor(TRACK))
-        p.drawRoundedRect(box, 4, 4)
-        if not self._pct:
-            return
-        inner = box.adjusted(1.5, 1.5, -1.5, -1.5)
-        inner.setWidth(max(0.0, inner.width() * self._pct / 100.0))
-        # Lighter at the top, so the fill has a lit edge rather than reading as
-        # a flat rectangle of colour.
-        fill = QLinearGradient(inner.topLeft(), inner.bottomLeft())
-        fill.setColorAt(0.0, wash(ACCENT, 0.22))
-        fill.setColorAt(1.0, QColor(ACCENT))
-        p.setPen(Qt.NoPen)
-        p.setBrush(fill)
-        p.drawRoundedRect(inner, 3, 3)
+        m = self.THICK / 2.0 + 1.0
+        ring = QRectF(m, m, self.width() - 2 * m, self.height() - 2 * m)
+
+        # Qt's arc angles are in sixteenths of a degree.
+        p.setPen(QPen(QColor(TRACK), self.THICK, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(ring, self.START_ANGLE * 16, self.SWEEP * 16)
+
+        pct = self._pct
+        if pct:
+            p.setPen(QPen(QColor(ACCENT), self.THICK, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(ring, self.START_ANGLE * 16,
+                      int(self.SWEEP * 16 * max(0.0, min(100.0, pct)) / 100.0))
+
+        p.setPen(QColor(INK) if pct is not None else QColor(MUTED))
+        p.setFont(font(PT_BIG, bold=True))
+        p.drawText(self.rect(), Qt.AlignCenter,
+                   "—" if pct is None else f"{pct:.0f}%")
 
 
 class ActuatorTrack(QWidget):
-    """The 3-position brush-height lever, drawn as a horizontal track.
+    """The 3-position brush-height lever, drawn as a HORIZONTAL track.
 
-    It used to be three stacked rows, which reads beautifully and costs 3x the
-    height - and height is the one thing this strip has none of. Laid on its
-    side it carries the same three facts (there are three stages, which one is
-    current, which way the next throw goes) in a third of the space, spending
-    width the strip has to spare.
-
-    Left to right is retract -> extend, so the dot travels the way the rod does.
+    RETRACT sits at the left and EXTEND at the right, with the current stage
+    named under the track. Horizontal on the operator's ask: sideways the whole
+    control is one track's thickness plus a line of text, and it sits level
+    with the brush pill beside it instead of towering over it.
     """
 
-    # (state string from inputs.py, colour when active)
+    # (state string from inputs.py, colour when active) - left to right.
     STAGES = (("RETRACT", ACCENT), ("STOP", TEXT), ("EXTEND", LIVE))
     LABELS = {"RETRACT": "RETRACT", "STOP": "NEUTRAL", "EXTEND": "EXTEND"}
 
-    TRACK_H = 16
-    HEIGHT = 40
+    TRACK_LEN = 96
+    TRACK_W = 16
+    WIDTH = 120                # room for the widest state word under the track
+    HEIGHT = TRACK_W + 24      # track plus the one-word state under it
 
     def __init__(self, tone=ACCENT):
         super().__init__()
         self._stage = None
         self._tone = tone
-        self.setFixedHeight(self.HEIGHT)
-        self.setMinimumWidth(150)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # Fixed, not Expanding: the track is drawn centred in its own width, so
+        # an expanding widget would stretch the hit area without moving the
+        # drawing, and the control would drift off-centre from its caption.
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
 
     def set_stage(self, stage):
         if stage != self._stage:
@@ -380,31 +420,35 @@ class ActuatorTrack(QWidget):
         # is truthfully "current" - so nothing lights and the track goes red.
         fault = self._stage == "FAULT"
         w = self.width()
+        cx = w / 2.0
 
-        track = QRectF(1.0, 0.0, float(w - 2), float(self.TRACK_H))
+        track = QRectF(cx - self.TRACK_LEN / 2.0, 1.0,
+                       float(self.TRACK_LEN), float(self.TRACK_W))
         p.setPen(QPen(QColor(BAD) if fault else wash(self._tone, 0.62), 1))
         p.setBrush(QColor("#fdecea") if fault else wash(self._tone, 0.88))
-        p.drawRoundedRect(track, self.TRACK_H / 2.0, self.TRACK_H / 2.0)
+        p.drawRoundedRect(track, self.TRACK_W / 2.0, self.TRACK_W / 2.0)
 
-        inset = self.TRACK_H
+        # Detents inset by the track thickness at each end, so the outer two
+        # sit inside the rounded caps rather than on them.
+        inset = self.TRACK_W
         span = track.width() - inset * 2
         cy = track.center().y()
         for i, (key, colour) in enumerate(self.STAGES):
             active = (not fault) and key == self._stage
-            cx = track.left() + inset + span * i / (len(self.STAGES) - 1)
+            dx = track.left() + inset + span * i / (len(self.STAGES) - 1)
             r = 6.0 if active else 3.0
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(colour) if active else wash(self._tone, 0.55))
-            p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
+            p.drawEllipse(QRectF(dx - r, cy - r, r * 2, r * 2))
 
         # One word under the track rather than three: the inactive stages are
         # already drawn as their detents, and three labels at a readable size
-        # would not fit the width the track needs.
+        # would not fit along a track this short.
         name = "FAULT" if fault else self.LABELS.get(self._stage, "—")
         colour = BAD if fault else dict(self.STAGES).get(self._stage, MUTED)
         p.setPen(QColor(colour))
         p.setFont(font(PT_VALUE, bold=True))
-        p.drawText(QRectF(0, self.TRACK_H + 1, w, self.HEIGHT - self.TRACK_H - 1),
+        p.drawText(QRectF(0, self.TRACK_W + 4, w, self.HEIGHT - self.TRACK_W - 4),
                    Qt.AlignHCenter | Qt.AlignVCenter, name)
 
 
@@ -431,16 +475,37 @@ class Card(QFrame):
             self._body.addLayout(item, stretch)
         return item
 
+    def spread(self, *items):
+        """Add columns with equal air before, between and after them.
 
-def column(cap, *widgets, spacing=3):
-    """Caption over content - the strip's unit of layout."""
+        This is what centres a card's contents as a group: fixed-size controls
+        plus stretches either side, instead of everything hugging the left edge
+        with all the slack piling up on the right.
+        """
+        self._body.addStretch(1)
+        for item in items:
+            self.add(item)
+            self._body.addStretch(1)
+
+
+def column(cap, *widgets, spacing=3, fill=False):
+    """Centred caption over centred content - the strip's layout unit.
+
+    Everything centres on the block's own axis: the title sits over the middle
+    of its control, so a block reads as one labelled instrument. Blocks are
+    top-aligned by the trailing stretch, which keeps every caption in the strip
+    on the same line no matter how tall the control under it is.
+    """
     col = QVBoxLayout()
     col.setSpacing(spacing)
     col.setContentsMargins(0, 0, 0, 0)
-    col.addWidget(caption(cap))
+    col.addWidget(caption(cap), 0, Qt.AlignHCenter)
     for w in widgets:
         if isinstance(w, QWidget):
-            col.addWidget(w)
+            # fill=True for content that genuinely wants the whole card width -
+            # the recording card's session view. Centring that would pin it to
+            # its sizeHint and leave the card half empty.
+            col.addWidget(w) if fill else col.addWidget(w, 0, Qt.AlignHCenter)
         else:
             col.addLayout(w)
     col.addStretch(1)
@@ -489,30 +554,42 @@ class SessionView(QWidget):
         self.pause_pill = Pill("PAUSE / RESUME", PILL_TONE["PAUSE / RESUME"])
         self.save_pill = Pill("SAVE", PILL_TONE["SAVE"])
 
+        # Both rows centred, a stretch on each side, to match the centred
+        # captions everywhere else in the strip.
         head_row = QHBoxLayout()
         head_row.setContentsMargins(0, 0, 0, 0)
         head_row.setSpacing(9)
+        head_row.addStretch(1)
         head_row.addWidget(self.head)
         head_row.addWidget(self.elapsed)
         head_row.addStretch(1)
 
         pill_row = QHBoxLayout()
         pill_row.setContentsMargins(0, 0, 0, 0)
-        pill_row.setSpacing(7)
-        # Weighted by label length so all three end up the same visual density
-        # rather than the same width - "SAVE" in a pill as wide as
-        # "PAUSE / RESUME" is mostly empty pill.
-        pill_row.addWidget(self.rec_pill, 6)
-        pill_row.addWidget(self.pause_pill, 7)
-        pill_row.addWidget(self.save_pill, 3)
+        pill_row.setSpacing(9)
+        # NATURAL widths - each pill is its own text plus the same padding, and
+        # the leftover card width goes into the stretches either side. The row
+        # used to stretch the pills to fill the card, which blew START / STOP
+        # and PAUSE / RESUME up to several times the width of every other
+        # control in the strip; same words + same padding is the same density.
+        pill_row.addStretch(1)
+        pill_row.addWidget(self.rec_pill)
+        pill_row.addWidget(self.pause_pill)
+        pill_row.addWidget(self.save_pill)
+        pill_row.addStretch(1)
 
+        # Order: heading, then the three buttons centred in the block, then the
+        # detail line pinned to the bottom. A stretch either side of the pill row
+        # is what centres it - without the second one the buttons ride up against
+        # the heading and the detail line floats in the middle of the block.
         col = QVBoxLayout(self)
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(2)
         col.addLayout(head_row)
-        col.addWidget(self.detail)
         col.addStretch(1)
         col.addLayout(pill_row)
+        col.addStretch(1)
+        col.addWidget(self.detail, 0, Qt.AlignHCenter)
 
     def set_status(self, status, snapshot):
         state = status.get("state") or "STOPPED"
@@ -610,42 +687,45 @@ class InputsPanel(QFrame):
         self.joy = JoystickView()
         self.joy_text = label("—", PT_CAP, MUTED)
         self.joy_text.setAlignment(Qt.AlignHCenter)
+        # Last drawable stick position, for DISPLAY continuity only - see
+        # set_state(). (value_x, value_y, monotonic stamp).
+        self._joy_disp = None
 
         self.pot = PotBar()
+        # Kept as a widget but no longer laid out: the dial draws its own number
+        # in the middle now, and a second copy beside it read as two readings.
+        # set_state() still updates it so nothing downstream has to care.
         self.pot_text = label("—", PT_BIG, INK, bold=True)
+        self.pot_text.hide()
         # The ADC warning belongs here and nowhere else: the joystick and the
         # pot are the only two readings it can break.
         self.status = label("", PT_CAP, WARN)
 
-        # Bar and number side by side, not stacked: the number is the reading
-        # and the bar is its shape, and putting them on one line costs a row
-        # this strip cannot spare.
-        pot_row = QHBoxLayout()
-        pot_row.setContentsMargins(0, 0, 0, 0)
-        pot_row.setSpacing(10)
-        pot_row.addWidget(self.pot, 1)
-        pot_row.addWidget(self.pot_text)
-
         drive = Card(DRIVE_TONE)
-        drive.add(column("JOYSTICK", self.joy, self.joy_text))
-        drive.add(column("LIGHT INTENSITY", pot_row, self.status), 1)
+        drive.spread(column("JOYSTICK", self.joy, self.joy_text),
+                     column("LIGHT INTENSITY", self.pot, self.status))
 
         # --- TOOLS -----------------------------------------------------------
         # The caption says which control it is, the pill says what it is doing.
         # A pill reading BRUSH with the word ON under it said both twice and
         # neither clearly.
-        self.brush = Pill("OFF", PILL_TONE["BRUSH"], alternates=("ON", "—"),
-                          points=PT_VALUE)
+        # No points= override: every pill in the strip takes the default so the
+        # brush control and the three recording controls are set identically.
+        self.brush = Pill("OFF", PILL_TONE["BRUSH"], alternates=("ON", "—"))
         self.actuator = ActuatorTrack(TOOLS_TONE)
 
         tools = Card(TOOLS_TONE)
-        tools.add(column("BRUSH", self.brush))
-        tools.add(column("BRUSH HEIGHT", self.actuator), 1)
+        tools.spread(column("BRUSH", self.brush),
+                     column("BRUSH HEIGHT", self.actuator))
 
         # --- RECORDING -------------------------------------------------------
+        # Wrapped in column() like the other two cards, so all three carry a
+        # title in the same style and at the same height. Without it the
+        # recording card started straight in on its state word and its contents
+        # sat a caption's-worth higher than everything beside it.
         self.session = SessionView()
         recording = Card(REC_TONE)
-        recording.add(self.session, 1)
+        recording.add(column("RECORDING", self.session, fill=True), 1)
 
         # Stretch factors, not natural widths: the strip spans whatever the
         # screen is, and three cards huddled at the left with dead space to the
@@ -655,9 +735,14 @@ class InputsPanel(QFrame):
         root = QHBoxLayout(self)
         root.setContentsMargins(9, 5, 9, 6)
         root.setSpacing(9)
-        root.addWidget(drive, 7)
-        root.addWidget(tools, 6)
-        root.addWidget(recording, 8)
+        # Rebalanced when the pills stopped stretching to fill their card: the
+        # old 4/3/11 existed to feed the recording card's full-width buttons,
+        # and with those at natural size it just left that card mostly empty
+        # while the two control cards clipped first. This split tracks each
+        # card's actual content width, so slack spreads evenly.
+        root.addWidget(drive, 4)
+        root.addWidget(tools, 3)
+        root.addWidget(recording, 5)
 
     def minimumSizeHint(self):
         # Without this the strip is a floor on the whole WINDOW's width: a
@@ -688,10 +773,31 @@ class InputsPanel(QFrame):
         self.actuator.set_stage(state.get("actuator"))
 
         joy = state.get("joy") or {}
-        self.joy.set_pos(joy.get("x"), joy.get("y"))
+        # BOTH axes have to be checked, not just x: sample() reads each ADC
+        # channel independently, so a partial read leaves one of them None. The
+        # guard used to test x alone and the y format then raised every frame -
+        # which aborted main.py's tick() before it reached the motor demand, and
+        # MotorLink went on transmitting the last demand at 50Hz. A display bug
+        # that keeps the wheels turning is worth this extra condition.
+        x, y = joy.get("x"), joy.get("y")
+        # DISPLAY HOLD, display only. inputs.py's validators blank a sample the
+        # instant it looks wrong, and the motors must see that None immediately
+        # - but painted at 30fps those single-sample blanks read as the whole
+        # strip blinking, which the operator reports as "the data is not
+        # continuous". Bridging gaps shorter than JOY_DISPLAY_HOLD_S keeps the
+        # picture steady without touching what the motors are told; a real
+        # outage (dead ADC, unzeroed stick) outlives the hold and still shows
+        # as the dash it deserves.
+        now = time.monotonic()
+        if x is not None and y is not None:
+            self._joy_disp = (x, y, now)
+        elif (self._joy_disp is not None
+                and now - self._joy_disp[2] < JOY_DISPLAY_HOLD_S):
+            x, y = self._joy_disp[0], self._joy_disp[1]
+        self.joy.set_pos(x, y)
         self.joy_text.setText(
-            f"x {joy['x']:+.2f}  y {joy['y']:+.2f}"
-            if joy.get("x") is not None else "—")
+            f"x {x:+.2f}  y {y:+.2f}"
+            if x is not None and y is not None else "—")
 
         pot = state.get("pot") or {}
         self.pot.set_pct(pot.get("pct"))

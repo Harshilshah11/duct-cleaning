@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import os
 import threading
 import time
 
@@ -59,6 +60,45 @@ from uno_serial import (MAX_PWM, SAMPLE_STALE_S, SEND_HZ, act_demand,
 # single lost datagram is normal and must not flip the link to "down".
 ACK_WINDOW = 50
 ACK_MIN_PCT = 20.0
+
+# Maximum change in wheel PWM per second - a slew-rate limit on the demand.
+#
+# Without this, pushing the stick steps the wheels from 0 to full PWM inside one
+# 20 ms frame, which is the worst case for inrush current on a shared supply.
+# The rig's reported symptom is that the cameras drop while the motors are being
+# driven, and when they drop they stop answering ARP entirely (192.168.1.102
+# INCOMPLETE) - which is a device losing power, not a network fault. The Uno on
+# the same wire never misses a packet, and the Pi's own rail reads
+# throttled=0x0, so the sag is on whatever feeds the cameras.
+#
+# Ramping cannot fix an undersized supply, but it removes the current STEP that
+# triggers the sag, which is the part software controls. MAX_PWM/0.4 means a
+# full-scale ramp takes 400 ms - slow enough to blunt the surge, fast enough
+# that the robot still feels responsive. Set MOTOR_SLEW_PER_S=0 to disable.
+MOTOR_SLEW_PER_S = float(os.environ.get("MOTOR_SLEW_PER_S", str(MAX_PWM / 0.4)))
+
+
+def slew(prev, target, max_step):
+    """Rate-limit a RISE in demand. Falling and stopping are never delayed.
+
+    Safety property, and the reason this is not a plain clamp: a limiter that
+    can slow down a STOP is a limiter that can run the robot into something.
+    Any move toward zero is applied in full, immediately. A reversal is passed
+    through zero first rather than slammed across, which is both the biggest
+    current spike available and the hardest thing on the gearbox.
+    """
+    if max_step <= 0:
+        return target                       # limiter disabled
+    # Checked BEFORE the magnitude test on purpose: an equal-and-opposite
+    # reversal (+200 -> -200) has the same magnitude, so a magnitude-first test
+    # waves it straight through - the exact case this guard exists to stop.
+    if (prev > 0 and target < 0) or (prev < 0 and target > 0):
+        return 0                            # reverse: stop at zero this frame
+    if abs(target) <= abs(prev):
+        return target                       # slowing or stopping - immediate
+    if target > prev:
+        return int(min(target, prev + max_step))
+    return int(max(target, prev - max_step))
 
 
 class MotorLink(threading.Thread):
@@ -80,6 +120,9 @@ class MotorLink(threading.Thread):
         self._light = None                # panel pot %, drives brightness
         self._light_at = 0.0
         self._recent = []                 # rolling window of per-frame ack counts
+        self._prev_left = 0               # last demand actually sent, for slew()
+        self._prev_right = 0
+        self._slew_at = 0.0               # monotonic stamp of the last ramp step
         self._state = {
             "ok": False, "error": "starting", "target": f"{host}:{port}",
             "left": 0, "right": 0, "act": 0, "brush": 0, "light": 0,
@@ -157,6 +200,17 @@ class MotorLink(threading.Thread):
                         light_fresh = (
                             time.monotonic() - self._light_at) < SAMPLE_STALE_S
                     left, right = mix(x, y) if fresh else (0, 0)
+                    # Ramp the wheels rather than stepping them - see
+                    # MOTOR_SLEW_PER_S. Uses the real frame time, so a jittery
+                    # loop still ramps at the configured rate rather than a rate
+                    # that depends on how busy the Pi happened to be.
+                    now = time.monotonic()
+                    dt = now - self._slew_at if self._slew_at else period
+                    self._slew_at = now
+                    max_step = MOTOR_SLEW_PER_S * max(0.0, min(dt, 0.5))
+                    left = slew(self._prev_left, left, max_step)
+                    right = slew(self._prev_right, right, max_step)
+                    self._prev_left, self._prev_right = left, right
                     # Aged independently of the stick: a reader that dies must
                     # stop the rod even if the last joystick sample was fine.
                     act = act_demand(act_state, act_pot) if act_fresh else 0

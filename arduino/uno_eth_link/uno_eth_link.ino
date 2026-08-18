@@ -4,7 +4,7 @@
  *
  *   Pi -> Uno  "CMD <seq> M <l> <r>\n"                        wheels only
  *   Pi -> Uno  "CMD <seq> M <l> <r> <act>\n"                  + actuator, sign only
- *   Pi -> Uno  "CMD <seq> M <l> <r> <act> <brush>\n"          + brush, 0 or 1
+ *   Pi -> Uno  "CMD <seq> M <l> <r> <act> <brush>\n"          + brush, 0..255
  *   Pi -> Uno  "CMD <seq> M <l> <r> <act> <brush> <light>\n"  + light, 0..255
  *   Pi -> Uno  "CMD <seq> J <x> <y>\n"                        raw stick, -1000..1000
  *   Pi -> Uno  "CMD <seq> STOP\n"                             explicit neutral
@@ -33,10 +33,17 @@
  * uno_motors.py sends 0, which is now a genuine stop — the safe answer to a
  * switch you cannot trust.
  *
- * <brush> is a plain 0/1 from the panel's TOGGLE switch (Pi GPIO13, active-LOW
- * like every switch on that panel — closed reads as ON). The brush has no speed
- * control: a 2-position toggle cannot express one, and by the time it was added
- * the Uno had no PWM pin left to give it.
+ * <brush> is a DUTY, 0..255, since 2026-08-17 — it was a plain 0/1 before. The
+ * Pi currently sends only 0 or 255: the panel's TOGGLE switch (Pi GPIO13,
+ * active-LOW like every switch on that panel) is the whole control, full speed
+ * or stopped. The duty path stays because the WIRE should stay expressive —
+ * for one evening the pot set the speed here, and it was reverted on the
+ * operator's call ("keep 255": one knob feeding both the lamp and the brush
+ * meant dimming one slowed the other) without needing a reflash, precisely
+ * because only the Pi's brush_demand() had to change. A1 has no timer, so a
+ * mid-range duty would be synthesised in software — see serviceBrushPwm(), the
+ * same mechanism the rod uses on D4; at 0 and 255 it resolves to a static
+ * level and costs nothing.
  *
  * <light> is the panel potentiometer (ADS1115 A2), scaled to 0..255 on the Pi
  * in uno_motors.py. It is unsigned — a lamp has no reverse. The pot could take
@@ -273,14 +280,15 @@ const uint8_t LIGHT_PWM = 5;   // Timer0 (~980 Hz) — same 0-duty caveat as D6
 // motor never turned — while the telemetry cheerfully reported BRUSH=ON, because
 // the sketch really was driving the one pin it knew about.
 //
-// There is still no speed control, which is all a 2-position toggle can express,
-// so the speed line is simply held at full scale whenever the brush runs.
-//
-// THAT IS WHY BRUSH_PWM CAN LIVE ON A1, a pin with no timer behind it: 255/255
-// duty IS a static HIGH. analogWrite(pin, 255) on an AVR resolves to exactly
-// that, so a hardware PWM channel would buy nothing here — which is fortunate,
-// because there were none left (3 and 6 are the wheels, 5 the light, 9 is DIR1,
-// 10-13 belong to the shield's SPI).
+// SPEED CONTROL ARRIVED 2026-08-17: the pot (freed from the rod, then shared
+// with the light) now sets the brush duty, 0..255 in the <brush> field. A1 has
+// no timer behind it, so the duty is SOFT-PWM — serviceBrushPwm() below chops
+// the pin from loop() exactly the way serviceActuatorPwm() runs the rod's D4.
+// The 0 and 255 endpoints still resolve to static levels, so OFF cannot be
+// caught mid-cycle and full speed cannot be chopped by a stalled loop; only
+// the middle range is synthesised, where a stall costs a slower brush, never a
+// runaway one. (Hardware PWM was never an option: 3 and 6 are the wheels, 5
+// the light, 9 is DIR1, 10-13 belong to the shield's SPI.)
 // MOVED D7 -> D2 ON 2026-08-15, AND THIS WAS NOT A TIDY-UP. D7 is the linear
 // actuator's direction line on the rig, and this sketch was holding it HIGH
 // permanently as the brush's direction — a constant, written on every frame.
@@ -303,8 +311,23 @@ const bool BRUSH_DIR_LEVEL = HIGH;
 // Many driver and relay inputs are ACTIVE-LOW — the channel enables when the pin
 // goes low, and such a board will run the brush the whole time the Uno is in
 // reset if this is wrong. Set false for those. Applies to BRUSH_PWM, the line
-// that actually gates the motor.
+// that actually gates the motor — including the soft-PWM's on-phase, which
+// serviceBrushPwm() inverts through this same constant.
 const bool BRUSH_ACTIVE_HIGH = true;
+
+// The duty currently demanded on A1, 0..255. Written by applyBrush(), acted on
+// by serviceBrushPwm() every pass of loop() — the same pairing as
+// actDuty / serviceActuatorPwm(), and it shares ACT_PWM_PERIOD_US (250 Hz)
+// because two independent soft-PWM periods would just be two numbers to keep
+// in sync for no benefit. A brush motor's inertia makes 250 Hz ripple
+// invisible, exactly as it does for the rod.
+int brushDuty = 0;
+
+// The smallest duty that actually TURNS the brush rather than buzzing it, the
+// same physics as MIN_DUTY on the wheels. Any non-zero demand is stretched
+// onto BRUSH_MIN_DUTY..255 so the bottom of the knob's travel is already a
+// moving brush instead of a heater. Set to 0 for a raw linear map.
+const int BRUSH_MIN_DUTY = 90;
 
 // Flip either of these if a wheel spins the wrong way. Doing it here is much
 // cheaper than re-soldering, and far safer than negating on the Pi — the Pi
@@ -411,21 +434,58 @@ void applyMotor(uint8_t dirPin, uint8_t pwmPin, int demand, bool invert) {
   }
 }
 
-/* Brush motor: on or off, nothing in between. Any non-zero demand means ON, so
- * the Pi can send a plain 0/1 and this still behaves if someone later sends a
- * speed there by mistake.
+/* Brush motor: duty 0..255 off the panel pot, gated by the panel toggle (the
+ * Pi folds the two into one number — see brush_demand()). A pre-2026-08-17
+ * sender's 0/1 still behaves: 1 stretches to BRUSH_MIN_DUTY, a slow brush
+ * rather than a dead one.
  *
  * Both lines are written every call, not just the one that changed. The
  * direction is a constant, but writing it here means a channel that browns out
  * and comes back gets its direction restored by the next frame rather than
  * running whichever way its input floated to. */
-void applyBrush(int on) {
-  bool run = (on != 0);
+void applyBrush(int duty) {
+  if (duty < 0) duty = 0;
+  if (duty > MAX_PWM) duty = MAX_PWM;
   // Direction before speed, the same ordering rule applyMotor() follows: setting
   // the gate first would spend a moment driving the old direction at full duty.
   digitalWrite(BRUSH_DIR, BRUSH_DIR_LEVEL);
-  // Full scale or nothing. A static HIGH is 255/255 duty — see BRUSH_PWM above.
-  digitalWrite(BRUSH_PWM, (run == BRUSH_ACTIVE_HIGH) ? HIGH : LOW);
+  if (duty > 0 && BRUSH_MIN_DUTY > 0) {
+    // Same stretch as applyMotor(): the smallest demand the knob can express
+    // must be one the motor can act on. Long arithmetic for the same overflow
+    // reason — 254 * 165 wraps a 16-bit int.
+    duty = BRUSH_MIN_DUTY
+           + (int)(((long)(duty - 1) * (MAX_PWM - BRUSH_MIN_DUTY))
+                   / (MAX_PWM - 1));
+  }
+  brushDuty = duty;
+  // The static endpoints are written HERE as well as in serviceBrushPwm(), so
+  // a stop takes effect on this very line rather than on the next loop() pass.
+  if (duty <= 0) {
+    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
+  } else if (duty >= MAX_PWM) {
+    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? HIGH : LOW);
+  }
+}
+
+/* Software PWM for the brush, because A1 has no timer. Same contract as
+ * serviceActuatorPwm(): called every pass of loop(), static levels for the 0
+ * and 255 endpoints so neither OFF nor full speed can be caught mid-cycle, and
+ * only the middle range is chopped — where a stalled loop costs a slower
+ * brush, never a runaway one. Shares ACT_PWM_PERIOD_US; both mechanisms are
+ * far too slow mechanically to care about 250 Hz ripple. */
+void serviceBrushPwm() {
+  if (brushDuty <= 0) {
+    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
+    return;
+  }
+  if (brushDuty >= MAX_PWM) {
+    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? HIGH : LOW);
+    return;
+  }
+  unsigned long phase = micros() % ACT_PWM_PERIOD_US;
+  unsigned long onFor = (ACT_PWM_PERIOD_US * (unsigned long)brushDuty) / MAX_PWM;
+  bool on = phase < onFor;
+  digitalWrite(BRUSH_PWM, (on == BRUSH_ACTIVE_HIGH) ? HIGH : LOW);
 }
 
 /* Linear actuator: D7 picks the direction, D4 gates it, zero holds position.
@@ -663,7 +723,15 @@ void setup() {
   // about looks like a flaky cable: with a card in the slot the link dies except
   // while retracting. A reset is the one moment someone is watching.
   Serial.println(F("  ^ D4 is the shield's SD chip select - RUN WITH THE SLOT EMPTY"));
-  Serial.println(F("BRUSH_DIR=D2 BRUSH_PWM=A1 held 255 (TOGGLE, Pi GPIO13)"));
+  // The build with pot speed control announces itself: an ACK-identical old
+  // build is otherwise indistinguishable over the LAN (see the banner note
+  // above), and "held 255" vs "soft-PWM" is exactly the difference that
+  // decides whether the knob does anything.
+  Serial.print(F("BRUSH_DIR=D2 BRUSH_PWM=A1 soft-PWM duty 0-"));
+  Serial.print(MAX_PWM);
+  Serial.print(F(" floor "));
+  Serial.print(BRUSH_MIN_DUTY);
+  Serial.println(F(" (TOGGLE on/off, Pi sends 0 or 255)"));
   Serial.println(F("LIGHT_DIR=A0 LIGHT_PWM=D5 (pot-dimmed, 0-255)"));
   Serial.print(F("failsafe after "));
   Serial.print(FAILSAFE_MS);
@@ -671,10 +739,11 @@ void setup() {
 }
 
 void loop() {
-  // First thing every pass, and again after the packet work below: the rod's
-  // 50% stage is synthesised here, so the more often this runs the cleaner its
-  // duty. Everything else in this loop is either instant or rate-limited.
+  // First thing every pass: the rod's 50% stage and the brush's pot-set speed
+  // are both synthesised in software, so the more often these run the cleaner
+  // their duty. Everything else in this loop is either instant or rate-limited.
   serviceActuatorPwm();
+  serviceBrushPwm();
 
   int size = udp.parsePacket();
   if (size > 0) {
@@ -818,7 +887,7 @@ void loop() {
     Serial.print(F(" ACT="));
     Serial.print(curA);
     Serial.print(F(" BRUSH="));
-    Serial.print(curB ? F("ON") : F("off"));
+    Serial.print(curB);          // duty 0..255 now, not ON/off
     Serial.print(F(" LIGHT="));
     Serial.print(curLight);
     Serial.print(F("  pkts="));

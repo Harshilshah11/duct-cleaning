@@ -15,6 +15,7 @@ Open-drain is done by flipping direction: input = released (pull-ups take it
 high), output-low = driven. A line is never driven high.
 """
 
+import os
 import sys
 import time
 
@@ -23,11 +24,48 @@ from gpiod.line import Bias, Direction, Value
 
 CHIP = "/dev/gpiochip0"
 SDA_DEFAULT, SCL_DEFAULT = 2, 3
-DELAY = 20e-6          # ~25 kHz. I2C has no minimum clock, so slow is safe.
+
+# Extra delay per clock edge, ON TOP of the ioctl that produces the edge.
+#
+# DEFAULT IS NOW 0, AND THAT IS NOT A SHORTCUT -- the syscall already IS the
+# delay. reconfigure_lines() measures 24.5 us on this Pi 4, so even with no
+# explicit wait the bus clocks at roughly 20 kHz with a symmetric duty cycle, and
+# every setup/hold time in the ADS1115 datasheet is specified in nanoseconds. The
+# old 20 us was therefore pure overhead: I2C has no minimum clock rate, so the
+# only thing it bought was a slower bus.
+#
+# WHAT IT COST: this delay is paid three times per I2C bit, ~90 bits per channel,
+# three channels per poll. time.sleep(20e-6) actually takes 80 us on this Pi
+# (measured -- the kernel's timer slack plus the wait to be rescheduled dominate
+# anything this short), which put one 3-channel poll at ~94 ms against the 50 ms
+# budget inputs.py allows it. The joystick was reaching the wheels at ~10 Hz.
+#
+# A BUSY-WAIT WAS TRIED HERE AND MADE IT WORSE -- 4 Hz, measured on the rig.
+# Spinning is faster in isolation (20.6 us vs 80.4 us) but it turns this thread
+# into a CPU hog on a Pi whose four cores are already saturated by two software
+# H.264 decoders, and the scheduler then de-prioritises it. Do not reintroduce it.
+# Removing the delay entirely is what actually helps, because it removes the
+# operation rather than making it spin.
+#
+# Raise it (I2C_BITBANG_DELAY_US=20) only to debug a marginal bus, and expect the
+# poll rate to fall roughly proportionally.
+DELAY = float(os.environ.get("I2C_BITBANG_DELAY_US", "0")) * 1e-6
 STRETCH_TIMEOUT = 0.01
 
 IN = gpiod.LineSettings(direction=Direction.INPUT, bias=Bias.PULL_UP)
 OUT_LOW = gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE)
+
+
+def _delay(seconds=None):
+    """Wait out one clock edge. Usually a no-op -- see DELAY above.
+
+    Kept as a function rather than inlined so the zero case costs one comparison
+    and the debug case still has somewhere to live.
+    """
+    seconds = DELAY if seconds is None else seconds
+    if seconds <= 0:
+        return
+    time.sleep(seconds)
 
 
 class Bus:
@@ -38,15 +76,24 @@ class Bus:
         self._state = {sda: IN, scl: IN}
 
     # release = high-Z, the external pull-up decides the level
+    #
+    # ONLY THE LINE THAT CHANGED IS RECONFIGURED. Both were passed on every call
+    # before, which re-applied the other line's existing settings for nothing --
+    # and reconfigure_lines() measured 24.5 us on this Pi, paid three times per
+    # I2C bit. Verified on the rig before relying on it: driving gpio20+21 low and
+    # then reconfiguring only gpio20 leaves gpio21 driven low, so lines omitted
+    # from the dict keep their configuration rather than being reset to defaults.
     def release(self, line):
+        if self._state[line] is IN:
+            return                          # already high-Z, nothing to write
         self._state[line] = IN
-        self.req.reconfigure_lines({self.sda: self._state[self.sda],
-                                    self.scl: self._state[self.scl]})
+        self.req.reconfigure_lines({line: IN})
 
     def drive_low(self, line):
+        if self._state[line] is OUT_LOW:
+            return                          # already driven, nothing to write
         self._state[line] = OUT_LOW
-        self.req.reconfigure_lines({self.sda: self._state[self.sda],
-                                    self.scl: self._state[self.scl]})
+        self.req.reconfigure_lines({line: OUT_LOW})
 
     def read(self, line):
         return self.req.get_value(line) == Value.ACTIVE
@@ -56,6 +103,9 @@ class Bus:
         self.req.reconfigure_lines({self.sda: IN, self.scl: IN})
 
     # --- primitives ---------------------------------------------------------
+    # Every delay here is _delay() (a busy-wait), never time.sleep() -- see the
+    # measurements in _delay's docstring. Three of these per bit is why the
+    # difference between 20 us and 80 us decides whether the joystick feels live.
     def _scl_release(self):
         """Release SCL and honour clock stretching."""
         self.release(self.scl)
@@ -63,38 +113,38 @@ class Bus:
         while not self.read(self.scl):
             if time.monotonic() - t0 > STRETCH_TIMEOUT:
                 return False
-        time.sleep(DELAY)
+        _delay()
         return True
 
     def _scl_low(self):
         self.drive_low(self.scl)
-        time.sleep(DELAY)
+        _delay()
 
     def start(self):
         self.release(self.sda)
         self._scl_release()
         self.drive_low(self.sda)
-        time.sleep(DELAY)
+        _delay()
         self._scl_low()
 
     def stop(self):
         self.drive_low(self.sda)
         self._scl_release()
         self.release(self.sda)
-        time.sleep(DELAY)
+        _delay()
 
     def write_bit(self, bit):
         if bit:
             self.release(self.sda)
         else:
             self.drive_low(self.sda)
-        time.sleep(DELAY)
+        _delay()
         self._scl_release()
         self._scl_low()
 
     def read_bit(self):
         self.release(self.sda)
-        time.sleep(DELAY)
+        _delay()
         self._scl_release()
         bit = self.read(self.sda)
         self._scl_low()
