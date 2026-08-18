@@ -74,6 +74,15 @@ _PARENT = os.path.dirname(_HERE)          # the bit-bang modules live in ~
 POLL_HZ = float(os.environ.get("INPUTS_POLL_HZ", "20"))
 ENABLED = os.environ.get("INPUTS_ENABLED", "1") == "1"
 
+# Kill-switch for the ANALOG half only (joystick + pot), leaving the switches
+# fully alive. Exists because the A1/A2 wiring is intermittent and its garbage
+# occasionally survives every validation gate as phantom wheel demand - set
+# INPUTS_ADC_ENABLED=0 (currently done in the Pi's .xinitrc) to take the whole
+# analog path out of the loop while testing the rest of the rig. The axes and
+# pot then read None everywhere, which mixes to a dead stop and a dark lamp,
+# and the strip says why instead of showing a dead stick.
+ADC_ENABLED = os.environ.get("INPUTS_ADC_ENABLED", "1") == "1"
+
 # Ceiling on the ADC thread's rate. It is a CEILING, not a promise: a full
 # 3-channel read is the slowest thing in this module and the thread simply runs
 # flat out when it cannot keep up.
@@ -514,7 +523,8 @@ class InputReader(threading.Thread):
         # Switches still work without the ADC, so a failure here is not fatal -
         # the panel shows analog as unavailable and the pills keep updating. It
         # is also not permanent any more: run() retries this every ADC_RETRY_S.
-        self._open_adc()
+        if ADC_ENABLED:
+            self._open_adc()
         return True
 
     def _open_adc(self):
@@ -978,8 +988,14 @@ class InputReader(threading.Thread):
         """The switch loop. Starts the ADC thread and then keeps its own time."""
         if not self._open():
             return
-        self._adc_thread = threading.Thread(target=self._adc_run, daemon=True)
-        self._adc_thread.start()
+        if ADC_ENABLED:
+            self._adc_thread = threading.Thread(target=self._adc_run, daemon=True)
+            self._adc_thread.start()
+        else:
+            # Said in the strip, not just implied by dashes: a deliberately
+            # disabled stick and a broken one must not look the same.
+            with self._lock:
+                self._state["adc_error"] = "ADC off for testing (INPUTS_ADC_ENABLED=0)"
 
         period = 1.0 / max(1.0, POLL_HZ)
         try:
