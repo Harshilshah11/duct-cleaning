@@ -319,12 +319,22 @@ class JoystickView(QWidget):
 
         r = 5.0
         half = (box.width() - 14) / 2.0
-        # The one rule here: pushing the stick "up" must move the dot up.
-        # Which SIGN that takes depends on the stick wiring and INVERT_Y, so
-        # it was set empirically on the rig (2026-08-18: the dot mirrored the
-        # hand vertically after the harness rework settled on INVERT_Y=1).
-        # If a future rewire flips the dot again, flip this + back to -.
-        dx, dy = cx + self._x * half, cy + self._y * half
+        # The one rule here: THE DOT MUST FOLLOW THE HAND. Push the stick up and
+        # the dot goes up; push it left and the dot goes left.
+        #
+        # Which SIGN each axis takes depends on the stick wiring AND on
+        # INVERT_X / INVERT_Y in inputs.py, because what arrives here is the
+        # ALREADY-inverted value. So both signs are set empirically on the rig,
+        # and both have now been flipped once:
+        #
+        #   Y flipped 2026-08-18, after the harness rework settled INVERT_Y=1
+        #   X flipped 2026-08-19, when INVERT_X went to 1 to correct the steering
+        #
+        # DISPLAY ONLY. Nothing here reaches the motors - the drive path reads
+        # inputs.py, not this widget - so a wrong sign here is a lying dot and
+        # never a robot that drives the wrong way. If a future rewire mirrors
+        # the dot again, flip the offending sign here and change nothing else.
+        dx, dy = cx - self._x * half, cy + self._y * half
         p.setPen(QPen(QColor(ACCENT), 1))
         p.setBrush(QColor(ACCENT))
         p.drawEllipse(QRectF(dx - r, dy - r, r * 2, r * 2))
