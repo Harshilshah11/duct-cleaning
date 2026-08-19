@@ -39,7 +39,7 @@ import traceback
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QRectF, QTimer
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap, QShortcut, QKeySequence
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -98,6 +98,10 @@ class VideoCanvas(QWidget):
         self._pixmap = None
         self._message = "CONNECTING..."
         self._highlight = False
+        # Thick enough to read at a glance from across a rig, thin enough not to
+        # eat the edge of the picture. Drawn inside the canvas, so this many
+        # pixels of video are covered on each side while lit.
+        self.HL_BORDER = 6
         self.setMinimumSize(320, 240)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -152,8 +156,7 @@ class VideoCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(
-            self.rect(), QColor("#ffffff" if self._highlight else "#05080b"))
+        painter.fillRect(self.rect(), QColor("#05080b"))
 
         rects = (
             self._blit_rects(self._pixmap)
@@ -169,6 +172,25 @@ class VideoCanvas(QWidget):
             painter.setPen(QColor("#e0564a"))
             painter.setFont(QFont(MONO, 13, QFont.Bold))
             painter.drawText(self.rect(), Qt.AlignCenter, self._message)
+
+        if self._highlight:
+            # DRAWN OVER THE VIDEO, and it has to be: config.VIDEO_ZOOM
+            # defaults to 1.0, which scales the picture to COVER the canvas, so
+            # there is no letterbox band left to colour. A frame on top is the
+            # only way to mark this view without tinting the image itself - and
+            # the image is the thing the operator is actually reading, so it
+            # stays untouched.
+            #
+            # Inset by half the pen width so the whole stroke lands inside the
+            # widget instead of being clipped in half by its edge; MiterJoin so
+            # the corners come to a point rather than rounding off.
+            pen = QPen(QColor("#ffffff"), self.HL_BORDER)
+            pen.setJoinStyle(Qt.MiterJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            i = self.HL_BORDER / 2.0
+            painter.drawRect(
+                QRectF(self.rect()).adjusted(i, i, -i, -i))
 
 
 class CameraPanel(QWidget):
@@ -281,18 +303,11 @@ class CameraPanel(QWidget):
         if on == self._highlight:
             return
         self._highlight = on
-        self.header_widget.setStyleSheet(
-            "#panelHeader { background: #ffffff; "
-            "border-bottom: 1px solid #ffffff; }"
-            "#panelName { color: #05080b; }" if on else ""
-        )
-        self.setStyleSheet(
-            "#panel { background: #ffffff; border: 4px solid #ffffff; "
-            "border-radius: 4px; }" if on else ""
-        )
-        # The canvas lights too, so the white reaches all the way around the
-        # video instead of stopping at the panel border. Without this the
-        # highlight was a frame with a black gap inside it.
+        # ONLY THE CAMERA VIEW LIGHTS, on the operator's call 2026-08-19.
+        # An earlier version whitened the title strip and the panel border too;
+        # that marked the whole panel, which was more than was wanted. The strip
+        # and the border now keep their idle look and the canvas carries the
+        # whole indication on its own.
         self.canvas.set_highlight(on)
 
     def refresh(self):
@@ -765,7 +780,7 @@ QWidget {{
     font-family: "{MONO}", monospace;
     font-size: 12px;
 }}
-#panel  {{ background: #05080b; border: 4px solid #1e2a38; border-radius: 4px; }}
+#panel  {{ background: #05080b; border: 1px solid #1e2a38; border-radius: 4px; }}
 #panelHeader {{ background: #111823; border-bottom: 1px solid #1e2a38; }}
 #panelName  {{ font-weight: bold; letter-spacing: 1px; }}
 #dot    {{ font-size: 12px; color: #e0564a; }}
