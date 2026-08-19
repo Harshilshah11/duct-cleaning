@@ -550,11 +550,23 @@ class GroundStationWindow(QWidget):
         #
         # left + right, because that is the pair's common component: a spin in
         # place is +x and -x, which sums to zero and correctly lights nothing,
-        # while a curve forward still sums positive and lights FRONT.
+        # while a curve still lights whichever end it is heading for.
+        #
+        # A NEGATIVE SUM IS FORWARD ON THIS RIG, AND THAT IS NOT A TYPO.
+        # Confirmed on the robot 2026-08-19: the first version of this used the
+        # obvious "positive is forward" and lit the BACK camera when the stick
+        # was pushed forward. The sign here is a property of the whole chain -
+        # the stick's wiring, INVERT_X/INVERT_Y in inputs.py, and whichever way
+        # round the driver's DIR lines are landed - so it is empirical, exactly
+        # like the dot's signs in inputs_panel.py.
+        #
+        # WORTH KNOWING WHEN READING TELEMETRY: it means a logged "L=+237 R=+237"
+        # is the robot REVERSING, not driving forward. Nothing is wrong with the
+        # drive; the label is just the opposite of the naive reading.
         drive = (motor_state.get("left") or 0) + (motor_state.get("right") or 0)
         for panel in self.panels:
-            panel.set_highlight((drive > 0 and panel.is_front)
-                                or (drive < 0 and panel.is_back))
+            panel.set_highlight((drive < 0 and panel.is_front)
+                                or (drive > 0 and panel.is_back))
         self.topbar.set_clock(datetime.now().strftime("%H:%M:%S"))
 
         # Same push model as the top bar - latest() is a cheap dict copy off the
