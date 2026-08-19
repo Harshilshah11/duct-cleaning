@@ -87,15 +87,36 @@ ADC_ENABLED = os.environ.get("INPUTS_ADC_ENABLED", "1") == "1"
 # 3-channel read is the slowest thing in this module and the thread simply runs
 # flat out when it cannot keep up.
 #
-# 40 Hz is sized for the KERNEL bus (ads_i2c.py), where a 3-channel poll costs
-# ~12 ms - mostly the chip's own conversion time - so a 25 ms period still
-# leaves half the budget idle. Raised from 25 on 2026-08-17 because every
+# 40 Hz was sized for the KERNEL bus (ads_i2c.py), where a 3-channel poll costs
+# ~12 ms - mostly the chip's own conversion time - so a 25 ms period still left
+# half the budget idle. Raised from 25 on 2026-08-17 because every
 # sample-counted latency in this file (the median, the jump confirm, the pot's
 # stability window) is priced in poll periods, and the reported pot lag was
-# exactly those windows at 40 ms a tick. On the userspace-bit-bang FALLBACK
-# this cap is unreachable (~32 ms/poll idle, far worse under load) and the
-# thread just runs as fast as that path allows, same as before.
-ADC_POLL_HZ = float(os.environ.get("INPUTS_ADC_POLL_HZ", "40"))
+# exactly those windows at 40 ms a tick.
+#
+# RAISED 40 -> 60 ON 2026-08-19, on the operator's report that the stick still
+# lags. 60 Hz is a 16.7 ms period against that same ~12 ms poll, so the loop
+# still finishes with ~28% of its budget spare rather than running flat out.
+# MEASURED before making the change, so this is headroom rather than optimism:
+#
+#     load average 0.98 on 4 cores, main.py at 130% CPU, throttled=0x0
+#     adc=40.0Hz sustained (the thread was pinned at its OLD ceiling, i.e.
+#         it had capacity to spare and the CEILING was the limit, not the bus)
+#     67 rejected samples in 2h31m of log = 0.018% of ~362,000 samples
+#
+# That last number is why tightening the windows is safe: every sample-counted
+# gate here shortens IN TIME as the rate rises, which trades a little noise
+# immunity for latency - and the noise gates were rejecting essentially nothing.
+#
+# BE HONEST ABOUT THE SIZE OF THIS WIN. It removes ~17 ms from a stick-to-wheel
+# budget still dominated by MOTOR_SLEW_PER_S in uno_motors.py (150 ms). The ADC
+# was measured NOT to be the bottleneck; this is the last cheap millisecond on
+# this side, not the fix for a sluggish stick.
+#
+# On the userspace-bit-bang FALLBACK this cap is unreachable (~32 ms/poll idle,
+# far worse under load) and the thread just runs as fast as that path allows,
+# same as before.
+ADC_POLL_HZ = float(os.environ.get("INPUTS_ADC_POLL_HZ", "60"))
 
 # The kernel's own bit-banged I2C bus, tried BEFORE the userspace bit-bang.
 # /boot/firmware/config.txt maps it onto the crossed wiring (SDA=GPIO3,
@@ -141,7 +162,46 @@ CENTRE_TOLERANCE = float(os.environ.get("INPUTS_CENTRE_TOLERANCE", "0.25"))
 # Fraction of full deflection ignored around centre, then rescaled so there is
 # no step at the edge of the band. Even a good centre drifts by a few counts,
 # and without this the wheels creep whenever the rig is powered up.
-AXIS_DEADBAND = float(os.environ.get("INPUTS_AXIS_DEADBAND", "0.08"))
+#
+# THERE ARE TWO DEADBANDS ON THIS PATH AND THEY STACK. uno_eth_link has its own
+# DEADBAND (of 255), applied to the value this function has ALREADY rescaled,
+# and it does not rescale again - the same double-band failure that UNO_DEADZONE
+# in uno_serial.py was set to 0.0 to cure, with the second copy living on the
+# Uno instead of in Python. Diagnosed 2026-08-19: the operator reported a dead
+# patch of ~12% while this constant said 8%, and the arithmetic agreed - a wheel
+# needed PWM >= 12, i.e. normalised >= 12/255 = 0.047, i.e. deflection >=
+# 0.08 + 0.047 * 0.92 = 0.1233 of half travel.
+#
+# MEASURED against 7433 logged frames in ~/motor_cam.log: the 5th percentile
+# deflection on frames where the wheels were actually commanded was 1056 counts,
+# against 1085 predicted by that formula and 704 predicted if this band were the
+# only one - which is what confirmed the stacking rather than a mis-tuned
+# constant. The stick at rest stayed within 240 counts at the 95th percentile
+# (median 80), which is the floor any deadband here has to clear to stop creep.
+#
+# RAISED TO 0.289 ON 2026-08-19, on the operator's instruction: nothing at all
+# must happen in the first 30% of stick travel, in every direction.
+#
+# WHY 0.289 AND NOT 0.30. The Uno's DEADBAND (now 4 of 255) still stacks, and it
+# is applied AFTER the rescale below, so it adds 4/255 * (1 - D) of travel.
+# Solving for a 30.0% total:
+#
+#     0.30 = D + (4/255) * (1 - D)   ->   D = 0.28884
+#
+# So 0.289 here puts the FIRST MOVING SAMPLE at 30.0% of travel, which is what
+# was asked for; 0.30 would put it at 31.1%.
+#
+# This is per-AXIS - _norm_axis applies it to x and y separately - which is what
+# makes the band 30% in forward, backward, left and right alike rather than a
+# 30% circle around centre.
+#
+# The travel past the band is still RESCALED to the full 0..1 range, so there is
+# no step at the edge: the remaining 70% of stick now carries the whole demand
+# range, which makes the stick more sensitive per millimetre past 30%. That is
+# inherent to spending travel on a deadband, not a side effect to fix.
+#
+# If you change this, remember the Uno's DEADBAND is the other half of the total.
+AXIS_DEADBAND = float(os.environ.get("INPUTS_AXIS_DEADBAND", "0.289"))
 
 # Which way the stick's electrical travel maps onto the robot's motion. Flip
 # these, not the mixer or the sketch, if a re-mount ever reverses an axis

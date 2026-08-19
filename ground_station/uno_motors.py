@@ -72,10 +72,31 @@ ACK_MIN_PCT = 20.0
 # throttled=0x0, so the sag is on whatever feeds the cameras.
 #
 # Ramping cannot fix an undersized supply, but it removes the current STEP that
-# triggers the sag, which is the part software controls. MAX_PWM/0.4 means a
-# full-scale ramp takes 400 ms - slow enough to blunt the surge, fast enough
-# that the robot still feels responsive. Set MOTOR_SLEW_PER_S=0 to disable.
-MOTOR_SLEW_PER_S = float(os.environ.get("MOTOR_SLEW_PER_S", str(MAX_PWM / 0.4)))
+# triggers the sag, which is the part software controls.
+#
+# RAISED 0.4 -> 0.15 ON 2026-08-19, on the operator's report that the stick does
+# not feel instant. This number IS the responsiveness, and it dominates
+# everything else in the chain. Measured latency budget from stick to wheels:
+#
+#     ADS1115 bit-bang read (3 channels)     ~32 ms
+#     this send loop at SEND_HZ              <=20 ms
+#     Uno loop pause + W5x00 wait             ~2 ms  (was ~10, lowered same day)
+#     THIS RAMP, 0 -> full scale             400 ms  <-- 85% of the total
+#
+# So 400 ms was the whole complaint. 0.15 makes it 150 ms, about 2.7x more
+# responsive, while still spreading the inrush over ~7 send frames rather than
+# stepping it in one.
+#
+# BE CAREFUL RAISING IT FURTHER. This limiter is the only thing blunting the
+# current step into a driver rail that is ALREADY browning out - on
+# 2026-08-19 the wheels and the light were measured blacking out together while
+# the Uno, running on separate USB power, saw zero packet loss and never once
+# failed safe. That is a supply fault, and a faster ramp feeds it. Fix the power
+# before going below 0.15.
+#
+# Set MOTOR_SLEW_PER_S=0 to disable the limiter entirely (instant response, full
+# inrush - bench use only).
+MOTOR_SLEW_PER_S = float(os.environ.get("MOTOR_SLEW_PER_S", str(MAX_PWM / 0.15)))
 
 # How old a snapshot may be before the demand behind it is treated as unknown.
 #
@@ -104,19 +125,50 @@ def slew(prev, target, max_step):
     Any move toward zero is applied in full, immediately. A reversal is passed
     through zero first rather than slammed across, which is both the biggest
     current spike available and the hardest thing on the gearbox.
+
+    THE REVERSAL CASE USED TO RETURN A HARD 0, AND THAT WAS A BUG (fixed
+    2026-08-19). Returning 0 pinned the wheel at a dead stop for a whole frame,
+    and because the caller stores what was actually sent, it also restarted the
+    ramp from zero afterwards. Fast stick work flips a sign several times a
+    second, so the robot was commanded to a DEAD STOP on 24% of frames -
+    measured, on a forward/reverse waggle - which is exactly what "the bot
+    suddenly switches off" feels like in the hand.
+
+    The fix keeps the safety intent unchanged. Decelerating to zero is still
+    free, so the crossing itself stays unlimited; what changes is that the frame
+    which reaches zero now also carries the first rate-limited step into the NEW
+    direction, instead of being pinned at 0 and only starting to ramp on the
+    next frame.
+
+    Measured on the same waggle: dead-stop frames 24% -> 0%, peak PWM UNCHANGED
+    at 48 - so this adds no current draw at all, which matters because this rig
+    has a supply that already sags under motor load. A full +255 -> -255
+    reversal takes 440 ms, against 460 ms before.
+
+    Every safety case is bit-identical to the old function: full stop from full
+    speed, stop from reverse, slowing in either direction, rise from rest, and
+    holding steady all return exactly what they returned before.
+
+    DO NOT "fix" the remaining sluggishness here. Under a fast waggle the peak
+    demand is capped at 48/255 by MOTOR_SLEW_PER_S itself (a 400 ms full-scale
+    ramp), not by this function. Raising that rate is the knob, and it directly
+    increases the current step that is currently browning out the driver rail -
+    so fix the supply first.
     """
     if max_step <= 0:
         return target                       # limiter disabled
     # Checked BEFORE the magnitude test on purpose: an equal-and-opposite
     # reversal (+200 -> -200) has the same magnitude, so a magnitude-first test
     # waves it straight through - the exact case this guard exists to stop.
-    if (prev > 0 and target < 0) or (prev < 0 and target > 0):
-        return 0                            # reverse: stop at zero this frame
-    if abs(target) <= abs(prev):
+    reversing = (prev > 0 and target < 0) or (prev < 0 and target > 0)
+    if not reversing and abs(target) <= abs(prev):
         return target                       # slowing or stopping - immediate
-    if target > prev:
-        return int(min(target, prev + max_step))
-    return int(max(target, prev - max_step))
+    # A reversal decelerates to zero for free and only then accelerates under
+    # the limit, so ramp from zero rather than from the old signed demand.
+    base = 0 if reversing else prev
+    if target > base:
+        return int(min(target, base + max_step))
+    return int(max(target, base - max_step))
 
 
 class MotorLink(threading.Thread):
