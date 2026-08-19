@@ -97,8 +97,24 @@ class VideoCanvas(QWidget):
         super().__init__()
         self._pixmap = None
         self._message = "CONNECTING..."
+        self._highlight = False
         self.setMinimumSize(320, 240)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_highlight(self, on):
+        """Flip the letterbox surround white while this is the camera being
+        driven toward.
+
+        THE VIDEO ITSELF IS NEVER TINTED. An operator reading a duct wall needs
+        the picture untouched; what lights is the area AROUND it. That area is
+        real rather than a hairline: with config.VIDEO_ZOOM below 1 the frame is
+        letterboxed on every side (at zoom 0 it is about a third of the panel),
+        so the whole panel reads as lit without a single pixel of the image
+        being altered.
+        """
+        if on != self._highlight:
+            self._highlight = on
+            self.update()
 
     def set_pixmap(self, pixmap):
         self._pixmap = pixmap
@@ -136,7 +152,8 @@ class VideoCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#05080b"))
+        painter.fillRect(
+            self.rect(), QColor("#ffffff" if self._highlight else "#05080b"))
 
         rects = (
             self._blit_rects(self._pixmap)
@@ -209,14 +226,15 @@ class CameraPanel(QWidget):
         self.header_widget = QWidget()
         self.header_widget.setObjectName("panelHeader")
         self.header_widget.setLayout(header)
-        # 32px flat, on the operator's call 2026-08-19 - superseding the earlier
-        # "+25%", which measured out at 28 from a 22px natural height.
+        # 40px flat, on the operator's call 2026-08-19 - the third number that
+        # day (22 natural -> 28 "+25%" -> 32 -> 40), so it is deliberately one
+        # constant and not something derived.
         #
-        # PINNED rather than derived from the margins because the number IS the
-        # requirement: the strip is 32px whatever the label does. Content is
-        # ~14px, so it centres with ~9px of air either side. A much larger font
+        # PINNED rather than grown from the margins because the number IS the
+        # requirement: the strip is 40px whatever the label does. Content is
+        # ~14px, so it centres with ~13px of air either side. A much larger font
         # would clip, and the fix then is to raise THIS number, not the margins.
-        self.header_widget.setFixedHeight(32)
+        self.header_widget.setFixedHeight(40)
 
         self.canvas = VideoCanvas()
 
@@ -229,27 +247,53 @@ class CameraPanel(QWidget):
         self.setObjectName("panel")
 
     def set_highlight(self, on):
-        """Light this camera's title strip - it is the one being driven toward.
+        """Light this WHOLE camera frame - it is the one being driven toward.
 
-        Forward lights FRONT, reverse lights BACK, and neutral lights neither,
-        so the strip answers "which view matters right now" without the operator
+        Forward lights FRONT, reverse lights BACK, neutral lights neither, so
+        the panel answers "which view matters right now" without the operator
         having to think about it.
 
+        WHITE, and around the whole frame rather than just the title strip, on
+        the operator's call 2026-08-19: the strip alone was too easy to miss
+        while looking at the video itself, which is the one moment it has to be
+        readable. The border carries it around the video; the strip going solid
+        white is what makes it unmissable in peripheral vision.
+
+        THE BORDER WIDTH DOES NOT CHANGE, and that matters more than it looks:
+        the app rule is already 2px (raised from 1px for exactly this), so
+        lighting a panel only swaps a COLOUR. Growing the border instead would
+        reflow the video by a pixel on every direction change, which reads as
+        the picture twitching.
+
+        #panelName is forced dark here because it inherits #d7e0ea from the
+        QWidget rule, which is invisible on white. The status dot is NOT touched
+        - refresh() sets its colour inline, and an inline sheet on the widget
+        itself outranks this one, so it keeps its red/green on the white strip.
+
         An INLINE stylesheet rather than a dynamic property + unpolish/polish:
-        the property route needs the whole widget re-polished on every change,
-        which at the UI frame rate is a lot of style recomputation for a two
-        colour swap. Clearing it back to "" restores the app-level rule.
+        the property route re-polishes the whole widget on every change, which
+        at the UI frame rate is a lot of style recomputation for a colour swap.
+        Clearing back to "" restores the app-level rules.
 
         Guarded on no-change because this is called every tick for every panel;
-        without the guard Qt would reparse the sheet ~10x a second per camera.
+        without the guard Qt would reparse both sheets ~10x a second per camera.
         """
         if on == self._highlight:
             return
         self._highlight = on
         self.header_widget.setStyleSheet(
-            "#panelHeader { background: #17304f; "
-            "border-bottom: 1px solid #3f6fb5; }" if on else ""
+            "#panelHeader { background: #ffffff; "
+            "border-bottom: 1px solid #ffffff; }"
+            "#panelName { color: #05080b; }" if on else ""
         )
+        self.setStyleSheet(
+            "#panel { background: #ffffff; border: 4px solid #ffffff; "
+            "border-radius: 4px; }" if on else ""
+        )
+        # The canvas lights too, so the white reaches all the way around the
+        # video instead of stopping at the panel border. Without this the
+        # highlight was a frame with a black gap inside it.
+        self.canvas.set_highlight(on)
 
     def refresh(self):
         """Pull the newest frame (if any) and update the status line."""
@@ -721,7 +765,7 @@ QWidget {{
     font-family: "{MONO}", monospace;
     font-size: 12px;
 }}
-#panel  {{ background: #05080b; border: 1px solid #1e2a38; border-radius: 4px; }}
+#panel  {{ background: #05080b; border: 4px solid #1e2a38; border-radius: 4px; }}
 #panelHeader {{ background: #111823; border-bottom: 1px solid #1e2a38; }}
 #panelName  {{ font-weight: bold; letter-spacing: 1px; }}
 #dot    {{ font-size: 12px; color: #e0564a; }}
