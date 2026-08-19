@@ -214,9 +214,29 @@ AXIS_DEADBAND = float(os.environ.get("INPUTS_AXIS_DEADBAND", "0.289"))
 # polarity is a property of the WIRING, so re-verify all four directions on
 # the real robot after any analog rework, and expect to touch only these two
 # values when it changes.
-# Final orientation confirmed on the robot 2026-08-18 night: left/right true,
-# forward/back reversed - so Y alone is flipped.
-INVERT_X = os.environ.get("INPUTS_INVERT_X", "0") == "1"
+# Orientation as confirmed on the robot 2026-08-18 night: left/right true,
+# forward/back reversed - so Y alone was flipped then.
+#
+# X IS NOW FLIPPED TOO (2026-08-19). The operator reported the turns swapped:
+# stick left steered right and stick right steered left, while forward and back
+# were correct. An X-only reversal is exactly that signature.
+#
+# NOTE THE AMBIGUITY, because it matters if this ever has to be re-derived.
+# "Turns reversed, forward/back correct" is produced IDENTICALLY by a reversed
+# X axis and by the two MOTOR CHANNELS being swapped in the wiring - in arcade
+# mixing both flip the sign of x relative to y and neither touches straight
+# running. Flipping it here fixes the feel either way, and this file is the
+# designated home for stick orientation, so it is the right first move.
+#
+# But if the real fault is swapped channels, then telemetry "L=" is driving the
+# physical RIGHT wheel, and that will mislead whoever debugs this next. To settle
+# it, drive one wheel on its own with the wheels off the ground:
+#
+#     python3 uno_motors.py --test --only LEFT
+#
+# If the RIGHT wheel turns, the channels are swapped and the honest fix is
+# INVERT_1/INVERT_2 or the pin map in the sketch, not this line.
+INVERT_X = os.environ.get("INPUTS_INVERT_X", "1") == "1"
 INVERT_Y = os.environ.get("INPUTS_INVERT_Y", "1") == "1"
 
 # How long a rejected sample may be papered over with the last GOOD reading.
