@@ -44,9 +44,9 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import Qt, QRectF, QSize
+from PySide6.QtCore import Qt, QPointF, QRectF, QSize
 from PySide6.QtGui import (
-    QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen,
+    QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen, QPolygonF,
 )
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
@@ -297,6 +297,33 @@ class JoystickView(QWidget):
             self._x, self._y = x, y
             self.update()
 
+    # Direction arrows, one per edge. Small on purpose: the box is 84px and the
+    # dot is the primary readout - these are a confirmation, not a second thing
+    # to read. INACTIVE they are drawn in the same wash as the dashed guides so
+    # they read as frame furniture; ACTIVE they go solid ACCENT like the dot.
+    ARROW_HALF = 3.5     # half-width of the triangle base
+    ARROW_LEN = 5.0      # tip to base
+    ARROW_INSET = 2.5    # gap between the tip and the box edge
+
+    def _arrow(self, p, tipx, tipy, ddx, ddy, active):
+        """One filled triangle with its tip at (tipx, tipy), pointing (ddx, ddy).
+
+        (ddx, ddy) is a unit vector; (-ddy, ddx) is its perpendicular, which is
+        what spreads the base. Doing it vectorially rather than with four
+        hard-coded triangles means the four calls below differ only by the
+        direction they are handed, so none of them can drift out of shape.
+        """
+        bx, by = tipx - ddx * self.ARROW_LEN, tipy - ddy * self.ARROW_LEN
+        px, py = -ddy, ddx
+        poly = QPolygonF([
+            QPointF(tipx, tipy),
+            QPointF(bx + px * self.ARROW_HALF, by + py * self.ARROW_HALF),
+            QPointF(bx - px * self.ARROW_HALF, by - py * self.ARROW_HALF),
+        ])
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(ACCENT) if active else wash(ACCENT, 0.72))
+        p.drawPolygon(poly)
+
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -311,30 +338,53 @@ class JoystickView(QWidget):
         p.drawLine(int(box.left()), int(cy), int(box.right()), int(cy))
         p.drawLine(int(cx), int(box.top()), int(cx), int(box.bottom()))
 
-        if self._x is None or self._y is None:
+        live = self._x is not None and self._y is not None
+
+        # ox / oy ARE THE SINGLE SOURCE OF TRUTH for this widget: the dot is
+        # placed with them AND the arrows are lit from them, so an arrow can
+        # never point somewhere the dot is not. If a rewire mirrors the display
+        # again, flip a sign HERE and both follow together.
+        #
+        # The one rule they encode: THE DOT MUST FOLLOW THE HAND. Push the stick
+        # up and the dot goes up; push it left and the dot goes left. Which sign
+        # that takes depends on the stick wiring AND on INVERT_X / INVERT_Y in
+        # inputs.py, because what arrives here is the ALREADY-inverted value, so
+        # both are empirical and both have now been flipped once:
+        #
+        #   Y flipped 2026-08-18, after the harness rework settled INVERT_Y=1
+        #   X flipped 2026-08-19, when INVERT_X went to 1 to correct the steering
+        #
+        # DISPLAY ONLY. Nothing in this widget reaches the motors - the drive
+        # path reads inputs.py, not the panel - so a wrong sign here is a lying
+        # dot, never a robot that drives the wrong way.
+        ox = -self._x if live else 0.0
+        oy = self._y if live else 0.0
+
+        # Lit on ANY departure from centre rather than at some display
+        # threshold: inputs.py has already applied AXIS_DEADBAND and rescaled,
+        # so a non-zero value here is exactly a value the motors are acting on.
+        # An arrow therefore lights at the same instant the wheels are commanded,
+        # which is what makes it worth looking at. eps only guards float dust.
+        eps = 1e-6
+        top, bot = box.top() + self.ARROW_INSET, box.bottom() - self.ARROW_INSET
+        lft, rgt = box.left() + self.ARROW_INSET, box.right() - self.ARROW_INSET
+        self._arrow(p, cx, top, 0.0, -1.0, live and oy < -eps)   # forward
+        self._arrow(p, cx, bot, 0.0, 1.0, live and oy > eps)     # reverse
+        self._arrow(p, lft, cy, -1.0, 0.0, live and ox < -eps)   # left
+        self._arrow(p, rgt, cy, 1.0, 0.0, live and ox > eps)     # right
+
+        if not live:
             p.setPen(QColor(MUTED))
             p.setFont(font(7))
             p.drawText(box, Qt.AlignCenter, "no ADC")
             return
 
         r = 5.0
-        half = (box.width() - 14) / 2.0
-        # The one rule here: THE DOT MUST FOLLOW THE HAND. Push the stick up and
-        # the dot goes up; push it left and the dot goes left.
-        #
-        # Which SIGN each axis takes depends on the stick wiring AND on
-        # INVERT_X / INVERT_Y in inputs.py, because what arrives here is the
-        # ALREADY-inverted value. So both signs are set empirically on the rig,
-        # and both have now been flipped once:
-        #
-        #   Y flipped 2026-08-18, after the harness rework settled INVERT_Y=1
-        #   X flipped 2026-08-19, when INVERT_X went to 1 to correct the steering
-        #
-        # DISPLAY ONLY. Nothing here reaches the motors - the drive path reads
-        # inputs.py, not this widget - so a wrong sign here is a lying dot and
-        # never a robot that drives the wrong way. If a future rewire mirrors
-        # the dot again, flip the offending sign here and change nothing else.
-        dx, dy = cx - self._x * half, cy + self._y * half
+        # 26, not the old 14: the dot's travel is pulled in so a fully deflected
+        # dot stops just short of the arrow it is pointing at instead of sitting
+        # on top of it. Widen this and they collide at full stick.
+        half = (box.width() - 26) / 2.0
+        dx, dy = cx + ox * half, cy + oy * half
         p.setPen(QPen(QColor(ACCENT), 1))
         p.setBrush(QColor(ACCENT))
         p.drawEllipse(QRectF(dx - r, dy - r, r * 2, r * 2))
