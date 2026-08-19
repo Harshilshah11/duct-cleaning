@@ -162,19 +162,22 @@ class CameraPanel(QWidget):
         self.stream = stream
         self._last_seq = -1
 
-        # HEADER SHOWS THE NUMBER ONLY - "CAM 1", never "CAM 1 . FRONT".
+        # HEADER SHOWS THE FULL NAME - "CAM 1 <dot> FRONT", not just "CAM 1".
         #
-        # Same operator call as the top-bar chip in topbar.py, for the same
-        # reason: the two panels sit side by side in a fixed order, so the
-        # FRONT/BACK word only widened the strip and said what the layout
-        # already says. The label is NOT dropped from config.camera_name():
-        # stream.name still feeds the snapshot slug and the stat-line tag
-        # further down this file, and camera_label() still burns FRONT/BACK
-        # into the recorded video. Matched on the number so a name with no
-        # label (recorder.py's "FULL VIEW") passes through untouched.
-        # Operator's call, 2026-08-19. Changing this does NOT rename a file.
-        _num = re.match(r"CAM\s*\d+", stream.name)
-        self.name_label = QLabel(_num.group(0) if _num else stream.name)
+        # Reverted on the operator's call 2026-08-19, same day the number-only
+        # form went in. The reasoning then was that the FRONT/BACK word only
+        # widened the strip and repeated what the side-by-side layout already
+        # said; with the strip now pinned at 32px there is room for it, and the
+        # word is what the highlight below is actually keyed on, so showing it
+        # makes the lit strip self-explanatory.
+        #
+        # The top-bar chips in topbar.py are still number-only and were NOT
+        # touched - they are a different, narrower row.
+        #
+        # This is display only: stream.name already carried the label, and it
+        # still feeds the snapshot slug, the stat-line tag and camera_label()'s
+        # burn-in. Changing this does NOT rename a file.
+        self.name_label = QLabel(stream.name)
         self.name_label.setObjectName("panelName")
 
         self.dot = QLabel("●")
@@ -185,6 +188,15 @@ class CameraPanel(QWidget):
         # stream is up, and the top bar's chip already carries the two things
         # that do (live / not, and how fast). Read them from the console with
         # `python3 check_streams.py` when you actually need them.
+        # WHICH WAY THIS CAMERA LOOKS, matched on the name rather than on the
+        # panel's index, so re-ordering cameras.txt cannot silently swap which
+        # strip lights up. A camera that is neither (recorder.py's "FULL VIEW")
+        # simply never highlights.
+        _up = stream.name.upper()
+        self.is_front = "FRONT" in _up
+        self.is_back = "BACK" in _up
+        self._highlight = False
+
         header = QHBoxLayout()
         header.setContentsMargins(10, 4, 10, 4)
         header.setSpacing(8)
@@ -192,19 +204,52 @@ class CameraPanel(QWidget):
         header.addWidget(self.name_label)
         header.addStretch(1)
 
-        header_widget = QWidget()
-        header_widget.setObjectName("panelHeader")
-        header_widget.setLayout(header)
+        # Kept on self: set_highlight() restyles it every time the drive
+        # direction changes.
+        self.header_widget = QWidget()
+        self.header_widget.setObjectName("panelHeader")
+        self.header_widget.setLayout(header)
+        # 32px flat, on the operator's call 2026-08-19 - superseding the earlier
+        # "+25%", which measured out at 28 from a 22px natural height.
+        #
+        # PINNED rather than derived from the margins because the number IS the
+        # requirement: the strip is 32px whatever the label does. Content is
+        # ~14px, so it centres with ~9px of air either side. A much larger font
+        # would clip, and the fix then is to raise THIS number, not the margins.
+        self.header_widget.setFixedHeight(32)
 
         self.canvas = VideoCanvas()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(header_widget)
+        layout.addWidget(self.header_widget)
         layout.addWidget(self.canvas, 1)
 
         self.setObjectName("panel")
+
+    def set_highlight(self, on):
+        """Light this camera's title strip - it is the one being driven toward.
+
+        Forward lights FRONT, reverse lights BACK, and neutral lights neither,
+        so the strip answers "which view matters right now" without the operator
+        having to think about it.
+
+        An INLINE stylesheet rather than a dynamic property + unpolish/polish:
+        the property route needs the whole widget re-polished on every change,
+        which at the UI frame rate is a lot of style recomputation for a two
+        colour swap. Clearing it back to "" restores the app-level rule.
+
+        Guarded on no-change because this is called every tick for every panel;
+        without the guard Qt would reparse the sheet ~10x a second per camera.
+        """
+        if on == self._highlight:
+            return
+        self._highlight = on
+        self.header_widget.setStyleSheet(
+            "#panelHeader { background: #17304f; "
+            "border-bottom: 1px solid #3f6fb5; }" if on else ""
+        )
 
     def refresh(self):
         """Pull the newest frame (if any) and update the status line."""
@@ -494,6 +539,22 @@ class GroundStationWindow(QWidget):
         # that probe counts too - either being up means the robot is reachable.
         motor_state = self.motors.latest() or {}
         self.topbar.set_robot(bool(motor_state.get("ok")) or self.link.connected)
+
+        # Light the camera we are driving TOWARD: forward -> FRONT, reverse ->
+        # BACK, neutral -> neither.
+        #
+        # Read from the MOTOR DEMAND, not the stick, so it follows what the
+        # wheels were actually told - which means it also stays dark through a
+        # failsafe trip (safeState zeroes both) and rides the slew ramp instead
+        # of flicking on before the robot has moved.
+        #
+        # left + right, because that is the pair's common component: a spin in
+        # place is +x and -x, which sums to zero and correctly lights nothing,
+        # while a curve forward still sums positive and lights FRONT.
+        drive = (motor_state.get("left") or 0) + (motor_state.get("right") or 0)
+        for panel in self.panels:
+            panel.set_highlight((drive > 0 and panel.is_front)
+                                or (drive < 0 and panel.is_back))
         self.topbar.set_clock(datetime.now().strftime("%H:%M:%S"))
 
         # Same push model as the top bar - latest() is a cheap dict copy off the

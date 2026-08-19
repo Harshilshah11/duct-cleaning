@@ -301,8 +301,16 @@ class JoystickView(QWidget):
     # dot is the primary readout - these are a confirmation, not a second thing
     # to read. INACTIVE they are drawn in the same wash as the dashed guides so
     # they read as frame furniture; ACTIVE they go solid ACCENT like the dot.
-    ARROW_HALF = 3.5     # half-width of the triangle base
-    ARROW_LEN = 5.0      # tip to base
+    # Sized on the operator's call 2026-08-19 to double the lit area of
+    # the first version (3.5/5.0). MEASURED by sweeping both constants and
+    # counting solid-accent pixels along the lit edge: the count is coarse
+    # because antialiased edges do not match the exact colour, so it steps
+    # 8 -> 10 -> 12 -> 14 rather than varying smoothly. 4.0/5.2 is the
+    # LARGEST pair that lands on 10, so the arrow is as visible as that
+    # count allows. Raising LEN past ~5.5 makes a fully deflected dot
+    # collide with the arrow it points at - see the dot inset below.
+    ARROW_HALF = 4.0     # half-width of the triangle base
+    ARROW_LEN = 5.2      # tip to base
     ARROW_INSET = 2.5    # gap between the tip and the box edge
 
     def _arrow(self, p, tipx, tipy, ddx, ddy, active):
@@ -383,7 +391,7 @@ class JoystickView(QWidget):
         # 26, not the old 14: the dot's travel is pulled in so a fully deflected
         # dot stops just short of the arrow it is pointing at instead of sitting
         # on top of it. Widen this and they collide at full stick.
-        half = (box.width() - 26) / 2.0
+        half = (box.width() - 28) / 2.0
         dx, dy = cx + ox * half, cy + oy * half
         p.setPen(QPen(QColor(ACCENT), 1))
         p.setBrush(QColor(ACCENT))
