@@ -77,6 +77,24 @@ ACK_MIN_PCT = 20.0
 # that the robot still feels responsive. Set MOTOR_SLEW_PER_S=0 to disable.
 MOTOR_SLEW_PER_S = float(os.environ.get("MOTOR_SLEW_PER_S", str(MAX_PWM / 0.4)))
 
+# How old a snapshot may be before the demand behind it is treated as unknown.
+#
+# TWO clocks, because the snapshot is filled by TWO threads in inputs.py and
+# either can die alone: the ADC can wedge while the GPIO loop is healthy, and
+# stopping the rod because an unrelated analog bus went quiet would be a
+# failsafe firing on the wrong evidence. ANALOG_STALE_S ages the stick and the
+# pot; SWITCH_STALE_S ages the actuator and the brush.
+#
+# These live HERE rather than in main.py because the demand path no longer runs
+# on the UI thread - see set_source(). ANALOG_STALE_S keeps its old environment
+# variable name so an existing override still applies, and 0.4 s is still ten
+# analog poll periods of slack. SWITCH_STALE_S is looser (20 polls at the
+# switch loop's 20 Hz) because a switch position is a latched state rather than
+# a continuously sampled one, so a couple of missed polls mean nothing.
+ANALOG_STALE_S = float(os.environ.get("ANALOG_STALE_S", "0.4"))
+SWITCH_STALE_S = float(os.environ.get("SWITCH_STALE_S", "1.0"))
+
+
 
 def slew(prev, target, max_step):
     """Rate-limit a RISE in demand. Falling and stopping are never delayed.
@@ -119,6 +137,7 @@ class MotorLink(threading.Thread):
         self._brush_at = 0.0
         self._light = None                # panel pot %, drives brightness
         self._light_at = 0.0
+        self._source = None           # pull-model demand source, see set_source
         self._recent = []                 # rolling window of per-frame ack counts
         self._prev_left = 0               # last demand actually sent, for slew()
         self._prev_right = 0
@@ -165,6 +184,75 @@ class MotorLink(threading.Thread):
             self._light = pot_pct
             self._light_at = time.monotonic()
 
+    def set_source(self, fn):
+        """Pull demands from `fn()` on THIS thread instead of waiting for pushes.
+
+        WHY THIS EXISTS, and it is the whole point of the class owning a thread.
+        Every demand used to be pushed in from main.py's Qt timer, so the wheels,
+        the rod and the brush all depended on the UI thread getting a turn inside
+        SAMPLE_STALE_S (250 ms). That thread also refreshes the camera panels.
+        Measured on this rig on 2026-08-19: 433 gaps of 2 s or more in the 1 Hz
+        correlation log, which is driven by a timer on that same thread - so the
+        demand went stale, the mixer produced (0, 0), and every one of those gaps
+        stopped the robot dead and then made it crawl back up the 400 ms slew
+        ramp when the UI caught up. The operator sees that as the stick going
+        numb and the acceleration coming and going, which is what was reported.
+
+        `fn` is inputs.InputReader.latest - a cheap locked dict copy off the
+        reader threads, safe to call at SEND_HZ. Nothing in the drive path now
+        touches Qt, so a stalled repaint costs a stale PANEL and nothing else.
+
+        Pushing still works and still applies when no source is set, so the
+        bench entry points below and the USB transport are unaffected.
+        """
+        with self._lock:
+            self._source = fn
+
+    def _pull(self, source):
+        """One snapshot -> the same set_*() calls main.py used to make.
+
+        Deliberately routed through the public setters rather than writing the
+        fields directly: they carry the locking and the timestamps, and having
+        one way to set a demand is what keeps the pull and push models honest.
+
+        Never raises. A reader that throws must not be able to stop the send
+        loop, because the send loop is what keeps the Uno's 300 ms failsafe from
+        tripping - losing the demand is survivable, losing the carrier is not.
+        """
+        try:
+            snap = source() or {}
+        except Exception as exc:
+            with self._lock:
+                self._state["error"] = f"input source failed: {exc}"
+            return
+
+        now = time.time()
+        joy = snap.get("joy") or {}
+        pot_pct = (snap.get("pot") or {}).get("pct")
+        # Past the limit the axes are forced to None, which mixes to a dead stop.
+        # inputs.py stamps adc_updated on every pass INCLUDING one where every
+        # channel was rejected, so this fires only for a reader that has
+        # genuinely stopped, not for a noisy one.
+        if now - (snap.get("adc_updated") or 0.0) > ANALOG_STALE_S:
+            joy, pot_pct = {}, None
+        self.set_joystick(joy.get("x"), joy.get("y"))
+        # Stale pot -> dark, for the same reason a stale stick means stop: the
+        # last known value is not evidence of anything.
+        self.set_light(pot_pct)
+
+        # The switch half, aged on its own clock. act_demand(None, ...) and
+        # brush_demand(None) both return 0, so a dead switch loop cuts the rod's
+        # enable and the brush rather than latching their last position - the
+        # hole the old UI-thread push left open, because it re-asserted whatever
+        # the snapshot still held regardless of whether anyone had refreshed it.
+        if now - (snap.get("updated") or 0.0) > SWITCH_STALE_S:
+            self.set_actuator(None, None)
+            self.set_brush(None)
+        else:
+            self.set_actuator(snap.get("actuator"), pot_pct)
+            self.set_brush((snap.get("switches") or {}).get("BRUSH"))
+
+
     def latest(self):
         with self._lock:
             return dict(self._state)
@@ -187,6 +275,13 @@ class MotorLink(threading.Thread):
             while not self._stop.is_set():
                 started = time.monotonic()
                 try:
+                    # Demands are PULLED here, on this thread, whenever a
+                    # source is set - so a stalled UI repaint can no longer age
+                    # the stick out from under the mixer. See set_source().
+                    with self._lock:
+                        source = self._source
+                    if source is not None:
+                        self._pull(source)
                     with self._lock:
                         x, y = self._joy
                         fresh = (time.monotonic() - self._joy_at) < SAMPLE_STALE_S

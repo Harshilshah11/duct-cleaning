@@ -626,7 +626,7 @@ void mixJoystick(int x, int y, int *left, int *right) {
 }
 
 void setup() {
-  Serial.begin(9600);   // 9600 on the operator's order 2026-08-18 - match the
+  Serial.begin(115200); // 115200 on the operator's order 2026-08-19 - match the
                         // serial monitor to this or the log reads as garbage.
 
   // Outputs are driven to a stopped state BEFORE they become outputs, so the

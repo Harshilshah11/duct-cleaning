@@ -61,10 +61,23 @@ BAUD = int(os.environ.get("UNO_BAUD", "115200"))
 # Opening the port resets the board; nothing sent before this elapses arrives.
 OPEN_SETTLE_S = float(os.environ.get("UNO_OPEN_SETTLE_S", "1.8"))
 
-# The stick's electrical centre is not exactly zero and drifts a little, so
-# ignore small magnitudes rather than creeping. inputs.py already auto-centres
-# at startup; this covers the residual.
-DEADZONE = float(os.environ.get("UNO_DEADZONE", "0.08"))
+# Residual deadzone applied HERE, on top of whatever the source already did.
+#
+# ZERO BY DEFAULT, and that is a fix rather than a disabled safety net. Both
+# real callers of mix() are fed from inputs.py, whose _norm_axis() already
+# applies INPUTS_AXIS_DEADBAND (0.08) AND rescales the travel past it so the
+# output leaves centre continuously from 0.0. Applying a second 0.08 band to
+# that rescaled value cost twice over: the dead patch became
+# 0.08 + 0.08 * 0.92 = ~15.4% of stick travel instead of 8%, and because the
+# second band clips WITHOUT rescaling, the wheels then broke away at
+# 0.08 * 255 = 20 PWM instead of easing up from zero. A wide dead patch
+# followed by a step is precisely what "the acceleration off centre is not
+# smooth" feels like in the hand.
+#
+# The deadband belongs to inputs.py because that is where the centre is learned
+# and where the rescale lives; one owner, one number. Set UNO_DEADZONE back to
+# 0.08 if mix() is ever fed raw, un-centred axes from somewhere else.
+DEADZONE = float(os.environ.get("UNO_DEADZONE", "0.0"))
 
 # Ceiling on demand sent to the driver. Drop it to tame the robot indoors --
 # it scales both channels, so steering stays proportional.

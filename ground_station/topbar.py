@@ -185,7 +185,16 @@ class TopBar(QWidget):
         # without this and the bar itself would not.
         self.setAttribute(Qt.WA_StyledBackground, True)
 
-        self._names = [name for name, _ in cameras]
+        # CHIP NAMES ARE THE NUMBER ONLY - "CAM 1", never "CAM 1 · FRONT".
+        #
+        # config.camera_name() still carries the FRONT/BACK label and it still
+        # rides the PANEL HEADER and the RECORDING FILE NAMES, which is where it
+        # earns its keep: footage pulled off a USB stick months later has to be
+        # tellable apart, and cam1_front_003.mp4 does that on its own. Up here it
+        # only made the chip wider and repeated what the panel directly below it
+        # already says, so the bar reads CAM 1 / CAM 2 and nothing else.
+        # Operator's call, 2026-08-19. Changing this does NOT rename any file.
+        self._names = [f"CAM {i + 1}" for i in range(len(cameras))]
 
         # --- brand ----------------------------------------------------------
         logo_label = QLabel()

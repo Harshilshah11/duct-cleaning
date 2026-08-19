@@ -418,23 +418,25 @@ ACT_RETRACT_PIN = 19
 BRUSH_PIN = 27          # brush motor on / off
 
 # Switches whose OPEN state means ON - the reverse of every other switch here.
+# EMPTY, and it belongs empty: every control on this rig is fail-dead active-low
+# again, so an unplugged or snapped wire reads OFF.
 #
-# THE BRUSH TOGGLE IS INVERTED ON THE OPERATOR'S EXPLICIT ORDER (2026-08-17,
-# "high -> brush on, low -> brush off"): the lever is mounted so that the throw
-# Harshil uses as ON leaves the pin open, and the throw used as OFF closes it to
-# ground. Decoding it active-low therefore ran the brush in the OFF position -
-# diagnosed live, with the pad register and the wire log side by side. That was
-# measured on the OLD pin (GPIO13); the orientation carried over to GPIO27
-# unverified, so if the brush now runs with the lever OFF, empty this set.
+# Kept as history because this was flipped once and it cost us. The brush toggle
+# was inverted on 2026-08-17 on the operator's explicit order ("high -> brush on,
+# low -> brush off"): as wired then, the throw Harshil used as ON left the pin
+# open and the throw used as OFF shorted it to ground, so an active-low decode
+# ran the brush in the OFF position. That was measured on the OLD pin (GPIO13)
+# and carried over to GPIO27 unverified.
 #
-# KNOW WHAT THIS COSTS. With the pull-up, an UNPLUGGED OR BROKEN WIRE floats
-# HIGH, and high now reads ON: a snapped toggle wire is a running brush that
-# the panel cannot stop (the joystick, actuator and light keep their fail-dead
-# active-low sense; only this switch trades that away). If the brush ever runs
-# with the toggle unplugged, this constant is why - and moving the wire to the
-# switch's other outer terminal, then emptying this set, restores the fail-safe
-# orientation without any code change.
-OPEN_IS_ON = {BRUSH_PIN}
+# The bill arrived on 2026-08-19. With the toggle unplugged the pull-up floats
+# GPIO27 HIGH, and HIGH meant ON, so the panel read BRUSH ON with no switch on
+# the rig at all - and a snapped wire would have read as a running brush the
+# panel could not stop. Harshil rewired the toggle so its OFF throw reads off,
+# which is the fail-safe orientation, so the inversion is gone.
+#
+# DO NOT RE-ADD IT. If the lever ever reads backwards, move the wire between the
+# switch's two outer terminals; that fixes the sense without giving up fail-dead.
+OPEN_IS_ON = set()
 # Rewired 2026-08-18 on the operator's order: the pair moved 24/23 -> 22/11
 # (red kept START/STOP, green kept PAUSE/RESUME - if the strip shows the two
 # levers swapped, exchange these two numbers, nothing else references them).

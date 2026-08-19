@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -55,16 +56,9 @@ from inputs_panel import InputsPanel
 from splash import SplashScreen
 from uno_motors import MotorLink
 
-# How old the ANALOG sample may be before the stick is treated as unknown.
-#
-# Sized off the measured analog poll rate, not guessed: inputs.py bit-bangs three
-# ADS channels in ~32 ms and is capped at 25 Hz, so a healthy sample is never more
-# than ~40 ms old and 0.4 s is ten poll periods of slack. Comfortably above any
-# real jitter on a Pi that is also decoding two camera streams, and far below the
-# point where a driving robot has gone anywhere - the wheels stop within half a
-# second of the reader going quiet. See the block in tick() for why this cannot be
-# left to MotorLink's own SAMPLE_STALE_S.
-ANALOG_STALE_S = float(os.environ.get("ANALOG_STALE_S", "0.4"))
+# Analog staleness now lives in uno_motors, next to the loop that acts on it -
+# the demand path is pulled on MotorLink's own thread rather than pushed from
+# tick(), so main.py has no say in how old a sample may be. See set_source().
 
 SANS = "DejaVu Sans"
 # One typeface across the app. The panel headers and the NO SIGNAL placeholder
@@ -168,7 +162,19 @@ class CameraPanel(QWidget):
         self.stream = stream
         self._last_seq = -1
 
-        self.name_label = QLabel(stream.name)
+        # HEADER SHOWS THE NUMBER ONLY - "CAM 1", never "CAM 1 . FRONT".
+        #
+        # Same operator call as the top-bar chip in topbar.py, for the same
+        # reason: the two panels sit side by side in a fixed order, so the
+        # FRONT/BACK word only widened the strip and said what the layout
+        # already says. The label is NOT dropped from config.camera_name():
+        # stream.name still feeds the snapshot slug and the stat-line tag
+        # further down this file, and camera_label() still burns FRONT/BACK
+        # into the recorded video. Matched on the number so a name with no
+        # label (recorder.py's "FULL VIEW") passes through untouched.
+        # Operator's call, 2026-08-19. Changing this does NOT rename a file.
+        _num = re.match(r"CAM\s*\d+", stream.name)
+        self.name_label = QLabel(_num.group(0) if _num else stream.name)
         self.name_label.setObjectName("panelName")
 
         self.dot = QLabel("●")
@@ -282,6 +288,10 @@ class GroundStationWindow(QWidget):
         # viewer down. UDP sends never fail loudly, so the link's health comes
         # from whether ACKs come back, not from whether send() threw.
         self.motors = MotorLink()
+        # The drive path pulls its own inputs, on MotorLink's thread, at
+        # SEND_HZ. Wired BEFORE start() so the very first pass already has a
+        # source and there is no window where the wheels wait on a UI frame.
+        self.motors.set_source(self.inputs.latest)
         self.motors.start()
 
         # --- recording -------------------------------------------------------
@@ -524,43 +534,22 @@ class GroundStationWindow(QWidget):
         except Exception:
             traceback.print_exc()
 
-        # Stick -> wheels. This only refreshes the demand; MotorLink keeps
-        # transmitting at its own 50 Hz regardless, so a slow UI frame can never
-        # starve the Uno into tripping its 300 ms failsafe. With no ADC the axes
-        # are None, which mixes to a dead stop rather than a stale demand.
+        # NOTHING BELOW THIS POINT DRIVES THE ROBOT ANY MORE, deliberately.
         #
-        # THE ANALOG SAMPLE'S OWN AGE IS CHECKED HERE, and it has to be. This push
-        # is what resets MotorLink's staleness timer, so pushing a value that the
-        # ADC thread stopped updating would re-assert the last stick position as
-        # "fresh" 30 times a second - the wheels would keep driving on a reading
-        # nobody had taken since the reader died. Past the limit the axes are
-        # forced to None, which mixes to a dead stop. inputs.py stamps
-        # adc_updated on every pass including all-rejected ones, so this fires
-        # only for a reader that has genuinely stopped, not for a noisy one.
-        joy = snapshot.get("joy") or {}
-        pot_pct = (snapshot.get("pot") or {}).get("pct")
-        adc_age = time.time() - (snapshot.get("adc_updated") or 0.0)
-        if adc_age > ANALOG_STALE_S:
-            joy, pot_pct = {}, None
-        self.motors.set_joystick(joy.get("x"), joy.get("y"))
-
-        # Actuator switch -> rod direction. The pot argument is vestigial: the
-        # rod has no speed input since D5 became the light, and act_demand()
-        # ignores it. Deliberately the SAME snapshot as the stick above, so the
-        # panel can never show a switch position the actuator did not get.
+        # tick() used to push the stick, the rod, the brush and the lamp into
+        # MotorLink from here, which quietly made every demand depend on this Qt
+        # timer running inside SAMPLE_STALE_S (250 ms). This timer also refreshes
+        # the camera panels: measured 2026-08-19, the 1 Hz correlation timer on
+        # this same thread missed its deadline by 2 s or more 433 times, and each
+        # of those aged the demand out, mixed it to (0, 0) and stopped the robot
+        # until the UI caught up - then made it climb the 400 ms slew ramp again.
+        # The old comment here claimed a slow frame "can never starve the Uno",
+        # which was true and beside the point: the Uno kept receiving packets, it
+        # was the DEMAND INSIDE them that had been zeroed.
         #
-        # NOT gated on adc_age: the rod is driven by the SWITCH pins, which are on
-        # their own thread and keep working with a dead ADC. Stopping the rod
-        # because an unrelated analog bus wedged would be a failsafe firing on the
-        # wrong evidence.
-        self.motors.set_actuator(snapshot.get("actuator"), pot_pct)
-        # Toggle -> brush, on/off at full scale. The brush briefly took its
-        # speed from the pot (2026-08-17, one evening): one knob feeding two
-        # mechanisms meant dimming the lamp also slowed the brush, and a knob
-        # at zero made an armed brush look broken. See brush_demand().
-        self.motors.set_brush((snapshot.get("switches") or {}).get("BRUSH"))
-        # Pot -> light brightness, which is the knob's ONLY job again.
-        self.motors.set_light(pot_pct)
+        # MotorLink now pulls inputs.latest() on its own thread (see
+        # set_source()), so a slow repaint costs a stale PANEL and nothing else.
+        # Keep it that way - do not reintroduce a set_* call in tick().
 
     def log_correlation(self):
         """One line a second pairing motor demand with camera state.
