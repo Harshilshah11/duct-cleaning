@@ -134,7 +134,7 @@ class VideoCanvas(QWidget):
         self.HL_ARROW_SHAFT_L = 30    # length of the stub behind the head, px
         self.HL_ARROW_SHAFT_W = 12    # half-width of that stub, px
         # THE DEFAULT ONLY. CameraPanel overwrites both of these per panel -
-        # FRONT red, BACK green - so this pair is what an unrecognised camera
+        # FRONT green, BACK red - so this pair is what an unrecognised camera
         # would get, not what either of the two on the rig actually uses. See
         # the block beside self.canvas in CameraPanel.__init__.
         self.HL_ARROW_RGB = (255, 59, 48)
@@ -412,10 +412,11 @@ class CameraPanel(QWidget):
 
         self.canvas = VideoCanvas()
 
-        # CAM 1 / FRONT JABS RED, CAM 2 / BACK JABS GREEN, on the operator's
-        # call 2026-08-20. Front was briefly blue that same day; the block below
-        # records why it was blue and why it went back to red - read that before
-        # changing this pair again.
+        # CAM 1 / FRONT JABS GREEN, CAM 2 / BACK JABS RED, on the operator's
+        # call 2026-08-20. That is the third arrangement in one day - front was
+        # red, then briefly blue, then red again, and now green - so the reasons
+        # each one existed are kept below rather than rewritten away. Read them
+        # before changing this pair again.
         #
         # KEYED ON is_back, i.e. on the camera's NAME, exactly like the
         # highlight itself above - not on the panel's index. Re-ordering
@@ -423,38 +424,33 @@ class CameraPanel(QWidget):
         # camera's colour, which an index would have allowed. A camera that is
         # neither keeps the canvas default and never highlights anyway.
         #
-        # This is the first thing on the panel that distinguishes the two
-        # cameras by colour rather than by position, and it is worth saying what
-        # it does NOT mean: it is not a go/stop signal. Green here is "you are
-        # reversing and this is the view behind you", not permission to move.
-        # The pairing is only that reverse and forward should not look alike at
-        # a glance.
+        # NEITHER COLOUR IS A GO/STOP SIGNAL. This is the first thing on the
+        # panel that tells the two cameras apart by colour rather than by
+        # position, and it is worth saying what it does not mean: green on the
+        # front is not permission to move, and red on the back is not a command
+        # to stop. Both mean "this is the view you are being driven toward".
+        # The pairing only has to make forward and reverse look different at a
+        # glance.
         #
-        # FRONT IS RED AGAIN, on the operator's call 2026-08-20, reversing the
-        # blue that had been put here for the reason below.
+        # THE ARGUMENT AGAINST RED ANYWHERE STILL STANDS AND IS WORTH LEAVING
+        # WRITTEN DOWN: this panel already spends #e0564a on failure - the
+        # disconnected status dot and the NO SIGNAL text - so a red jab is a
+        # neighbour of the one colour here that means something is wrong. Blue
+        # was the one hue on this panel carrying no status meaning at all; it
+        # was chosen deliberately for that, and overridden just as deliberately.
+        # Moving red from the front to the back does not answer that objection,
+        # it relocates it. If a red jab is ever taken for a fault on the rig,
+        # this is the line to change, and blue is the option already tried.
         #
-        # THE ARGUMENT AGAINST RED STILL STANDS AND IS WORTH LEAVING WRITTEN
-        # DOWN: this panel already spends #e0564a on failure - the disconnected
-        # status dot and the NO SIGNAL text - so a red jab is a neighbour of the
-        # one colour that means something is wrong, and blue was the one hue
-        # here carrying no status meaning at all. It was chosen deliberately,
-        # not by accident, and the operator overrode it deliberately too.
-        #
-        # What keeps it workable is that these two are much hotter and more
+        # What keeps it workable is that both colours are far hotter and more
         # saturated than either status colour, and they MOVE - a jab that
         # crosses the panel in a second does not read like a dot sitting still.
-        # If red on the front ever does get taken for a fault on the rig, this
-        # is the line to change, and blue is the option that was already tried.
-        #
-        # Green on the back is not a go signal either: it means "you are
-        # reversing and this is the view behind you", not permission to move.
-        # The pairing only has to make forward and reverse look different.
         if self.is_back:
-            self.canvas.HL_ARROW_RGB = (46, 226, 90)
-            self.canvas.HL_ARROW_EDGE = (5, 62, 24)
-        else:
             self.canvas.HL_ARROW_RGB = (255, 59, 48)
             self.canvas.HL_ARROW_EDGE = (74, 8, 4)
+        else:
+            self.canvas.HL_ARROW_RGB = (46, 226, 90)
+            self.canvas.HL_ARROW_EDGE = (5, 62, 24)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -859,6 +855,7 @@ class GroundStationWindow(QWidget):
         try:
             self.inputs_panel.set_state(snapshot, status)
             self.topbar.set_recording(status)
+            self.topbar.set_usb(status.get("usb"))
         except Exception:
             traceback.print_exc()
 

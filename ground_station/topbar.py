@@ -130,6 +130,85 @@ def _separator():
     return line
 
 
+def _after_session(fv):
+    """The REC chip once recording has STOPPED: (text, state, dot).
+
+    STANDBY is only true when nothing is happening. The post-save pipeline -
+    re-encoding the per-camera masters, then hstacking them into the full view -
+    outlives the SAVED toast on any run of length, and a chip reading STANDBY
+    all the way through it is exactly what sends an operator to the USB socket
+    while ffmpeg is still writing. inputs_panel's strip has narrated this since
+    the pipeline landed; the chip is the half of the bar the operator is already
+    looking at, because it is the half next to the picture.
+    """
+    fv = fv or {}
+    state = fv.get("state")
+    if state in ("queued", "normalising"):
+        # "PROCESSING", not "NORMALISING": the operator is being told to wait,
+        # not what ffmpeg is doing. Same word the strip uses.
+        #
+        # "queued" is the instant between Thread.start() and the builder's first
+        # statement. Left out, it put STANDBY back on the chip for those frames.
+        return f"PROCESSING  {fv.get('frac', 0.0) * 100:.0f}%", "warn", "◐"
+    if state == "building":
+        return f"MERGING  {fv.get('frac', 0.0) * 100:.0f}%", "warn", "◐"
+    if fv.get("ready"):
+        # Processing has finished and no backup has run since - the one moment
+        # when plugging a stick in is a straight copy of a complete session.
+        if state == "error":
+            return "MERGE FAILED", "bad", "●"
+        return "READY  PLUG USB", "ok", "●"
+    if state == "error":
+        return "MERGE FAILED", "bad", "●"
+    return "STANDBY", "idle", "●"
+
+
+def _usb_chip(usb):
+    """The USB chip: (text, state, dot).
+
+    The strip's vocabulary cut to chip length. Every phase the daemon publishes
+    gets a word, not just the copy: detect, mount and the copy plan are seconds
+    each on a full stick, and a chip that goes blank through them reads as "the
+    stick did not take" at precisely the moment it must not.
+    """
+    usb = usb or {}
+    state = usb.get("state")
+    if not state:
+        # No status file, or one nobody has stamped for 10s - main._usb_status()
+        # already treats a dead daemon as absent. There is no backup here.
+        return "USB  —", "idle", "●"
+    if state == "idle":
+        # The daemon is up and watching the bus. This is the state that had no
+        # chip at all: the socket works, there is simply nothing in it, and the
+        # operator could not tell that apart from the daemon being dead.
+        return "USB  READY", "idle", "○"
+    if state in ("detected", "mounting"):
+        return "USB  OPENING", "warn", "●"
+    if state == "scanning":
+        return "USB  CHECKING", "warn", "●"
+    if state == "copying":
+        total = usb.get("bytes_total") or 0
+        pct = 100.0 * (usb.get("bytes_done") or 0) / total if total else 0.0
+        # The one chip state where pulling the stick destroys something, so it
+        # blinks - off the wall clock, like the REC chip, so a busy Pi drops
+        # frames without slowing the blink.
+        lit = int(time.monotonic() * 2.8) % 2 == 0
+        return (f"USB  COPYING {pct:.0f}%", "warn", "●" if lit else "○")
+    if state == "finishing":
+        # The stick went in before the merge finished. Nothing is copying this
+        # second, which is the gap the operator used to read as "done".
+        return "USB  FINISHING", "warn", "●"
+    if state == "clearing":
+        return "USB  CLEARING", "warn", "●"
+    if state == "done":
+        return "USB  COMPLETE", "ok", "●"
+    if state == "error":
+        return "USB  FAILED", "bad", "●"
+    # A phase added to usb_backup.py and not here still shows as busy rather
+    # than vanishing, which is the failure mode that matters.
+    return (("USB  " + state.upper())[:20], "warn", "●")
+
+
 class StatusPill(QLabel):
     """A rounded chip whose colour carries the state: ok / warn / bad / idle."""
 
@@ -174,7 +253,7 @@ class StatusPill(QLabel):
 
 
 class TopBar(QWidget):
-    """Logo | title | one chip per camera | robot link | SoC temperature | clock."""
+    """Logo | title | REC | USB | one chip per camera | robot | temp | clock."""
 
     def __init__(self, cameras, logo_path=None, title="GROUND CONTROL STATION"):
         super().__init__()
@@ -185,7 +264,7 @@ class TopBar(QWidget):
         # without this and the bar itself would not.
         self.setAttribute(Qt.WA_StyledBackground, True)
 
-        # CHIP NAMES ARE THE NUMBER ONLY - "CAM 1", never "CAM 1 � FRONT".
+        # CHIP NAMES ARE THE NUMBER ONLY - "CAM 1", never "CAM 1 · FRONT".
         #
         # config.camera_name() still carries the FRONT/BACK label and it still
         # rides the PANEL HEADER and the RECORDING FILE NAMES, which is where it
@@ -234,6 +313,13 @@ class TopBar(QWidget):
         # cameras it is keeping rather than beside the housekeeping.
         self._rec_pill = StatusPill("STANDBY", "idle", min_width=173)
 
+        # Where the footage GOES, beside where it is being kept. The backup
+        # daemon has published a full phase list all along and nothing on this
+        # bar read it, so the bar could not answer "is the stick in and working"
+        # - the question an operator asks while standing at the socket looking
+        # at the screen, not down at the strip.
+        self._usb_pill = StatusPill("USB  —", "idle", min_width=190)
+
         self._robot_pill = StatusPill("ROBOT  LINKING", "warn", min_width=225)
 
         # This machine's own temperature, so it belongs with the clock rather
@@ -260,6 +346,7 @@ class TopBar(QWidget):
         row.addWidget(title_group)
         row.addStretch(1)
         row.addWidget(self._rec_pill)
+        row.addWidget(self._usb_pill)
         row.addWidget(_separator())
         for pill in self._camera_pills:
             row.addWidget(pill)
@@ -325,7 +412,17 @@ class TopBar(QWidget):
             # colour does.
             self._rec_pill.set(f"PAUSED  {held}", "warn", "❚❚")
         else:
-            self._rec_pill.set("STANDBY", "idle")
+            # STOPPED does not mean FINISHED - see _after_session.
+            self._rec_pill.set(*_after_session(status.get("full_view")))
+
+    def set_usb(self, usb):
+        """One main._usb_status() dict, or None/{} when there is no daemon.
+
+        Its own chip rather than another line in the REC chip: the transfer and
+        the recording are two different questions, and both get asked at once
+        every time a stick goes in.
+        """
+        self._usb_pill.set(*_usb_chip(usb))
 
     def set_robot(self, connected):
         """connected: True / False / None (no probe result yet)."""
@@ -373,7 +470,8 @@ class TopBar(QWidget):
         # The threshold is the width at which the title fits WHOLE. A QLabel does
         # not elide, it clips, so a title that is 40px short does not look tight —
         # it looks like "GROUND CONTROL STATI".
-        # Every threshold here moved when the REC chip joined the row. They are
+        # Every threshold here moved when the REC chip joined the row, and
+        # again when USB did. They are
         # the widths at which the REMAINING content fits WHOLE, so they have to
         # be re-derived whenever a chip is added or its text grows - the old
         # numbers left CAM 1 reading "CONNECTEI" at 1024.
@@ -382,18 +480,31 @@ class TopBar(QWidget):
         # each chip's width() against its sizeHint().width(), which is what a
         # QLabel needs to render without clipping. Guessing from character
         # counts was off by ~100px, because the tracked font and the pill
+        # padding both land outside the obvious arithmetic. Measure with
+        # WORST-CASE text in every chip, and allow ~2px of slack: the
+        # layout hands a QLabel floor(share) and sizeHint carries a
+        # rounding margin, so a chip that renders perfectly sits 1px under.
         # padding both land outside the obvious arithmetic.
         width = self.width()
-        self._title_group.setVisible(width >= 1510)
+        self._title_group.setVisible(width >= 1915)
         # The temperature chip goes next. Below this the ROBOT chip is the one
         # that clips, and a chip reading "ROBOT  DISCONNEC" is worse than no
         # temperature at all. The cameras, the robot and REC all outrank it.
-        self._temp_pill.setVisible(width >= 1225)
+        self._temp_pill.setVisible(width >= 1599)
+        # USB outranks the temperature and loses to everything else. A
+        # stick in the socket is something the operator is doing right
+        # now and can ruin by pulling early; the SoC temperature is
+        # housekeeping they will read off the strip. It is also the only
+        # chip here that is dark most of the time, so shedding it costs
+        # nothing on the runs where no stick ever appears.
+        self._usb_pill.setVisible(width >= 1371)
         # The logo goes last, and only because it got big: at 42px tall it is
         # ~188px wide, and on a 1024px panel that is the difference between the
         # camera chips fitting and CAM 1 reading "CONNECTEE". Brand loses to
         # data — on a screen that small the chips ARE the interface.
-        self._logo_label.setVisible(width >= 1065)
+        self._logo_label.setVisible(width >= 1153)
+        # Below ~1036 the cameras, the robot and REC stop fitting between
+        # them and there is nothing sensible left to shed.
         super().resizeEvent(event)
 
 

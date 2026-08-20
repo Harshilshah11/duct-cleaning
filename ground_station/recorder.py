@@ -947,6 +947,51 @@ class FullViewBuilder(threading.Thread):
                 pass
 
 
+def _sweep_orphans(root, older_than=60.0):
+    """Remove recorder temporaries left behind by a viewer that was killed.
+
+    _normalize_one writes .<name>.norm and _build_clip writes full_nnn.mp4.part,
+    each renamed over the real file on success. A SIGTERM mid-encode - which is
+    every pass of the .xinitrc supervision loop, 49 of them in one afternoon on
+    2026-08-20 - leaves the temporary behind instead, and nothing ever came back
+    for it. It cannot be copied away either: usb_backup.plan_copy skips both
+    patterns deliberately, because a half-written file is not footage. So the
+    orphan is never backed up, never cleared, and _discard_if_empty cannot take
+    the directory with it - that uses rmdir(), which refuses a directory holding
+    anything at all. SESSION001 of that afternoon was the result: a session
+    folder with no video in it, 1.6 MB of orphan, and no path that could ever
+    remove either of them.
+
+    Called once at startup, where no build of this process can be running. The
+    mtime guard is for the case that is not this process: a second viewer, or a
+    build still finishing under a supervisor that has already started the next.
+    """
+    if not root or not os.path.isdir(root):
+        return
+    now = time.time()
+    for base, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith((".norm", ".part")):
+                continue
+            path = os.path.join(base, name)
+            try:
+                if now - os.path.getmtime(path) < older_than:
+                    continue
+                os.remove(path)
+            except OSError:
+                pass
+    # Whatever is left empty was a session that never had video in it. rmdir(),
+    # never rmtree(), for exactly the reason _discard_if_empty gives: it refuses
+    # a directory holding anything, so this cannot delete footage even if the
+    # sweep above is wrong about what counts as a temporary.
+    for base, dirs, _files in os.walk(root):
+        for name in dirs:
+            try:
+                os.rmdir(os.path.join(base, name))
+            except OSError:
+                pass
+
+
 class SessionManager:
     """The recording session: state machine, output paths, one recorder each.
 
@@ -969,6 +1014,9 @@ class SessionManager:
 
     def __init__(self, streams, root=None):
         self.root = root or config.RECORD_DIR
+        # Before anything opens a file: clear temporaries a killed viewer
+        # left behind, and the empty session folders they pinned in place.
+        _sweep_orphans(self.root)
         sources = list(streams)
         # The FULL VIEW is a session output, so it is created here rather than
         # by main.py: anything that records through a SessionManager gets the

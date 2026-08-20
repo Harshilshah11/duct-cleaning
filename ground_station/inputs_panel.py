@@ -773,7 +773,8 @@ class SessionView(QWidget):
                 f"COPY FAILED  ·  {(status['usb'].get('detail') or '')}"
                 f"  ·  nothing deleted from Pi")
             recolour(self.detail, BAD, PT_CAP, bold=True)
-        elif (status.get("full_view") or {}).get("state") == "normalising":
+        elif ((status.get("full_view") or {}).get("state")
+              in ("queued", "normalising")):
             # Same reason the BUILDING line exists: this runs after the save,
             # rewrites the per-camera masters in place, and on a long clip it
             # outlasts the SAVED toast. An idle strip here is what makes an
