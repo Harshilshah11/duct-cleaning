@@ -895,10 +895,29 @@ void loop() {
     Serial.println(packetsReceived);
   }
 
-  // 5 ms pause per pass, on the operator's order 2026-08-18. Costs: the loop
-  // tops out near 200 Hz, so the rod's and brush's synthesised PWM stages get
-  // 5 ms duty granularity, and a command can wait up to 5 ms extra in the
-  // W5x00 before it is read - both well inside the 50 Hz command period and
-  // the 300 ms failsafe. Remove this line to restore the free-running loop.
-  delay(5);
+  // 5 ms pause per pass, on the operator's order 2026-08-18: it holds the loop
+  // near 200 Hz so a command waits at most 5 ms extra in the W5x00 - well
+  // inside the 50 Hz command period and the 300 ms failsafe.
+  //
+  // IT IS NOT delay(5), AND THAT IS THE WHOLE POINT. delay() stops the world,
+  // and the world it was stopping included serviceBrushPwm() and
+  // serviceActuatorPwm() - whose period, ACT_PWM_PERIOD_US, is 4 ms. Servicing
+  // a 4 ms waveform once every 5 ms cannot resolve it: the sampled phase
+  // (micros() % 4000) advances by exactly 5000 % 4000 = 1000 us per pass, so it
+  // only ever lands on 0, 1000, 2000, 3000 and takes four passes - 20 ms - to
+  // walk one cycle. What reached the brush was therefore a 50 Hz square wave
+  // with its duty quantised to 25% steps, not a 250 Hz chop at the demanded
+  // duty. 50 Hz is visible flicker and audible stutter, which is exactly how it
+  // presented: the brush "powered on off on off" at any mid duty, while 0 and
+  // 255 looked perfect because both endpoints bypass the chopper entirely
+  // (see serviceBrushPwm) and never alias.
+  //
+  // So: pause for the same 5 ms, but keep the two synthesised stages running
+  // through it. The pacing the operator asked for is unchanged; the PWM now
+  // gets serviced at loop speed - tens of kHz - instead of once per pause.
+  unsigned long pauseStart = micros();
+  while (micros() - pauseStart < 5000UL) {
+    serviceActuatorPwm();
+    serviceBrushPwm();
+  }
 }
