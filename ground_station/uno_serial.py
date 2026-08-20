@@ -143,6 +143,25 @@ def mix(x, y):
 # flat out, so slowing one must not slow the other.
 ACT_MAX_PWM = int(os.environ.get("UNO_ACT_MAX_PWM", "255"))
 
+# THE ROD'S LEADS ARE LANDED THE OTHER WAY ROUND ON THIS RIG, so EXTEND has to
+# go out NEGATIVE. Measured on the rod 2026-08-20: the lever's EXTEND throw
+# retracted it while the panel correctly read ACT=EXTEND.
+#
+# CORRECTED HERE RATHER THAN IN THE PIN MAP, and the difference is not cosmetic.
+# Swapping ACT_EXTEND_PIN/ACT_RETRACT_PIN also moves the rod the right way - it
+# was tried first - but it does so by mislabelling the lever, so the panel then
+# reads RETRACT while the rod extends. Only one of the two fixes leaves the
+# operator's display telling the truth, and on a control this is the whole
+# point: the strip has to say what the rod is about to do.
+#
+# THE HONEST FIX IS A SOLDERING IRON - swap the two leads at the actuator, or
+# invert ACT_DIR in uno_eth_link.ino, and set this to 0. This constant is the
+# software standing in for a wiring fault, which is worth knowing if the rod is
+# ever rewired: whoever does that has to clear this at the same time, or they
+# will re-invert it. Same shape as INVERT_X / INVERT_Y in inputs.py, which
+# stands in for the stick's wiring for the same reason.
+ACT_INVERT = os.environ.get("UNO_ACT_INVERT", "1") == "1"
+
 
 def act_demand(state, pot_pct):
     """3-position actuator switch -> ONE signed demand.
@@ -176,7 +195,8 @@ def act_demand(state, pot_pct):
     """
     if state not in ("EXTEND", "RETRACT"):
         return 0
-    return ACT_MAX_PWM if state == "EXTEND" else -ACT_MAX_PWM
+    out = ACT_MAX_PWM if state == "EXTEND" else -ACT_MAX_PWM
+    return -out if ACT_INVERT else out
 
 
 def brush_demand(toggle_closed):

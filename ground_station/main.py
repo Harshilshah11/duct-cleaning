@@ -31,6 +31,7 @@ Keys:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -38,8 +39,9 @@ import time
 import traceback
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QRectF, QTimer
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QShortcut, QKeySequence
+from PySide6.QtCore import Qt, QPointF, QRectF, QTimer
+from PySide6.QtGui import (QColor, QFont, QImage, QPainter, QPen, QPixmap,
+                           QPolygonF, QShortcut, QKeySequence)
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -98,10 +100,54 @@ class VideoCanvas(QWidget):
         self._pixmap = None
         self._message = "CONNECTING..."
         self._highlight = False
+        # When the current highlight began, for the one-shot sweep below.
+        self._hl_started = 0.0
         # Thick enough to read at a glance from across a rig, thin enough not to
         # eat the edge of the picture. Drawn inside the canvas, so this many
         # pixels of video are covered on each side while lit.
-        self.HL_BORDER = 6
+        #
+        # 8px on the operator's call 2026-08-20, up from 6.
+        self.HL_BORDER = 8
+
+        # FOUR SOLID ARROWS JABBING INWARD, the moving half of the lit cue.
+        #
+        # The static border alone is a state: on or off, and a border that is
+        # merely present competes with everything else already drawn at the edge
+        # of a panel. Motion is what the eye catches in peripheral vision while
+        # it is busy reading a duct wall, which is the one moment this cue has
+        # to work. The border says WHICH panel; this is what makes it register.
+        #
+        # SOLID BODIES, NOT LINE CHEVRONS - the operator's call 2026-08-20,
+        # after two rounds of stroked chevrons read as too thin and too plain.
+        # This is the stock "look here" pointer: a filled head on a stub shaft,
+        # dark-edged so it holds its shape against a pale wall, jabbing at the
+        # picture a few times and then gone.
+        #
+        # ALL FOUR AIM AT THE CENTRE, which is direction-agnostic, and that
+        # turns out to matter: the panel that lights is the one being driven
+        # TOWARD (FRONT under forward, BACK under reverse), so an arrow that
+        # claimed a heading would claim the same heading on both cameras.
+        # Pointing AT the picture says the only thing true of both - look here -
+        # and forward from reverse is told apart by WHICH panel lights.
+        self.HL_ARROW_HEAD_L = 34     # length of the head, px
+        self.HL_ARROW_HEAD_W = 30     # half-width of the head at its base, px
+        self.HL_ARROW_SHAFT_L = 30    # length of the stub behind the head, px
+        self.HL_ARROW_SHAFT_W = 12    # half-width of that stub, px
+        # THE DEFAULT ONLY. CameraPanel overwrites both of these per panel -
+        # FRONT red, BACK green - so this pair is what an unrecognised camera
+        # would get, not what either of the two on the rig actually uses. See
+        # the block beside self.canvas in CameraPanel.__init__.
+        self.HL_ARROW_RGB = (255, 59, 48)
+        # A dark edge, not a light one. On a bright duct wall a saturated shape
+        # with no outline loses its silhouette; against the dark panel border a
+        # light outline would do the same. Dark holds up on both.
+        self.HL_ARROW_EDGE = (74, 8, 4)
+        self.HL_ARROW_GLOW = 16       # width of the soft halo under it, px
+        self.HL_ARROW_S = 1.25        # seconds the whole gesture lasts
+        self.HL_ARROW_JABS = 3        # how many times it lunges at the picture
+        self.HL_ARROW_INSET = 16      # gap from the border at full retraction
+        self.HL_ARROW_TRAVEL = 0.09   # jab distance, as a fraction of the
+                                      # panel's short side
         self.setMinimumSize(320, 240)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -118,6 +164,8 @@ class VideoCanvas(QWidget):
         """
         if on != self._highlight:
             self._highlight = on
+            if on:
+                self._hl_started = time.monotonic()
             self.update()
 
     def set_pixmap(self, pixmap):
@@ -192,6 +240,110 @@ class VideoCanvas(QWidget):
             painter.drawRect(
                 QRectF(self.rect()).adjusted(i, i, -i, -i))
 
+            # ONE SWEEP, THEN GONE, on the operator's call 2026-08-20.
+            # The train crosses the panel once, bottom edge to top edge, and
+            # after that this branch draws nothing at all - the lit border is
+            # the only thing that persists. A cue that kept marching for as long
+            # as the stick was held would sit permanently over the picture, and
+            # the picture is the thing actually being read: the sweep announces
+            # the panel and then gets out of the way.
+            #
+            # Re-armed on every off->on edge (see set_highlight), so easing off
+            # and driving again plays it again.
+            #
+            # ANIMATED OFF THE CLOCK, NOT OFF A TIMER, which is what makes it
+            # affordable: update() here repaints the whole canvas, and the
+            # expensive part of that is re-blitting the scaled frame, so a 20Hz
+            # animation timer would very nearly DOUBLE this panel's repaint cost
+            # on a Pi already near 145% CPU for two decodes. Taking progress
+            # from the monotonic clock means the sweep advances on the repaints
+            # the video is already causing (~25/s) and adds none of its own.
+            # It also self-clears for free: when the sweep is over this draws
+            # nothing, and the next video frame repaints the panel without it.
+            u = (time.monotonic() - self._hl_started) / self.HL_ARROW_S
+            if u < 1.0:
+                # ANTIALIASING ONLY FROM HERE. These are the sole diagonals on
+                # the panel and they look hand-cut without it, but the hint is
+                # set AFTER the frame blit on purpose - turning it on any
+                # earlier would put the smoothing on the scaled video too, which
+                # is the one operation on this path that cannot afford it.
+                painter.setRenderHint(QPainter.Antialiasing, True)
+
+                cx = self.width() / 2.0
+                cy = self.height() / 2.0
+                # Measured off the SHORT side so the jab covers the same number
+                # of pixels whichever way round the panel is - a camera rotated
+                # 90 degrees makes these tall rather than wide.
+                reach = min(self.width(), self.height()) * self.HL_ARROW_TRAVEL
+
+                # A RAISED COSINE, which is what makes this read as a jab rather
+                # than a slide: it leaves the edge slowly, drives through the
+                # middle of each lunge at full speed and eases into the far end,
+                # then comes back the same way. Whole cycles, so the arrow is
+                # retracted at the end of the gesture instead of being cut off
+                # mid-lunge when the fade takes it.
+                lunge = 0.5 - 0.5 * math.cos(2.0 * math.pi * self.HL_ARROW_JABS * u)
+                # In fast, out slower, so it announces itself and then leaves
+                # without a hard cut.
+                fade = min(1.0, u / 0.10, (1.0 - u) / 0.25)
+                alpha = max(0.0, min(1.0, fade))
+
+                # Start point and inward unit vector, one per edge. Each arrow
+                # rides its own normal toward the middle of the picture.
+                edges = (
+                    (cx, self.HL_ARROW_INSET, 0.0, 1.0),                     # top
+                    (cx, self.height() - self.HL_ARROW_INSET, 0.0, -1.0),    # bottom
+                    (self.HL_ARROW_INSET, cy, 1.0, 0.0),                     # left
+                    (self.width() - self.HL_ARROW_INSET, cy, -1.0, 0.0),     # right
+                )
+
+                hl, hw = self.HL_ARROW_HEAD_L, self.HL_ARROW_HEAD_W
+                sl, sw = self.HL_ARROW_SHAFT_L, self.HL_ARROW_SHAFT_W
+
+                for sx, sy, dx, dy in edges:
+                    # Tip of the arrow after this frame's lunge.
+                    ax = sx + dx * (reach * lunge + hl)
+                    ay = sy + dy * (reach * lunge + hl)
+
+                    # ONE POLYGON FOR THE WHOLE ARROW, walked from the tip down
+                    # one side and back up the other. (-dy, dx) is the
+                    # perpendicular, so this single piece of geometry serves all
+                    # four edges without a case for each - which is the reason
+                    # the four can never drift out of agreement.
+                    def at(back, side):
+                        return QPointF(ax - dx * back - dy * side,
+                                       ay - dy * back + dx * side)
+
+                    body = QPolygonF([
+                        at(0, 0),           # tip
+                        at(hl, hw),         # head, one side
+                        at(hl, sw),         # in to the shaft
+                        at(hl + sl, sw),    # tail, same side
+                        at(hl + sl, -sw),   # tail, other side
+                        at(hl, -sw),        # back out to the head
+                        at(hl, -hw),
+                    ])
+
+                    # Halo first, underneath everything: a wide soft stroke of
+                    # the arrow's own colour. This is what lifts it off a duct
+                    # wall - a shape with no glow disappears into any surface
+                    # near its own colour, and the picture underneath is not
+                    # ours to darken.
+                    glow = QPen(QColor(*self.HL_ARROW_RGB, int(70 * alpha)),
+                                self.HL_ARROW_GLOW)
+                    glow.setJoinStyle(Qt.RoundJoin)
+                    painter.setPen(glow)
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawPolygon(body)
+
+                    # Then the solid body and its dark edge in one pass.
+                    painter.setPen(QPen(QColor(*self.HL_ARROW_EDGE,
+                                               int(230 * alpha)), 2))
+                    painter.setBrush(QColor(*self.HL_ARROW_RGB, int(245 * alpha)))
+                    painter.drawPolygon(body)
+
+                painter.setBrush(Qt.NoBrush)
+
 
 class CameraPanel(QWidget):
     """Title strip (status dot + name) over the video canvas, for one camera."""
@@ -254,11 +406,55 @@ class CameraPanel(QWidget):
         #
         # PINNED rather than grown from the margins because the number IS the
         # requirement: the strip is 40px whatever the label does. Content is
-        # ~14px, so it centres with ~13px of air either side. A much larger font
+        # ~21px, so it centres with ~9px of air either side. A much larger font
         # would clip, and the fix then is to raise THIS number, not the margins.
         self.header_widget.setFixedHeight(40)
 
         self.canvas = VideoCanvas()
+
+        # CAM 1 / FRONT JABS RED, CAM 2 / BACK JABS GREEN, on the operator's
+        # call 2026-08-20. Front was briefly blue that same day; the block below
+        # records why it was blue and why it went back to red - read that before
+        # changing this pair again.
+        #
+        # KEYED ON is_back, i.e. on the camera's NAME, exactly like the
+        # highlight itself above - not on the panel's index. Re-ordering
+        # cameras.txt therefore cannot leave the front camera flashing the back
+        # camera's colour, which an index would have allowed. A camera that is
+        # neither keeps the canvas default and never highlights anyway.
+        #
+        # This is the first thing on the panel that distinguishes the two
+        # cameras by colour rather than by position, and it is worth saying what
+        # it does NOT mean: it is not a go/stop signal. Green here is "you are
+        # reversing and this is the view behind you", not permission to move.
+        # The pairing is only that reverse and forward should not look alike at
+        # a glance.
+        #
+        # FRONT IS RED AGAIN, on the operator's call 2026-08-20, reversing the
+        # blue that had been put here for the reason below.
+        #
+        # THE ARGUMENT AGAINST RED STILL STANDS AND IS WORTH LEAVING WRITTEN
+        # DOWN: this panel already spends #e0564a on failure - the disconnected
+        # status dot and the NO SIGNAL text - so a red jab is a neighbour of the
+        # one colour that means something is wrong, and blue was the one hue
+        # here carrying no status meaning at all. It was chosen deliberately,
+        # not by accident, and the operator overrode it deliberately too.
+        #
+        # What keeps it workable is that these two are much hotter and more
+        # saturated than either status colour, and they MOVE - a jab that
+        # crosses the panel in a second does not read like a dot sitting still.
+        # If red on the front ever does get taken for a fault on the rig, this
+        # is the line to change, and blue is the option that was already tried.
+        #
+        # Green on the back is not a go signal either: it means "you are
+        # reversing and this is the view behind you", not permission to move.
+        # The pairing only has to make forward and reverse look different.
+        if self.is_back:
+            self.canvas.HL_ARROW_RGB = (46, 226, 90)
+            self.canvas.HL_ARROW_EDGE = (5, 62, 24)
+        else:
+            self.canvas.HL_ARROW_RGB = (255, 59, 48)
+            self.canvas.HL_ARROW_EDGE = (74, 8, 4)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -782,7 +978,7 @@ QWidget {{
 }}
 #panel  {{ background: #05080b; border: 1px solid #1e2a38; border-radius: 4px; }}
 #panelHeader {{ background: #111823; border-bottom: 1px solid #1e2a38; }}
-#panelName  {{ font-weight: bold; letter-spacing: 1px; }}
+#panelName  {{ font-weight: bold; font-size: 18px; letter-spacing: 1px; }}
 #dot    {{ font-size: 12px; color: #e0564a; }}
 """
 

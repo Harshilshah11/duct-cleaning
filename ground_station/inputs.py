@@ -163,44 +163,50 @@ CENTRE_TOLERANCE = float(os.environ.get("INPUTS_CENTRE_TOLERANCE", "0.25"))
 # no step at the edge of the band. Even a good centre drifts by a few counts,
 # and without this the wheels creep whenever the rig is powered up.
 #
-# THERE ARE TWO DEADBANDS ON THIS PATH AND THEY STACK. uno_eth_link has its own
-# DEADBAND (of 255), applied to the value this function has ALREADY rescaled,
-# and it does not rescale again - the same double-band failure that UNO_DEADZONE
-# in uno_serial.py was set to 0.0 to cure, with the second copy living on the
-# Uno instead of in Python. Diagnosed 2026-08-19: the operator reported a dead
-# patch of ~12% while this constant said 8%, and the arithmetic agreed - a wheel
-# needed PWM >= 12, i.e. normalised >= 12/255 = 0.047, i.e. deflection >=
-# 0.08 + 0.047 * 0.92 = 0.1233 of half travel.
+# LOWERED 0.08 -> 0.04 ON 2026-08-19. THE BAND THE OPERATOR ACTUALLY FELT WAS
+# 12.3%, NOT 8%, BECAUSE A SECOND DEADBAND STACKS ON TOP OF THIS ONE.
 #
-# MEASURED against 7433 logged frames in ~/motor_cam.log: the 5th percentile
-# deflection on frames where the wheels were actually commanded was 1056 counts,
-# against 1085 predicted by that formula and 704 predicted if this band were the
-# only one - which is what confirmed the stacking rather than a mis-tuned
-# constant. The stick at rest stayed within 240 counts at the 95th percentile
-# (median 80), which is the floor any deadband here has to clear to stop creep.
+# uno_eth_link's own DEADBAND (12 of 255) is applied to the value this function
+# has ALREADY rescaled, and it does not rescale again - the exact double-band
+# failure that UNO_DEADZONE in uno_serial.py was set to 0.0 to cure, just with
+# the second copy living on the Uno instead of in Python. The arithmetic: a
+# wheel needs PWM >= 12, i.e. normalised >= 12/255 = 0.047, which needs raw
+# deflection >= 0.08 + 0.047 * 0.92 = 0.1233 of half travel.
 #
-# RAISED TO 0.289 ON 2026-08-19, on the operator's instruction: nothing at all
-# must happen in the first 30% of stick travel, in every direction.
+# MEASURED, not derived: over 7433 logged frames in ~/motor_cam.log the 5th
+# percentile deflection on frames where the wheels were actually commanded was
+# 1056 counts, against 1085 predicted by that formula and 704 predicted if this
+# band were the only one. The operator reported motion starting below ~1300 and
+# above ~1700 on a ~1500 centre, which is the same number in millivolts.
 #
-# WHY 0.289 AND NOT 0.30. The Uno's DEADBAND (now 4 of 255) still stacks, and it
-# is applied AFTER the rescale below, so it adds 4/255 * (1 - D) of travel.
-# Solving for a 30.0% total:
+# 0.04 here plus DEADBAND 4 on the Uno gives 0.04 + 4/255 * 0.96 = 0.0551, or
+# ~485 counts. THE SAFETY MARGIN IS ALSO MEASURED: on the same log the stick at
+# rest stayed within 240 counts at the 95th percentile (median 80), so 485 is
+# about 2x the observed resting spread and the wheels still cannot creep.
+#
+# LOWER THIS FURTHER ONLY AGAINST THAT NUMBER, not by feel - re-run the resting
+# spread from the log first. And if you change it, remember the Uno's DEADBAND
+# is the other half of the total.
+# RAISED 0.04 -> 0.289 ON 2026-08-19, on the operator's instruction: nothing at
+# all must happen in the first 30% of stick travel, in every direction.
+#
+# WHY 0.289 AND NOT 0.30. The Uno's own DEADBAND (4 of 255) still stacks on top
+# of this one, and it is applied AFTER the rescale below, so it adds
+# 4/255 * (1 - D) of stick travel. Solving for a 30.0% total:
 #
 #     0.30 = D + (4/255) * (1 - D)   ->   D = 0.28884
 #
 # So 0.289 here puts the FIRST MOVING SAMPLE at 30.0% of travel, which is what
-# was asked for; 0.30 would put it at 31.1%.
+# was actually asked for. Setting this to 0.30 would put it at 31.1%.
 #
-# This is per-AXIS - _norm_axis applies it to x and y separately - which is what
+# This is per-AXIS, applied to x and y separately in _norm_axis, which is what
 # makes the band 30% in forward, backward, left and right alike rather than a
 # 30% circle around centre.
 #
 # The travel past the band is still RESCALED to the full 0..1 range, so there is
-# no step at the edge: the remaining 70% of stick now carries the whole demand
+# no step at the edge - the remaining 70% of stick now carries the whole demand
 # range, which makes the stick more sensitive per millimetre past 30%. That is
 # inherent to spending travel on a deadband, not a side effect to fix.
-#
-# If you change this, remember the Uno's DEADBAND is the other half of the total.
 AXIS_DEADBAND = float(os.environ.get("INPUTS_AXIS_DEADBAND", "0.289"))
 
 # Which way the stick's electrical travel maps onto the robot's motion. Flip
@@ -489,6 +495,19 @@ SWITCHES = [
     ("START / STOP", 22),
     ("PAUSE / RESUME", 11),
 ]
+# SWAPPED AND PUT BACK, 2026-08-20. Worth keeping the round trip on record,
+# because the symptom does not distinguish the two causes on its own.
+#
+# The complaint was that the lever's EXTEND throw retracted the rod. That has
+# two possible causes and they need opposite fixes: either this pair is mapped
+# the wrong way round, or the rod's leads are landed backwards. The pair was
+# swapped here first, which DID correct the rod - and broke the panel with it,
+# because the label then disagreed with the lever. That is the tell: the label
+# had been right all along, so the fault was never here. The 2026-08-14 bench
+# measurement of this pair stands.
+#
+# The real inversion is in the rod's wiring and it is corrected at the point it
+# actually occurs - see ACT_INVERT in uno_serial.py.
 ACT_EXTEND_PIN = 16
 ACT_RETRACT_PIN = 19
 
@@ -1151,8 +1170,8 @@ class InputReader(threading.Thread):
                              "EXTEND" if ext else
                              "RETRACT" if ret else "STOP")
         # Back to raw levels for display: closed == shorted to GND == reads 0.
-        # Measured on the rig 2026-08-14, the three stages are
-        # 16=0/19=1 EXTEND, 16=1/19=1 STOP, 16=1/19=0 RETRACT.
+        # Measured on the rig 2026-08-14 and re-confirmed 2026-08-20, the three
+        # stages are 16=0/19=1 EXTEND, 16=1/19=1 STOP, 16=1/19=0 RETRACT.
         state["act_pins"] = {ACT_EXTEND_PIN: 0 if ext else 1,
                              ACT_RETRACT_PIN: 0 if ret else 1}
 

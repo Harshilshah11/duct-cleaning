@@ -435,31 +435,89 @@ def _status():
     return 1
 
 
-def _test():
-    print("WHEELS OFF THE GROUND. Driving each direction, Ctrl-C to abort.")
+def _test(hold_s=5.0, gap_s=1.0, deflect=0.6, loop=False, only=None):
+    """Drive each direction in turn with the joystick OUT of the loop.
+
+    NOTHING HAS TO BE COMMENTED OUT TO GET HERE. set_joystick() below IS the
+    bypass: no source is registered (see set_source), so the run loop consumes
+    these synthetic samples and inputs.py, the ADC and the panel are never
+    consulted. A direction that fails here is the mixer, the link, the Uno or
+    the driver, and cannot be the stick -- which is the point of the split.
+
+    Each sample is re-pushed every 50 ms because the run loop ages it at
+    SAMPLE_STALE_S (250 ms): stop feeding it and the wheels stop, which is the
+    same failsafe the panel relies on. A gap stage pushes a CENTRED stick for
+    the same reason, so it is an active zero rather than an absence of demand.
+
+    gap_s is not padding. The interesting failure is a wheel that drives one
+    way and not the other, and a back-to-back reversal hides it behind slew()'s
+    single pass-through-zero frame. --gap 0 gives a continuous square.
+    """
+    legs = f"{hold_s:g}s per leg"
+    if gap_s > 0:
+        legs += f", {gap_s:g}s stopped between"
+    print(f"WHEELS OFF THE GROUND. {legs}. Ctrl-C to stop.")
+    print(f"stick deflection {deflect:g} of full, MAX_PWM={MAX_PWM}\n")
+
+    stages = (("FORWARD", (0.0, deflect)), ("BACK", (0.0, -deflect)),
+              ("LEFT", (-deflect, 0.0)), ("RIGHT", (deflect, 0.0)))
+
+    # One leg at a time, for splitting a fault that only one direction
+    # shows. Filtered AFTER the table is built so the names and the
+    # deflection stay defined in exactly one place.
+    if only:
+        want = only.strip().upper()
+        names = [s[0] for s in stages]
+        if want not in names:
+            print('unknown direction %r -- pick one of %s'
+                  % (only, ', '.join(names)))
+            return 2
+        stages = tuple(s for s in stages if s[0] == want)
+
     link = MotorLink()
     link.start()
     time.sleep(1.0)
+
+    def hold(x, y, secs):
+        deadline = time.monotonic() + secs
+        while time.monotonic() < deadline:
+            link.set_joystick(x, y)
+            time.sleep(0.05)
+
+    cycle = 0
     try:
-        for label, (x, y) in (("FRONT", (0.0, 0.6)), ("BACK", (0.0, -0.6)),
-                              ("LEFT", (-0.6, 0.0)), ("RIGHT", (0.6, 0.0))):
-            print(f"  {label:6} -> {mix(x, y)}")
-            deadline = time.monotonic() + 1.5
-            while time.monotonic() < deadline:
-                link.set_joystick(x, y)     # keep it fresh, or it goes stale
-                time.sleep(0.05)
-            deadline = time.monotonic() + 0.7
-            while time.monotonic() < deadline:
-                link.set_joystick(0.0, 0.0)
-                time.sleep(0.05)
+        while True:
+            cycle += 1
+            if loop:
+                print(f"-- cycle {cycle} --", flush=True)
+            for label, (x, y) in stages:
+                left, right = mix(x, y)
+                print(f"  {label:8} stick=({x:+.2f},{y:+.2f})"
+                      f" -> left={left:+4d} right={right:+4d}", flush=True)
+                hold(x, y, hold_s)
+                if gap_s > 0:
+                    hold(0.0, 0.0, gap_s)
+            if not loop:
+                break
     except KeyboardInterrupt:
-        pass
+        print("\naborted")
     finally:
+        # Centre the stick before dropping the link, so the last demand on the
+        # wire is a stop rather than whichever leg was interrupted.
+        try:
+            hold(0.0, 0.0, 0.3)
+        except KeyboardInterrupt:
+            pass
         link.stop()
         time.sleep(0.3)
     s = link.latest()
-    print(f"\nsent={s['sent']} acked={s['acked']} loss={s['loss_pct']:.1f}%")
-    return 0 if s["acked"] else 1
+    print(f"\ncycles={cycle} sent={s['sent']} acked={s['acked']}"
+          f" loss={s['loss_pct']:.1f}%")
+    if not s["acked"]:
+        print("NOTHING ACKED - the wheels were never the problem; fix the link"
+              " first (python3 uno_motors.py --status)")
+        return 1
+    return 0
 
 
 def _act_test(hold_s):
@@ -533,10 +591,24 @@ if __name__ == "__main__":
     ap.add_argument("--test", action="store_true", help="drive each direction")
     ap.add_argument("--act", action="store_true",
                     help="drive the linear actuator only, panel switch bypassed")
-    ap.add_argument("--hold", type=float, default=3.0, metavar="SEC",
-                    help="seconds per stage for --act, default 3 (long enough "
-                         "to get a meter on the pin)")
+    ap.add_argument("--hold", type=float, default=None, metavar="SEC",
+                    help="seconds per stage: default 5 for --test, 3 for --act"
+                         " (long enough to get a meter on the pin)")
+    ap.add_argument("--loop", action="store_true",
+                    help="with --test, repeat the square until Ctrl-C")
+    ap.add_argument("--gap", type=float, default=1.0, metavar="SEC",
+                    help="stopped seconds between --test legs, default 1;"
+                         " 0 runs them back to back")
+    ap.add_argument("--deflect", type=float, default=0.6, metavar="FRAC",
+                    help="stick deflection for --test, 0..1, default 0.6")
+    ap.add_argument("--only", metavar="DIR",
+                    help="with --test, drive ONE leg only: FORWARD, BACK,"
+                         " LEFT or RIGHT")
     args = ap.parse_args()
     if args.act:
-        sys.exit(_act_test(args.hold))
-    sys.exit(_test() if args.test else _status())
+        sys.exit(_act_test(3.0 if args.hold is None else args.hold))
+    if args.test:
+        sys.exit(_test(hold_s=5.0 if args.hold is None else args.hold,
+                       gap_s=args.gap, deflect=args.deflect,
+                       loop=args.loop, only=args.only))
+    sys.exit(_status())
