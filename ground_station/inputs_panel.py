@@ -220,6 +220,19 @@ def caption(text):
     return label(text, PT_CAP, CAP_INK, bold=True, extra="letter-spacing:1px;")
 
 
+# USB daemon states that mean "a stick is in and being worked on - do not
+# pull it". Kept as a set so adding a phase to usb_backup.py does not need
+# a matching elif here to stay visible.
+_USB_BUSY = ("detected", "mounting", "scanning", "copying", "finishing",
+             "clearing")
+
+
+def _queued(fv):
+    """'  +2 sessions' when saves have stacked up behind the running build."""
+    n = fv.get("queued") or 0
+    return f"  +{n} session{'s' if n != 1 else ''}" if n else ""
+
+
 class Pill(QLabel):
     """One control's state. Tinted in its own colour when on, outlined when off.
 
@@ -709,29 +722,103 @@ class SessionView(QWidget):
                     f"{clips} clip{'s' if clips != 1 else ''}"
                     f"  {hms(status.get('pending_held'))}")
             recolour(self.detail, WARN, PT_CAP, bold=True)
-        elif (status.get("usb") or {}).get("state") == "copying":
-            # The USB daemon is mirroring /recordings onto a stick right now.
-            # Shown above everything routine (but below toasts and the confirm
-            # window, which are operator decisions in flight) because the one
-            # mistake this line prevents is pulling the stick mid-copy.
+        elif (status.get("usb") or {}).get("state") in _USB_BUSY:
+            # The USB daemon is working on a stick right now. Shown above
+            # everything routine (but below toasts and the confirm window, which
+            # are operator decisions in flight) because the one mistake this line
+            # prevents is pulling the stick mid-copy.
+            #
+            # Every phase is named, not just the copy: detect, mount and the
+            # copy plan used to publish nothing, so on a full stick the strip sat
+            # blank for seconds through exactly the part where the operator is
+            # standing there wondering whether the stick took at all.
             usb = status["usb"]
-            total = usb.get("bytes_total") or 0
-            pct = 100.0 * (usb.get("bytes_done") or 0) / total if total else 0.0
-            self.detail.setText(
-                f"USB TRANSFERRING  {pct:.0f}%  ·  {usb.get('file') or ''}"
-                f"  ·  {usb.get('file_i') or 0}/{usb.get('files_total') or 0}"
-                f" files")
+            state = usb.get("state")
+            if state == "copying":
+                total = usb.get("bytes_total") or 0
+                pct = (100.0 * (usb.get("bytes_done") or 0) / total
+                       if total else 0.0)
+                self.detail.setText(
+                    f"COPYING TO USB  {pct:.0f}%  ·  {usb.get('file') or ''}"
+                    f"  ·  {usb.get('file_i') or 0}"
+                    f"/{usb.get('files_total') or 0} files")
+            elif state == "detected":
+                self.detail.setText("USB FOUND  ·  do not remove")
+            elif state == "mounting":
+                self.detail.setText("OPENING USB  ·  do not remove")
+            elif state == "scanning":
+                self.detail.setText(
+                    "CHECKING WHAT TO COPY  ·  do not remove")
+            elif state == "finishing":
+                # The stick went in before the merge finished. Nothing is being
+                # copied this second, which is exactly when the old strip fell
+                # silent and the operator pulled it - see usb_backup's settle
+                # loop for the recording that lost its full view that way.
+                self.detail.setText(
+                    "FINISHING VIDEO FILES  ·  DO NOT REMOVE USB")
+            else:                                   # clearing
+                self.detail.setText(
+                    f"FREEING SPACE ON PI  ·  copy verified  ·  "
+                    f"{usb.get('files_total') or 0} files")
             recolour(self.detail, WARN, PT_CAP, bold=True)
         elif (status.get("usb") or {}).get("state") == "done":
             usb = status["usb"]
             self.detail.setText(
-                f"USB BACKUP DONE  ·  safe to remove  ·  "
-                f"{usb.get('copied') or 0} copied, "
-                f"{usb.get('deleted') or 0} cleared off Pi")
+                f"COPY COMPLETE  ·  SAFE TO REMOVE USB  ·  "
+                f"{usb.get('copied') or 0} files copied, "
+                f"{usb.get('deleted') or 0} freed off Pi")
             recolour(self.detail, TONES["on"][0], PT_CAP, bold=True)
         elif (status.get("usb") or {}).get("state") == "error":
             self.detail.setText(
-                f"USB BACKUP FAILED  ·  {(status['usb'].get('detail') or '')}")
+                f"COPY FAILED  ·  {(status['usb'].get('detail') or '')}"
+                f"  ·  nothing deleted from Pi")
+            recolour(self.detail, BAD, PT_CAP, bold=True)
+        elif (status.get("full_view") or {}).get("state") == "normalising":
+            # Same reason the BUILDING line exists: this runs after the save,
+            # rewrites the per-camera masters in place, and on a long clip it
+            # outlasts the SAVED toast. An idle strip here is what makes an
+            # operator pull the stick out mid re-encode.
+            fv = status["full_view"]
+            self.detail.setText(
+                f"PROCESSING VIDEO  {fv.get('frac', 0.0) * 100:.0f}%"
+                f"  ·  clip {fv.get('clip') or 0}"
+                f"/{fv.get('clips_total') or 0}{_queued(fv)}"
+                f"  ·  wait before plugging in USB")
+            recolour(self.detail, WARN, PT_CAP, bold=True)
+        elif (status.get("full_view") or {}).get("state") == "building":
+            # The side-by-side is built after the save, not while recording, so
+            # it outlives the SAVED toast on any run of length. Without a line
+            # for it the operator sees SAVED, then an idle strip, while ffmpeg
+            # is still working - and pulls the stick before the file exists.
+            fv = status["full_view"]
+            self.detail.setText(
+                f"MERGING CAMERAS INTO ONE VIDEO"
+                f"  {fv.get('frac', 0.0) * 100:.0f}%"
+                f"  ·  clip {fv.get('clip') or 0}"
+                f"/{fv.get('clips_total') or 0}{_queued(fv)}"
+                f"  ·  wait before plugging in USB")
+            recolour(self.detail, WARN, PT_CAP, bold=True)
+        elif (status.get("full_view") or {}).get("ready"):
+            # The whole point of the two lines above: this is the instant the
+            # merged file exists and the footage is complete on the card. Plug
+            # the stick in NOW and the transfer is a straight copy with nothing
+            # left running behind it.
+            fv = status["full_view"]
+            if fv.get("state") == "error":
+                self.detail.setText(
+                    f"READY TO TRANSFER  ·  PLUG IN USB  ·  merge failed"
+                    f"  ·  {(fv.get('error') or '')[:40]}")
+                recolour(self.detail, BAD, PT_CAP, bold=True)
+            else:
+                self.detail.setText(
+                    f"READY TO TRANSFER  ·  PLUG IN USB  ·  "
+                    f"{fv.get('built') or 0} merged video"
+                    f"{'s' if (fv.get('built') or 0) != 1 else ''}")
+                recolour(self.detail, TONES["on"][0], PT_CAP, bold=True)
+        elif (status.get("full_view") or {}).get("state") == "error":
+            self.detail.setText(
+                f"MERGE FAILED  ·  {(status['full_view'].get('error') or '')}"
+                f"  ·  camera files are safe")
             recolour(self.detail, BAD, PT_CAP, bold=True)
         elif error:
             self.detail.setText(error)
