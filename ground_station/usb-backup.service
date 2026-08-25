@@ -1,0 +1,16 @@
+# USB auto-backup of /recordings - see ground_station/usb_backup.py.
+# Install:  sudo cp usb-backup.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now usb-backup
+[Unit]
+Description=Auto-copy /recordings to any USB drive that is plugged in
+After=local-fs.target
+
+[Service]
+# Root on purpose: mounting block devices needs it, and this stays a separate
+# tiny daemon precisely so the viewer never does.
+ExecStart=/usr/bin/python3 /home/arnobot/DuctCleaning/ground_station/usb_backup.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

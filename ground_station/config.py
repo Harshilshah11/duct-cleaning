@@ -25,10 +25,35 @@ RTSP_PORT = int(os.environ.get("RTSP_PORT", "8554"))
 CAM1_URL = os.environ.get("CAM1_URL", f"rtsp://{ROBOT_PI_IP}:{RTSP_PORT}/cam1")
 CAM2_URL = os.environ.get("CAM2_URL", f"rtsp://{ROBOT_PI_IP}:{RTSP_PORT}/cam2")
 
+# What each camera IS, not just its number: CAM 1 looks out the FRONT of the
+# robot, CAM 2 out the BACK (operator spec 2026-08-18). The label rides on the
+# panel header, the top-bar chip and the recording file names, so footage from
+# a duct can be told apart without remembering which number faced which way.
+_LABELS_RAW = os.environ.get("CAM_LABELS", "FRONT,BACK")
+CAM_LABELS = [v.strip() for v in _LABELS_RAW.split(",")]
+
+
+def camera_label(index):
+    """FRONT / BACK / '' for camera `index` (0-based)."""
+    return CAM_LABELS[index] if index < len(CAM_LABELS) else ""
+
+
+def camera_name(index):
+    """Display name: 'CAM 1 · FRONT'."""
+    label = camera_label(index)
+    return f"CAM {index + 1} · {label}" if label else f"CAM {index + 1}"
+
+
+def camera_slug(index):
+    """Filename stem: 'cam1_front'. Filesystem-safe, unlike the display name."""
+    label = camera_label(index)
+    return f"cam{index + 1}_{label.lower()}" if label else f"cam{index + 1}"
+
+
 # (label, url) pairs rendered left-to-right in the GUI.
 CAMERAS = [
-    ("CAM 1", CAM1_URL),
-    ("CAM 2", CAM2_URL),
+    (camera_name(0), CAM1_URL),
+    (camera_name(1), CAM2_URL),
 ]
 
 # Simplest way to set your two streams: edit cameras.txt next to this file,
@@ -42,7 +67,7 @@ if os.path.exists(_CAM_FILE):
             if line.strip() and not line.lstrip().startswith("#")
         ]
     if _urls:
-        CAMERAS = [(f"CAM {i + 1}", url) for i, url in enumerate(_urls)]
+        CAMERAS = [(camera_name(i), url) for i, url in enumerate(_urls)]
         CAM1_URL = CAMERAS[0][1]
         CAM2_URL = CAMERAS[1][1] if len(CAMERAS) > 1 else CAM1_URL
 
@@ -116,7 +141,48 @@ UI_FPS = int(os.environ.get("UI_FPS", "30"))  # GUI repaint rate
 # It is a *crop*, not a zoom out of thin air: whatever this hides, the operator
 # never sees. Raise it for a fuller screen, drop it to 0 to see everything the
 # camera does.
-VIDEO_ZOOM = max(0.0, min(1.0, float(os.environ.get("VIDEO_ZOOM", "0.2"))))
+# Default raised 0.2 -> 1.0 so the picture COVERS its panel with no black bands.
+# This matters much more now the cameras are rotated: a 90-degree rotation makes
+# the frame portrait inside a landscape panel, and at 0.2 that left roughly half
+# the panel black down both sides. Covering crops instead - at 1.0 nothing is
+# letterboxed but the parts of the frame outside the panel's aspect are not
+# shown. Set VIDEO_ZOOM=0 to see the whole frame again, bands and all.
+VIDEO_ZOOM = max(0.0, min(1.0, float(os.environ.get("VIDEO_ZOOM", "1.0"))))
+
+# Rotate every decoded frame, clockwise degrees: 0, 90, 180 or 270.
+#
+# The cameras are mounted on their sides on this rig, so the default is 90.
+# Applied in the capture thread with cv2.rotate (an optimised transpose) rather
+# than as a QPainter transform per panel per frame: doing it once at the source
+# keeps it off the GUI thread on a Pi that is already software-decoding two
+# streams, and means the RECORDER writes the same orientation you are looking
+# at. Rotating in the GUI would leave recordings sideways.
+#
+# 90 and 270 swap width and height, which VIDEO_ZOOM's geometry picks up on its
+# own because it reads the frame's real dimensions.
+# One value rotates every camera the same way; a comma-separated list sets them
+# individually in cameras.txt order, so "180,90" is CAM 1 upside down and CAM 2
+# on its side. A short list reuses its last value for the remaining cameras,
+# which keeps a single value working when a third camera is added.
+# Both cameras re-aimed on the operator's eye, 2026-08-25:
+#   CAM 1 FRONT  180 -> 90 -> 0   "3 time right" then "1 time left":
+#                                180+270 = 90, then 90-90 = 0
+#   CAM 2 BACK    90 ->  0   "rotate 1 time left"  = -90,  and  90- 90 =  0
+#
+# Note this changes the MERGED view's geometry as well as the screen: full_nnn
+# sizes its canvas from the two cameras' dimensions, and rotating one of them by
+# a quarter turn swaps its width and height. That is not a fault, but it is why
+# the canvas may no longer be the 2560x1280 the recorder's notes describe.
+_ROT_RAW = os.environ.get("VIDEO_ROTATE", "0,0")
+VIDEO_ROTATE_LIST = [int(v) % 360 for v in _ROT_RAW.split(",") if v.strip()]
+VIDEO_ROTATE = VIDEO_ROTATE_LIST[0] if VIDEO_ROTATE_LIST else 0
+
+
+def rotate_for(index):
+    """Clockwise degrees for camera `index` (0-based). See VIDEO_ROTATE."""
+    if not VIDEO_ROTATE_LIST:
+        return 0
+    return VIDEO_ROTATE_LIST[min(index, len(VIDEO_ROTATE_LIST) - 1)]
 
 # Wordmark in the top bar, next to the logo.
 TITLE = os.environ.get("GS_TITLE", "GROUND CONTROL STATION")
@@ -136,6 +202,62 @@ SPLASH_PARTIAL_S = float(os.environ.get("SPLASH_PARTIAL_S", "3.5"))
 RECONNECT_DELAY_S = 2.0                        # wait before retrying a dead stream
 READ_FAIL_LIMIT = 50                           # consecutive bad reads -> reconnect
 
+# Ceiling for the exponential backoff between failed connection attempts.
+#
+# THIS IS THE SETTING THAT MAKES TWO CAMERAS WORK AT ONCE. Retrying a dead
+# camera every RECONNECT_DELAY_S forever is what broke the rig: each attempt
+# opens three separate TCP connections to the camera (reachability probe, codec
+# DESCRIBE, then rtspsrc itself), so a flat 2s retry is ~90 connections/minute
+# per camera. Measured on the real rig with both cameras configured, tcpdump
+# counted 22 new connections to :554 in 30s across the pair. These cameras run a
+# tiny embedded TCP stack and stop answering *even ARP* under that, which shows
+# up as ICMP loss and "host unreachable" - so the retry storm was manufacturing
+# the very outage it was retrying against, and each stall triggered more
+# retries. One camera stayed under the threshold; two did not, which is exactly
+# why it only ever failed with both configured.
+RECONNECT_MAX_DELAY_S = float(os.environ.get("RECONNECT_MAX_DELAY_S", "20.0"))
+
+# Backoff ceiling for the case where the camera is not on the wire at all.
+#
+# Deliberately much shorter than RECONNECT_MAX_DELAY_S, because the two failures
+# want opposite treatment and lumping them together made outages longer than
+# they needed to be:
+#
+#   camera ABSENT (no TCP connect, ARP fails) - it is powered down or rebooting.
+#     Retrying costs ONE SYN that nothing answers, so it cannot overload anything,
+#     and the only thing a long backoff buys is up to 20s of extra black panel
+#     after the camera is already back. Poll briskly.
+#   camera PRESENT but refusing RTSP - this is the session-limit case, and every
+#     attempt is a real connection the camera has to service. This is the one
+#     that needs the long backoff (see SESSION_WAIT_S).
+#
+# Measured: CAM 1 sat on "no signal - retrying" long after the camera answered.
+UNREACHABLE_MAX_DELAY_S = float(os.environ.get("UNREACHABLE_MAX_DELAY_S", "4.0"))
+
+# Minimum spacing between connection attempts across ALL cameras. The cameras
+# share one tether, so two of them opening RTSP sessions simultaneously is the
+# worst case; this staggers them instead. 0 disables the gate.
+CONNECT_STAGGER_S = float(os.environ.get("CONNECT_STAGGER_S", "1.0"))
+
+# How long to wait for a previous, abandoned RTSP session to actually die before
+# opening a new one to the same camera.
+#
+# NEVER set this to 0. These cameras accept only a very small number of
+# concurrent RTSP sessions, and a stalled reader keeps its session open until
+# rtspsrc's tcp-timeout expires (~5s). Reconnecting inside that window asks the
+# camera for a second session it cannot give, and it answers by resetting the
+# connection - "Could not write to resource" in the GStreamer log. Measured on
+# the rig: both cameras cycling connect/drop, CAM 1 live only 32% of the time
+# with 17 reconnects in 3 minutes. Waiting for the old session first is what
+# makes the reconnect land.
+SESSION_WAIT_S = float(os.environ.get("SESSION_WAIT_S", "8.0"))
+# Wall-clock seconds with no decoded frame before forcing a reconnect. Backstops
+# the case where a camera half-closes its RTSP socket (CLOSE-WAIT) and cap.read()
+# blocks forever, so READ_FAIL_LIMIT never trips and the panel freezes. Seen when
+# a camera reboots/flaps under the viewer. Keep a couple of seconds above the
+# real inter-frame gap so a momentarily slow camera is not torn down needlessly.
+READ_STALL_TIMEOUT_S = float(os.environ.get("READ_STALL_TIMEOUT_S", "5.0"))
+
 # How long to wait for the RTSP port to accept a TCP connection before declaring
 # NO SIGNAL. On a direct LAN the round trip is sub-millisecond, so 4s is generous.
 # This bounds the "tether unplugged" case - without it the OS TCP connect can
@@ -143,3 +265,245 @@ READ_FAIL_LIMIT = 50                           # consecutive bad reads -> reconn
 OPEN_TIMEOUT_S = float(os.environ.get("OPEN_TIMEOUT_S", "4.0"))
 
 SNAPSHOT_DIR = os.path.expanduser(os.environ.get("SNAPSHOT_DIR", "~/snapshots"))
+
+# --- Recording ---------------------------------------------------------------
+# Driven by the two panel switches (see inputs.py): switch 1 on GPIO22 is
+# START/STOP, switch 2 on GPIO11 is PAUSE/RESUME. Each run gets its own
+# directory under RECORD_DIR, named YYYYMMDD_HHMMSS_SESSIONnnn, with one file
+# per camera inside it.
+#
+# /recordings (not ~/recordings) is the spec: ONE fixed folder on the Pi that
+# the USB backup daemon (usb_backup.py) mirrors verbatim onto any stick that
+# is plugged in. Created root-side with `sudo mkdir /recordings && sudo chown
+# arnobot:arnobot /recordings`.
+RECORD_DIR = os.path.expanduser(os.environ.get("RECORD_DIR", "/recordings"))
+
+# Frames are re-encoded from the ones already decoded for the screen, so this is
+# a straight CPU cost on top of the decode: ~0.4 of a core per 720p camera at 15.
+# It is also the *wall-clock* sample rate, not just the header value - recorder.py
+# writes one frame per tick whether or not the camera delivered a new one, so an
+# hour of duct run is an hour of video and the timeline stays honest.
+RECORD_FPS = float(os.environ.get("RECORD_FPS", "15"))
+
+# "mp4v" (MPEG-4 Part 2) is the one fourcc the apt OpenCV can always write into
+# a .mp4 without an external encoder. "avc1" gives smaller files where the build
+# has libx264, and dies with a warning where it does not - so it is not default.
+RECORD_FOURCC = os.environ.get("RECORD_FOURCC", "mp4v")
+RECORD_EXT = os.environ.get("RECORD_EXT", ".mp4")
+
+# 0 keeps the camera's native size. Set e.g. 960 to shrink 720p before encoding
+# if the Pi runs out of CPU with both cameras recording.
+RECORD_MAX_WIDTH = int(os.environ.get("RECORD_MAX_WIDTH", "0"))
+
+# Centre-crop every camera to ONE COMMON SQUARE before encoding. 0 disables it
+# and each camera records its own native frame again.
+#
+# Why a square (operator spec 2026-08-19: "store both camera feed to same
+# quality same size ... both in feed same size width and height"). The two
+# cameras are mounted 90 degrees apart, so after VIDEO_ROTATE one is 1280x720
+# and the other 720x1280. Two pictures cannot be the same width AND the same
+# height unless they share an aspect ratio, so one had to be chosen:
+#
+#   * pad both into a common box - keeps every pixel, but the pictures are
+#     still different shapes and the files carry a lot of black;
+#   * fit the portrait camera into a landscape frame - drops CAM 2 from 0.92MP
+#     to 0.29MP, which is most of the detail on a duct camera;
+#   * CROP both to the largest square either can supply - what this is. The
+#     pictures come out genuinely identical, 720x720, at native pixel density
+#     with nothing scaled or stretched. It costs the left/right edges of the
+#     landscape camera and the top/bottom of the portrait one, permanently.
+#
+# 720 is not arbitrary: it is min(1280, 720), the largest square that fits
+# inside both cameras' frames, so neither is ever upscaled to reach it.
+RECORD_SQUARE_PX = int(os.environ.get("RECORD_SQUARE_PX", "720"))
+
+# Re-encode the per-camera masters AFTER a save so the two cameras produce files
+# of the same SIZE, not merely the same pixel dimensions (operator spec
+# 2026-08-19: "one file store too much size and other low").
+#
+# Why it cannot be done live. The masters are written by cv2.VideoWriter with
+# RECORD_FOURCC, and the only fourcc that keeps up on this Pi is mp4v, which
+# exposes no bitrate control whatsoever. Measured here 2026-08-19, both cameras
+# at 720x720/15 with the viewer running: avc1 (libx264 in-process) collapsed to
+# ~3 fps - 46 frames where mp4v wrote 137 - and left a file with no moov atom.
+# Two in-process x264 encoders do not fit beside two decodes and the UI. So the
+# live path stays mp4v and the size is fixed offline, on idle cores, exactly the
+# way COMBINED_AFTER_SAVE already fixes the full view.
+RECORD_NORMALIZE = os.environ.get("RECORD_NORMALIZE", "1") == "1"
+
+# CONSTANT bitrate, deliberately not CRF. CRF gives both cameras identical
+# QUALITY and lets the busier scene produce the bigger file - measured 1.56 MB
+# against 1.29 MB for the same clip, which is the behaviour being complained
+# about. Pinning minrate=maxrate=bufsize=b:v with nal-hrd=cbr makes x264 pad to
+# the target instead, so two clips of equal length come out equal size.
+#
+# The cost is real and is the operator's call: at a fixed rate the camera
+# looking at more detail gets less of it. 1200k is chosen against measurement -
+# mp4v was spending 2.2-2.8 Mbit/s on these same 720x720 frames, and an offline
+# x264 pass at visually-equivalent quality wanted ~1.1 Mbit/s.
+RECORD_NORM_BITRATE = os.environ.get("RECORD_NORM_BITRATE", "1200k")
+RECORD_NORM_PRESET = os.environ.get("RECORD_NORM_PRESET", "veryfast")
+
+# H.264 profile and level for the normalised masters.
+#
+# The share complaint that produced this ("when i store, file stored file
+# extension is not supported for share, but merged video is") was never about
+# the extension: all three files are .mp4. It was the CODEC inside. Measured on
+# a real session 2026-08-19:
+#
+#     cam1_front_001.mp4   mpeg4, Simple Profile, tag mp4v   <- refused
+#     cam2_back_001.mp4    mpeg4, Simple Profile, tag mp4v   <- refused
+#     full_001.mp4         h264,  Constrained Baseline, avc1 <- shared fine
+#
+# mp4v is MPEG-4 Part 2, which phones and messaging apps stopped accepting years
+# ago; the full view already went out as H.264 because it is built by ffmpeg
+# rather than by cv2.VideoWriter. Re-encoding the masters fixes it on its own -
+# pinning the profile is what keeps it fixed on the oldest handset likely to be
+# handed one of these.
+#
+# BASELINE, NOT MAIN - round two of the same complaint, 2026-08-20: "the merged
+# video was perfect to store and share but single cam was not". Both files were
+# H.264 by then, so this time the difference was WHICH H.264:
+#
+#     full_001.mp4        Constrained Baseline, 0 B-frames, level 3.2  <- shared
+#     cam1_front_001.mp4  Main,                 2 B-frames, level 4.0  <- did not
+#
+# The full view was only Constrained Baseline by accident: COMBINED_PRESET is
+# ultrafast, and ultrafast turns CABAC and B-frames off. That accident is the
+# configuration that demonstrably travels, so the masters are now pinned to the
+# same thing deliberately - and so is the full view, see COMBINED_PROFILE.
+#
+# B-frames are the expensive part to decode and the part simple players get
+# wrong; baseline drops them and CABAC with them. At CBR the file SIZE does not
+# move (RECORD_NORM_BITRATE pins it) - what is spent is a little quality at the
+# same bitrate, which is a fair price for a file that opens on the first try.
+RECORD_NORM_PROFILE = os.environ.get("RECORD_NORM_PROFILE", "baseline")
+RECORD_NORM_LEVEL = os.environ.get("RECORD_NORM_LEVEL", "3.2")
+
+# Equal bitrate only yields equal size if the files are equally LONG, and they
+# are not: each camera's recorder thread runs its own tick loop, so one measured
+# clip closed at 87 frames on CAM 1 and 91 on CAM 2. That 267ms also drifts the
+# two halves of the full view apart. Trim every camera in a clip to the shortest
+# one's frame count.
+#
+# Trimmed from the TAIL, so the head alignment the full view depends on
+# (CameraRecorder._clip_first_write -> its lead-in padding) is untouched.
+RECORD_NORM_MATCH_FRAMES = os.environ.get("RECORD_NORM_MATCH_FRAMES", "1") == "1"
+
+# Hard stop on one master's re-encode, so a wedged ffmpeg cannot hang the save.
+RECORD_NORM_TIMEOUT_S = float(os.environ.get("RECORD_NORM_TIMEOUT_S", "900"))
+
+# Stop writing rather than fill the SD card. A full root filesystem does not
+# just lose the recording - it takes X, the viewer and this SSH session with it,
+# which is a far worse failure than a truncated video.
+RECORD_MIN_FREE_MB = int(os.environ.get("RECORD_MIN_FREE_MB", "512"))
+
+# Seconds to hold a finished recording waiting for the SAVE button before
+# deleting it. Stopping does not keep the run any more - the operator has this
+# long to say the run was worth keeping, and silence means it was not.
+#
+# THIS DELETES VIDEO. It is the one setting here that can lose work, so it is
+# deliberately generous and deliberately loud in the UI: the strip counts the
+# window down and the SAVE pill pulses for the whole of it. Set
+# RECORD_CONFIRM_S=0 to go back to keeping everything automatically.
+#
+# 15 -> 10 on operator spec 2026-08-19: the window only has to outlast the walk
+# from the panel back to the screen, and RECORD_SAVE_HOLD_S extends it while the
+# button is down, so a hold begun on the last second still lands.
+RECORD_CONFIRM_S = float(os.environ.get("RECORD_CONFIRM_S", "10"))
+
+# How long a run must last before stopping it is worth asking about. Operator's
+# instruction 2026-08-25: "when start recording and its more than 3 second and
+# press stop button to show save 10 second".
+#
+# Was hardcoded at 1.0 s inside recorder._stop_session, which is why it could
+# not be tuned from here. 1 s was chosen to swallow switch bounce; 3 s also
+# swallows the deliberate-but-pointless run - a lever knocked on and off while
+# the operator repositions - so the confirm window is only spent on footage
+# somebody might actually want.
+#
+# Runs SHORTER than this are dropped silently: no window, no toast, and the
+# session directory is removed if nothing was written into it.
+RECORD_MIN_RUN_S = float(os.environ.get("RECORD_MIN_RUN_S", "3.0"))
+
+# Build a third file per clip - full_nnn.mp4 - with BOTH cameras side by side in
+# one frame, each tile labelled. This is what gets handed to whoever asked for
+# "the video" singular; the per-camera files stay because they are the masters.
+#
+# BUILT AFTER THE SAVE, NOT WHILE RECORDING (operator spec 2026-08-19). It used
+# to be a third live encoder, and that is what made it wrong on both counts the
+# operator complained about:
+#
+#   * it scaled both cameras to COMBINED_HEIGHT=480, well under the 720 the
+#     cameras actually stream, because a live 720 encoder does not fit; and
+#   * it gave each camera a width from its OWN aspect ratio, so with CAM 2
+#     rotated 90 the tiles came out 852px + 270px - a 76/24 split, measured on
+#     /recordings/20260819_143315_SESSION009/full_001.mp4 at 1122x480.
+#
+# Measured on this Pi 4, a live 50/50 canvas at stream resolution is not
+# available at any setting: 2560x1280 encodes at 9.4fps against the 15 it would
+# need, the hardware H.264 encoder tops out at 1920x1920 so it cannot help, and
+# even 2560x720 leaves only 11% margin on top of two decodes and two encoders.
+#
+# Building it from the finished per-camera files instead costs NOTHING while
+# recording, gets both cameras at their exact native size, and only spends the
+# effort on runs the operator actually kept. The tradeoff is that full_nnn.mp4
+# appears a beat after the save rather than growing live - the strip reports the
+# build so the operator knows it is happening.
+COMBINED_AFTER_SAVE = os.environ.get("COMBINED_AFTER_SAVE", "1") == "1"
+
+# 0 = each camera at its native size, which is the point of building offline:
+# the half-width is the widest camera and the canvas height the tallest, so
+# nothing is downscaled and neither camera is stretched - the leftover inside
+# each half is padded black. With CAM 1 at 1280x720 and CAM 2 rotated to
+# 720x1280 that is a 2560x1280 file, exactly 50/50.
+#
+# Set a pixel cap (e.g. 960) if that is too big for whoever receives it; tiles
+# are then scaled down together, so the 50/50 split survives.
+COMBINED_MAX_HALF = int(os.environ.get("COMBINED_MAX_HALF", "0"))
+
+# The offline encoder. Speed here is wall clock the operator waits AFTER a save,
+# measured on the Pi 4 at 2560x1280: ultrafast/crf28 lands near 1x realtime,
+# superfast/crf28 is ~0.43x for ~40% smaller files. libx264 rather than the
+# mp4v the live recorders use - the full view travels to other machines, and
+# H.264 plays everywhere MPEG-4 Part 2 does not.
+COMBINED_VCODEC = os.environ.get("COMBINED_VCODEC", "libx264")
+COMBINED_PRESET = os.environ.get("COMBINED_PRESET", "ultrafast")
+COMBINED_CRF = os.environ.get("COMBINED_CRF", "28")
+
+# STATED, NOT INHERITED. The full view has always come out Constrained Baseline
+# and that is why it shares everywhere - but it came out that way only because
+# ultrafast happens to disable CABAC and B-frames. Anyone who changed the preset
+# for smaller files (superfast is right there in the comment above) would have
+# silently turned the one reliably shareable file on the card into a Main
+# profile one, with nothing to say it had happened until a handset refused it.
+# Saying it explicitly costs nothing and cannot drift. Same pair as
+# RECORD_NORM_PROFILE, deliberately: the masters and the merged view should not
+# be two different kinds of H.264.
+COMBINED_PROFILE = os.environ.get("COMBINED_PROFILE", "baseline")
+COMBINED_LEVEL = os.environ.get("COMBINED_LEVEL", "3.2")
+
+# Hard stop on one clip's build, so a wedged ffmpeg cannot leave the strip
+# saying BUILDING for ever. Generous: 0.43-1.2x realtime means a 20 minute clip
+# is inside this, and a build that trips it leaves the per-camera masters intact.
+COMBINED_TIMEOUT_S = float(os.environ.get("COMBINED_TIMEOUT_S", "3600"))
+
+# Kept for the headless test and for anyone who still wants the old live third
+# encoder. Default OFF - see COMBINED_AFTER_SAVE above for why.
+RECORD_COMBINED = os.environ.get("RECORD_COMBINED", "0") == "1"
+COMBINED_HEIGHT = int(os.environ.get("COMBINED_HEIGHT", "480"))
+
+# Where usb_backup.py (a separate root daemon) publishes its transfer status,
+# and where the viewer reads it from to show "data is transferring" in the
+# strip. /run is tmpfs: root-writable, world-readable, gone on reboot - all
+# three of which are right for live status.
+USB_STATUS_PATH = os.environ.get("USB_STATUS_PATH", "/run/usb_backup_status.json")
+
+# How long the SAVE button must be HELD, after a stop, to claim the recording.
+# A press-and-hold rather than a tap on purpose (operator spec 2026-08-18):
+# the same physical button banks clips mid-run on a tap, so the gesture that
+# permanently keeps a whole session is made deliberate. The confirm window
+# above is extended while the button is down, so a hold started on the last
+# second still lands.
+RECORD_SAVE_HOLD_S = float(os.environ.get("RECORD_SAVE_HOLD_S", "2.0"))
+

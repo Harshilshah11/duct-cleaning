@@ -61,10 +61,23 @@ BAUD = int(os.environ.get("UNO_BAUD", "115200"))
 # Opening the port resets the board; nothing sent before this elapses arrives.
 OPEN_SETTLE_S = float(os.environ.get("UNO_OPEN_SETTLE_S", "1.8"))
 
-# The stick's electrical centre is not exactly zero and drifts a little, so
-# ignore small magnitudes rather than creeping. inputs.py already auto-centres
-# at startup; this covers the residual.
-DEADZONE = float(os.environ.get("UNO_DEADZONE", "0.08"))
+# Residual deadzone applied HERE, on top of whatever the source already did.
+#
+# ZERO BY DEFAULT, and that is a fix rather than a disabled safety net. Both
+# real callers of mix() are fed from inputs.py, whose _norm_axis() already
+# applies INPUTS_AXIS_DEADBAND (0.08) AND rescales the travel past it so the
+# output leaves centre continuously from 0.0. Applying a second 0.08 band to
+# that rescaled value cost twice over: the dead patch became
+# 0.08 + 0.08 * 0.92 = ~15.4% of stick travel instead of 8%, and because the
+# second band clips WITHOUT rescaling, the wheels then broke away at
+# 0.08 * 255 = 20 PWM instead of easing up from zero. A wide dead patch
+# followed by a step is precisely what "the acceleration off centre is not
+# smooth" feels like in the hand.
+#
+# The deadband belongs to inputs.py because that is where the centre is learned
+# and where the rescale lives; one owner, one number. Set UNO_DEADZONE back to
+# 0.08 if mix() is ever fed raw, un-centred axes from somewhere else.
+DEADZONE = float(os.environ.get("UNO_DEADZONE", "0.0"))
 
 # Ceiling on demand sent to the driver. Drop it to tame the robot indoors --
 # it scales both channels, so steering stays proportional.
@@ -130,14 +143,34 @@ def mix(x, y):
 # flat out, so slowing one must not slow the other.
 ACT_MAX_PWM = int(os.environ.get("UNO_ACT_MAX_PWM", "255"))
 
+# THE ROD'S LEADS ARE LANDED THE OTHER WAY ROUND ON THIS RIG, so EXTEND has to
+# go out NEGATIVE. Measured on the rod 2026-08-20: the lever's EXTEND throw
+# retracted it while the panel correctly read ACT=EXTEND.
+#
+# CORRECTED HERE RATHER THAN IN THE PIN MAP, and the difference is not cosmetic.
+# Swapping ACT_EXTEND_PIN/ACT_RETRACT_PIN also moves the rod the right way - it
+# was tried first - but it does so by mislabelling the lever, so the panel then
+# reads RETRACT while the rod extends. Only one of the two fixes leaves the
+# operator's display telling the truth, and on a control this is the whole
+# point: the strip has to say what the rod is about to do.
+#
+# THE HONEST FIX IS A SOLDERING IRON - swap the two leads at the actuator, or
+# invert ACT_DIR in uno_eth_link.ino, and set this to 0. This constant is the
+# software standing in for a wiring fault, which is worth knowing if the rod is
+# ever rewired: whoever does that has to clear this at the same time, or they
+# will re-invert it. Same shape as INVERT_X / INVERT_Y in inputs.py, which
+# stands in for the stick's wiring for the same reason.
+ACT_INVERT = os.environ.get("UNO_ACT_INVERT", "1") == "1"
+
 
 def act_demand(state, pot_pct):
     """3-position actuator switch -> ONE signed demand.
 
-    ONLY THE SIGN REACHES THE HARDWARE NOW. The actuator lost its PWM pin to the
-    light on 2026-08-14 (D5), so uno_eth_link.ino drives ACT_DIR alone and reads
-    nothing from this value but its sign. The magnitude stays at full scale so
-    the field still means "-255..255" on the wire.
+    ONLY THE SIGN REACHES THE HARDWARE. The actuator lost its speed demand when
+    its PWM pin went to the light on 2026-08-14 (D5), so uno_eth_link.ino reads
+    nothing from this value but its sign -- positive extends, negative retracts,
+    zero cuts the enable. The magnitude stays at full scale so the field still
+    means "-255..255" on the wire.
 
     THE POT NO LONGER SETS ROD SPEED. It dims the light instead -- see
     light_demand() below. pot_pct is still accepted so callers need not change,
@@ -153,18 +186,34 @@ def act_demand(state, pot_pct):
     has failed, and the safe answer to a switch you cannot trust is not to guess
     which way it was travelling.
 
-    BUT 0 IS NO LONGER A STOP over the Ethernet link. With no enable pin the Uno
-    can only choose a direction, and it reads 0 as RETRACT. Returning 0 here now
-    means "retract", not "hold still" -- the rod cannot be held in software at
-    all. Give the driver a real enable line to get that back.
+    0 IS A GENUINE STOP AGAIN. The rod has a real enable line on the Uno (D4 as
+    of 2026-08-15, A2 before that), so 0 cuts the channel's power and the rod
+    holds position -- it no longer means "drive the other way". That is what
+    makes returning 0 for FAULT and for a stale sample the safe answer rather
+    than merely the least-bad one, and it is what lets the sketch's failsafe stop
+    the rod instead of running it into an end stop.
     """
     if state not in ("EXTEND", "RETRACT"):
         return 0
-    return ACT_MAX_PWM if state == "EXTEND" else -ACT_MAX_PWM
+    out = ACT_MAX_PWM if state == "EXTEND" else -ACT_MAX_PWM
+    return -out if ACT_INVERT else out
 
 
 def brush_demand(toggle_closed):
-    """Panel TOGGLE (Pi GPIO13) -> brush motor 0/1.
+    """Panel TOGGLE (Pi GPIO27) -> brush motor demand, 255 or 0.
+
+    TOGGLE ONLY, AT FULL SCALE. The brush briefly took its speed from the
+    light's pot on 2026-08-17 and it lasted one evening: one knob feeding two
+    mechanisms meant dimming the lamp also slowed the brush, and a knob parked
+    at zero made an armed brush look broken (it cost a live debugging round on
+    the rig). The operator's verdict was "Pwm->A1, keep 255" - the brush is an
+    on/off tool.
+
+    255 rather than 1 because the wire field is a DUTY now: uno_eth_link.ino
+    soft-PWMs A1 at whatever magnitude arrives, so full speed must be SAID
+    (255), not implied. A board still running the pre-duty build treats any
+    non-zero as ON and behaves identically, so this value is right on every
+    sketch this rig has ever flashed.
 
     inputs.py has already done the active-LOW inversion, so what arrives here is
     a plain "is the switch closed" boolean and True means ON. Doing that
@@ -175,7 +224,7 @@ def brush_demand(toggle_closed):
     unavailable), and that is treated as OFF -- an unknown switch must never
     start a brush.
     """
-    return 1 if toggle_closed else 0
+    return 255 if toggle_closed else 0
 
 
 def light_demand(pot_pct):

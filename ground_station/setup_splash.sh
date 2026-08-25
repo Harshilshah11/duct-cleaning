@@ -72,7 +72,7 @@ PLY
 # screen it would be all but invisible.
 sudo tee "$THEME_DIR/$THEME_NAME.script" >/dev/null <<'SCRIPT'
 Window.SetBackgroundTopColor(1.0, 1.0, 1.0);
-Window.SetBackgroundBottomColor(0.91, 0.93, 0.96);
+Window.SetBackgroundBottomColor(1.0, 1.0, 1.0);
 
 screen_width = Window.GetWidth(0);
 screen_height = Window.GetHeight(0);

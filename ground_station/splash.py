@@ -15,18 +15,29 @@ import os
 
 from PySide6.QtCore import Qt, QRect, QTimer
 from PySide6.QtGui import QBrush, QColor, QFont, QLinearGradient, QPainter, QPixmap
+
+import theme
 from PySide6.QtWidgets import QWidget
 
 # Sampled from the logo, so the chrome around it never clashes. The field is
 # light because the logo is dark navy — on the app's near-black background it
 # would be all but invisible.
 BG_TOP = QColor("#ffffff")
-BG_BOTTOM = QColor("#e8edf6")
-INK = QColor("#241f7a")        # the dark navy of "ARNOBOT"
-ACCENT = QColor("#3f6fb5")     # the mid blue of the "R"
-MUTED = QColor("#8590ab")
+BG_BOTTOM = QColor("#ffffff")  # flat, was #e8edf6: Plymouth dithers a
+# gradient this shallow into visible horizontal banding on the panel in
+# the case, and the loading screen has to match the boot theme exactly or
+# the handover changes colour. Both ends flattened together, 2026-08-24.
+INK = QColor(theme.BRAND_INK)        # the dark navy of "ARNOBOT"
+ACCENT = QColor(theme.BRAND_ACCENT)  # the mid blue of the "R"
+# Secondary label, not its own grey — same navy at 60%, so the status line
+# recedes from the subtitle without shifting hue. See theme.LIGHT.
+MUTED = QColor(36, 31, 122, 153)
 
-FONT = "DejaVu Sans"
+# Inter, standing in for SF Pro — see theme.py. The splash is the FIRST thing
+# the operator sees after Plymouth, so it is also where a font change is most
+# visible; keeping it on the same family as the bar is what makes the handover
+# read as one app starting rather than two screens in a row.
+FONT = theme.FAMILY_TEXT
 
 
 class SplashScreen(QWidget):
@@ -53,8 +64,7 @@ class SplashScreen(QWidget):
 
         self._backdrop = backdrop
         self._subtitle = "" if backdrop else subtitle
-        self._status = "" if backdrop else "starting…"
-        self._phase = 0
+        self._status = "" if backdrop else "starting"
 
         # Set by main.py to "stop waiting, show the viewer now". Closing the
         # splash on its own would be worse than useless: it is the only visible
@@ -71,17 +81,15 @@ class SplashScreen(QWidget):
         # dots strip, so the scaled logo is not re-blitted 16 times a second.
         self._logo_rect = QRect()
         self._subtitle_rect = QRect()
-        self._dots_rect = QRect()
         self._status_rect = QRect()
         self._scaled = None
 
-        # No animation on the backdrop: it lives for the whole session, and a
-        # repaint every 90ms forever is a wakeup the Pi does not need to pay for
-        # something nobody is watching. The loading screen keeps its dots.
+        # The travelling dots were removed at the operator's request, so
+        # nothing on this screen animates any more and there is no 90ms repaint
+        # to pay for. Liveness is carried by the status line instead, which
+        # main.py restamps as the cameras come up. The timer object stays only
+        # because finish() stops it; it is never started.
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self._advance)
-        if not backdrop:
-            self._timer.start(90)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -112,10 +120,6 @@ class SplashScreen(QWidget):
 
     # -- painting ------------------------------------------------------------
 
-    def _advance(self):
-        self._phase += 1
-        self.update(self._dots_rect)
-
     def resizeEvent(self, event):
         w, h = self.width(), self.height()
 
@@ -133,8 +137,7 @@ class SplashScreen(QWidget):
         top = int(h * 0.38) - logo_h // 2
         self._logo_rect = QRect((w - logo_w) // 2, top, logo_w, logo_h)
         self._subtitle_rect = QRect(0, self._logo_rect.bottom() + int(h * 0.045), w, 28)
-        self._dots_rect = QRect(0, self._subtitle_rect.bottom() + int(h * 0.06), w, 24)
-        self._status_rect = QRect(0, self._dots_rect.bottom() + int(h * 0.035), w, 26)
+        self._status_rect = QRect(0, self._subtitle_rect.bottom() + int(h * 0.06), w, 26)
         super().resizeEvent(event)
 
     def paintEvent(self, event):
@@ -150,47 +153,33 @@ class SplashScreen(QWidget):
             painter.drawPixmap(self._logo_rect.topLeft(), self._scaled)
         else:
             painter.setPen(INK)
-            painter.setFont(QFont(FONT, 44, QFont.Bold))
+            # Large title, one step up the ramp from Apple's 34 because this
+            # is a wordmark on an otherwise empty screen rather than a heading
+            # in a list. Semibold rather than bold — the logo pixmap it stands
+            # in for is not a bold weight either, so the fallback should not
+            # jump when the file is missing.
+            painter.setFont(theme.font_for(theme.LARGE_TITLE + 10,
+                                           theme.W_SEMIBOLD))
             painter.drawText(self._logo_rect, Qt.AlignCenter, "ARNOBOT")
 
         if self._backdrop:
             return          # logo only — matches the Plymouth theme exactly
 
         if self._subtitle:
-            font = QFont(FONT, 13, QFont.Bold)
-            font.setLetterSpacing(QFont.AbsoluteSpacing, 6)
+            # Tracked-out small caps is the one place wide letter-spacing
+            # earns its keep, and 6px stays. Medium weight, footnote size: at
+            # this tracking bold turns the subtitle into a second wordmark
+            # competing with the real one directly above it.
+            font = theme.font_for(theme.FOOTNOTE, theme.W_MEDIUM, tracking=6)
             painter.setFont(font)
             painter.setPen(ACCENT)
             painter.drawText(self._subtitle_rect, Qt.AlignCenter, self._subtitle)
 
-        self._paint_dots(painter)
-
-        painter.setFont(QFont(FONT, 11))
+        # Caption. The quietest thing on the screen, and the only one
+        # that changes while it is up.
+        painter.setFont(theme.font_for(theme.CAPTION1))
         painter.setPen(MUTED)
         painter.drawText(self._status_rect, Qt.AlignCenter, self._status)
-
-    def _paint_dots(self, painter):
-        count = 3
-        radius = 5
-        gap = 26
-        cx = self.width() // 2 - (count - 1) * gap // 2
-        cy = self._dots_rect.center().y()
-
-        painter.setPen(Qt.NoPen)
-        for i in range(count):
-            # Each dot lights in turn — a plain travelling highlight, cheap to
-            # repaint and obviously alive even if a stream never connects.
-            lit = (self._phase // 3) % count == i
-            colour = QColor(INK if lit else MUTED)
-            colour.setAlpha(255 if lit else 90)
-            painter.setBrush(colour)
-            grow = 2 if lit else 0
-            painter.drawEllipse(
-                cx + i * gap - radius - grow,
-                cy - radius - grow,
-                2 * (radius + grow),
-                2 * (radius + grow),
-            )
 
     def keyPressEvent(self, event):
         # The backdrop must survive every keystroke: closing it is closing the

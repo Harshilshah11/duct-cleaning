@@ -65,8 +65,12 @@
  * MOTOR PIN MAP — chosen around the shield, NOT freely
  * ---------------------------------------------------------------------------
  *
- *   channel 1 / LEFT    DIR1 = D9        PWM1 = D3    (Timer2)
- *   channel 2 / RIGHT   DIR2 = D8        PWM2 = D6    (Timer0)
+ *   channel 1 / LEFT    DIR1 = A2        PWM1 = D3    (Timer2, 7812.5 Hz)
+ *   channel 2 / RIGHT   DIR2 = D8        PWM2 = D9    (Timer1, 7812.5 Hz)
+ *
+ *   REWIRED 2026-08-24: DIR1 moved D9 -> A2 and PWM2 moved D6 -> D9, so both
+ *   motor channels sit on timers that can reach 7.8 kHz without touching
+ *   Timer0 - which owns millis() and therefore the failsafe. D6 is now free.
  *   linear actuator     ACT_DIR = D7     ACT_PWM = D4  (LOW extends! see below)
  *   brush motor         BRUSH_DIR = D2   BRUSH_PWM = A1 (held 255, on/off)
  *   light               LIGHT_DIR = A0   LIGHT_PWM = D5 (Timer0)
@@ -147,10 +151,65 @@ IPAddress ip(192, 168, 50, 20);
 const uint16_t LISTEN_PORT = 5005;
 
 // --- Motor driver pins (see the pin-map note above before changing) ----------
-const uint8_t DIR1 = 9;    // channel 1 direction (LEFT)
-const uint8_t PWM1 = 3;    // channel 1 speed, Timer2  (~490 Hz)
+// REWIRED 2026-08-24 FOR 7.8 kHz ON BOTH CHANNELS. Two wires move:
+//
+//     DIR1 : D9 -> A2      (direction only; any digital pin will do)
+//     PWM2 : D6 -> D9      (needs a Timer1 pin, and D9 is the only free one)
+//
+// WHY THE MOVE IS UNAVOIDABLE. PWM2 was on D6, which is Timer0 - the timer that
+// also generates millis(), and millis() is what the 300 ms failsafe is timed
+// off. Raising Timer0's prescaler to reach 7.8 kHz would make millis() run 8x
+// fast, firing the failsafe at ~37 ms and breaking delay() and the Ethernet
+// library with it. Timer0 is therefore left completely alone.
+//
+// D10 would have been the natural second Timer1 pin; the W5100/W5500 owns it as
+// chip select. D9 is the only Timer1 pin this shield leaves free, which is why
+// DIR1 has to give it up - a direction line only needs digitalWrite, so it
+// costs nothing to move to A2.
+//
+// BOTH CHANNELS NOW RUN AT 7812.5 Hz - see setupMotorPwm(). The pin note above
+// warns that raising one timer without the other makes the channels respond
+// differently to the same demand and reads as a mechanical fault; this keeps
+// them matched to within a rounding step.
+//
+// D6 IS NOW FREE and D5 (the light) still sits on an untouched Timer0 at its
+// stock ~980 Hz, which a lamp does not care about.
+const uint8_t DIR1 = A2;   // channel 1 direction (LEFT)   - moved off D9
+const uint8_t PWM1 = 3;    // channel 1 speed, Timer2  (7812.5 Hz)
 const uint8_t DIR2 = 8;    // channel 2 direction (RIGHT)
-const uint8_t PWM2 = 6;    // channel 2 speed, Timer0  (~980 Hz, see pin note)
+const uint8_t PWM2 = 9;    // channel 2 speed, Timer1  (7812.5 Hz) - moved off D6
+
+// NEITHER channel goes through analogWrite() any more. Both timers run with a
+// register TOP so the period can be exact, and analogWrite() assumes TOP is 255
+// on both counts - it would mis-scale the duty AND rewrite the mode bits that
+// set the frequency. setMotorDuty() writes the compare registers directly and
+// scales 0..255 onto whichever TOP the channel has.
+// 25 kHz ON BOTH CHANNELS, 2026-08-24 - the operator's figure, and a common
+// ceiling for hobby H-bridges (L298N, BTS7960/IBT-2 are all rated around it).
+// It is also above hearing, so the motors stop whining.
+//
+// NEITHER TIMER REACHES 25 kHz ON ITS PRESCALER LADDER. The plain fast-PWM
+// steps are 62.5 kHz and 7.8 kHz with nothing between, so both timers are put
+// into a mode where TOP is a register and the period can be set exactly:
+//
+//   Timer2  fast PWM, TOP = OCR2A = 79, prescaler 8
+//           16e6 / (8 * 80) = 25000 Hz exactly, 80 duty steps
+//           OCR2A is only 8 bits, so prescaler 1 is impossible here - it would
+//           need TOP = 639. Using OCR2A as TOP also costs OC2A/D11 as a PWM
+//           output, which is free: the shield owns D11 as MOSI anyway.
+//
+//   Timer1  fast PWM, TOP = ICR1 = 639, prescaler 1
+//           16e6 / 640 = 25000 Hz exactly, 640 duty steps
+//
+// THE TWO RESOLUTIONS DIFFER (80 steps against 640) and that is fine, because
+// neither is addressed directly: setMotorDuty() scales the 0..255 demand onto
+// whichever TOP the channel has. Channel 1 therefore quantises to ~3 PWM units
+// per step, which is finer than MIN_DUTY's own granularity and far finer than
+// anything the stick can express.
+//
+// Timer0 is still untouched, so millis() and the 300 ms failsafe are unaffected.
+const uint16_t T2_TOP = 79;     // 16 MHz / (8 * (79+1))  = 25000 Hz
+const uint16_t T1_TOP = 639;    // 16 MHz / (1 * (639+1)) = 25000 Hz
 
 // --- Linear actuator: DIR + PWM, DIR on D7 (pinout corrected 2026-08-15) -----
 // Direction comes from the ground station's 3-position actuator switch
@@ -246,17 +305,7 @@ const int ACT_DUTY_EXTEND = 255;
 // SPI read of the W5100 — can hit each edge closely enough, fast enough that the
 // rod sees a smooth average rather than steps. A linear actuator is mechanically
 // far too slow to care about ripple at this rate.
-// SCALED, because micros() comes off Timer0 exactly as millis() does - see
-// MILLIS_SCALE. With Timer0 at prescaler 1 this counter runs 64x fast, so a
-// raw 4000 here would be 62.5 us of real time: the soft-PWM period for the rod
-// and the brush would have jumped from 250 Hz to 16 kHz, far faster than
-// loop() can service, and the duty would have collapsed into noise.
-//
-// MILLIS_SCALE is declared further down with the failsafe, so the factor is
-// spelled out here rather than referenced - keep the two in step.
-//
-// 4000 us * 64 = 250 Hz real, which is what both mechanisms were tuned for.
-const unsigned long ACT_PWM_PERIOD_US = 4000UL * 64UL;
+const unsigned long ACT_PWM_PERIOD_US = 4000;
 
 // The duty currently demanded on D4, 0..255. Written by applyActuator(), acted
 // on by serviceActuatorPwm() every pass of loop().
@@ -350,25 +399,7 @@ const bool INVERT_2 = false;
 // 300 ms: long enough to ride out a handful of dropped datagrams at the 50 Hz
 // command rate (15 in a row), short enough that the robot stops within a third
 // of a second of a real tether failure.
-// TIMER0'S PRESCALER IS CHANGED IN setup() TO RAISE THE D6 PWM FREQUENCY, and
-// Timer0 is what drives millis(). At prescaler 1 instead of the stock 64,
-// millis() counts 64x too fast - so every duration measured in "ms" below is
-// really that many 64ths of a millisecond.
-//
-// EVERY millis()-DERIVED CONSTANT IS THEREFORE SCALED BY THIS. Without it the
-// failsafe fires after 300/64 = 4.7 ms of real time, and since command packets
-// arrive every 20 ms it would trip between every single one - the wheels would
-// never turn at all. That is not a subtle regression; it is a robot that does
-// not drive.
-//
-// If Timer0 is ever put back to its stock prescaler, set this to 1.
-const unsigned long MILLIS_SCALE = 64;
-
-// 300 ms REAL: long enough to ride out a handful of dropped datagrams at the
-// 50 Hz command rate, short enough that the robot stops within a third of a
-// second of a real tether failure. The multiply is what keeps it 300 ms of
-// wall clock rather than 300 of Timer0's accelerated ticks.
-const unsigned long FAILSAFE_MS = 300UL * MILLIS_SCALE;
+const unsigned long FAILSAFE_MS = 300;
 
 // --- Tuning ------------------------------------------------------------------
 // Below this the motor buzzes and heats without turning, so treat it as zero.
@@ -441,9 +472,25 @@ void applyMotor(uint8_t dirPin, uint8_t pwmPin, int demand, bool invert) {
 
   int duty = demand >= 0 ? demand : -demand;
   if (duty == 0) {
-    // NOT analogWrite(pwmPin, 0) — on a Timer0 pin (PWM2 = D6) that can still
-    // emit a narrow pulse each period and leave the motor creeping. See the
-    // pin-map note at the top.
+    // A STOP MUST DISCONNECT THE TIMER FROM THE PIN, not just write 0 to it.
+    //
+    // Since setupMotorPwm() both timers hold their compare-output bits set
+    // permanently, which means the TIMER owns these pins - a digitalWrite()
+    // while COM is set is simply ignored, and the pin keeps carrying whatever
+    // the timer last generated. Writing a 0 duty is not enough either: on
+    // Timer1 in ICR1 mode OCR1A=0 still produces a one-tick sliver every
+    // period, which is precisely the "motor will not quite stop" this file has
+    // always guarded against on Timer0.
+    //
+    // So clear COM first - that hands the pin back to the port - and only then
+    // drive it low. setMotorDuty() re-arms COM on the next non-zero demand.
+    if (pwmPin == PWM2) {
+      TCCR1A &= ~_BV(COM1A1);
+      OCR1A = 0;
+    } else {
+      TCCR2A &= ~_BV(COM2B1);
+      OCR2B = 0;
+    }
     digitalWrite(pwmPin, LOW);
   } else {
     if (MIN_DUTY > 0) {
@@ -458,7 +505,20 @@ void applyMotor(uint8_t dirPin, uint8_t pwmPin, int demand, bool invert) {
       duty = MIN_DUTY
              + (int)(((long)(duty - 1) * (MAX_PWM - MIN_DUTY)) / (MAX_PWM - 1));
     }
-    analogWrite(pwmPin, duty);
+    // Both channels are driven through their compare registers directly, and
+    // both must RE-ARM the compare output first - the stop path above clears it
+    // to hand the pin back to the port, so without this the first demand after
+    // any stop would set a duty on a pin the timer no longer drives.
+    //
+    // analogWrite() is not used on either any more: on D9 Timer1 is in ICR1
+    // mode where its 8-bit assumption is wrong, and on D3 it would rewrite
+    // TCCR2A and undo the prescaler setupMotorPwm() chose.
+    if (pwmPin == PWM2) {
+      TCCR1A |= _BV(COM1A1);
+    } else {
+      TCCR2A |= _BV(COM2B1);
+    }
+    setMotorDuty(pwmPin, duty);
   }
 }
 
@@ -653,6 +713,49 @@ void mixJoystick(int x, int y, int *left, int *right) {
   *right = (int)(r * MAX_PWM / peak);
 }
 
+/* Put both motor timers on 7812.5 Hz. Timer0 is deliberately NOT touched.
+ *
+ * Both channels: 25000 Hz exactly, via a register TOP on each timer. See the
+ * T2_TOP / T1_TOP note for why the prescaler ladder cannot get there.
+ */
+void setupMotorPwm() {
+  // --- Timer2 -> D3 ---
+  // WGM22:20 = 111 (Fast PWM, TOP = OCR2A), COM2B1 = non-inverting on OC2B/D3,
+  // CS2 = 010 (prescaler 8). OCR2A is the PERIOD here, not a duty.
+  TCCR2A = _BV(COM2B1) | _BV(WGM21) | _BV(WGM20);
+  TCCR2B = _BV(WGM22) | _BV(CS21);
+  OCR2A = (uint8_t)T2_TOP;     // TOP -> 25 kHz
+  OCR2B = 0;
+
+  // --- Timer1 -> D9 ---
+  // WGM13:10 = 1110 (Fast PWM, TOP=ICR1), COM1A1 = non-inverting on OC1A/D9,
+  // CS1 = 001 (no prescaling).
+  TCCR1A = _BV(COM1A1) | _BV(WGM11);
+  TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS10);
+  ICR1 = T1_TOP;              // TOP -> 25 kHz
+  OCR1A = 0;
+}
+
+/* A channel's duty, 0..255, scaled onto whichever TOP that channel's timer has.
+ *
+ * BOTH channels need this now. Neither timer runs with TOP = 255 any more, so
+ * a raw 0..255 written to a compare register would be wrong on both - on
+ * Timer2 anything above 79 would simply peg at full, and on Timer1 a full-scale
+ * demand would come out at 255/640 = 40% duty.
+ *
+ * The multiply is promoted to uint32_t deliberately: 255 * 639 is 162945, well
+ * past the Uno's 16-bit int, and would wrap.
+ */
+void setMotorDuty(uint8_t pwmPin, int duty) {
+  if (duty < 0) duty = 0;
+  if (duty > MAX_PWM) duty = MAX_PWM;
+  if (pwmPin == PWM2) {
+    OCR1A = (uint16_t)(((uint32_t)duty * T1_TOP) / MAX_PWM);
+  } else {
+    OCR2B = (uint8_t)(((uint32_t)duty * T2_TOP) / MAX_PWM);
+  }
+}
+
 void setup() {
   Serial.begin(9600);   // 9600 on the operator's order 2026-08-18 - match the
                         // serial monitor to this or the log reads as garbage.
@@ -691,36 +794,10 @@ void setup() {
   // else is needed to stop it being an ADC input.
   pinMode(LIGHT_DIR, OUTPUT);
   pinMode(LIGHT_PWM, OUTPUT);
-  // --- PWM frequency ---------------------------------------------------
-  // Operator's change 2026-08-24. Both wheel PWM pins go to prescaler 1.
-  //
-  // Timer2: D3
-  // Prescaler = 1, AND fast PWM -> 62.5 kHz, matching D6.
-  //
-  // The prescaler alone gave 31.37 kHz, not 62.5: the Arduino core leaves
-  // Timer2 in PHASE-CORRECT PWM (WGM=001), which counts up and back down and
-  // so takes 510 ticks per period instead of 256. Timer0 is left in fast PWM
-  // by the core, hence the 2:1 split. Setting WGM21 alongside the core's WGM20
-  // makes WGM=011 (fast PWM, TOP=255) and the two land on the same number:
-  //
-  //     16e6 / (256 * 1) = 62500 Hz   both channels
-  //
-  // Matching matters - the pin note warns that channels on different
-  // frequencies respond differently to the same demand and read as a
-  // mechanical fault, which is a pull to one side on a straight run.
-  TCCR2A |= _BV(WGM21);
-  TCCR2B = (TCCR2B & 0b11111000) | 0b001;
-
-  // Timer0: D6
-  // Prescaler = 1 -> about 62.5 kHz
-  // WARNING: this breaks normal millis()/micros()/delay() timing - millis()
-  // now runs 64x fast. MILLIS_SCALE above compensates every duration this
-  // sketch measures; anything ELSE that calls millis() (the Ethernet library's
-  // internal timeouts, any future delay()) is NOT compensated and will be 64x
-  // short. There are no delay() calls in this sketch today, and the link runs
-  // on a static IP so nothing here waits on a DHCP timeout.
-  TCCR0B = (TCCR0B & 0b11111000) | 0b001;
-
+  // AFTER the pinModes above: both motor timers are reconfigured for
+  // 7812.5 Hz here. Timer0 is untouched, so millis() and the failsafe are
+  // unaffected. See setupMotorPwm().
+  setupMotorPwm();
   // NOTE: STATUS_LED is LED_BUILTIN = D13, which is also the SPI clock the
   // shield uses. With the shield fitted this lamp tracks Ethernet traffic
   // rather than link state, and is not a reliable indicator. Harmless, but do
@@ -931,10 +1008,8 @@ void loop() {
   unsigned long now = millis();
   bool changed = (curL != printedL || curR != printedR || curA != printedA
                   || curB != printedB || curLight != printedLight)
-                 && (now - lastPrintMs) > 200UL * MILLIS_SCALE;
-  // Same scaling as FAILSAFE_MS - without it the telemetry would print 64x as
-  // often and drown the serial line at 9600 baud.
-  if (changed || (now - lastPrintMs) > 3000UL * MILLIS_SCALE) {
+                 && (now - lastPrintMs) > 200;
+  if (changed || (now - lastPrintMs) > 3000) {
     printedL = curL;
     printedR = curR;
     printedA = curA;

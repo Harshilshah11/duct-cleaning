@@ -4,16 +4,20 @@
 # CAM 1 — camera at 192.168.1.103 (MAC 00:c2:33:71:13:6d), reached over eth0.
 #   /stream   h264  1280x720 @25   (main)
 #   /stream1  h265   720x576 @25   (sub)
+#   No authentication.
 #
-# CAM 2 — second camera at 192.168.1.101. Assumed to be the same model, so the
-#   same paths. Confirm before trusting it — this camera family answers 200 OK
-#   to DESCRIBE on paths that serve nothing, so only pulling video proves it:
+# CAM 2 — camera at 192.168.1.102 (MAC 00:ca:4f:d1:23:df), reached over eth0.
+#   Confirmed on the wire 2026-08-17; it is NOT at 192.168.1.101 (that address
+#   never answered). Different vendor from CAM 1 (nginx/h5player web UI on :80,
+#   :8000 open) and it REQUIRES RTSP Basic auth — credentials admin:123456,
+#   embedded in the URL below. Verified by decoding real frames, not just DESCRIBE:
+#   /stream   h264  1280x720 @20   (main)
+#   /stream1  h265   720x576       (sub)
 #     ffprobe -v error -rtsp_transport tcp -show_entries stream=codec_name,width,height \
-#             -of default=noprint_wrappers=1:nokey=1 rtsp://192.168.1.101:554/stream
-#   See "Finding the RTSP path" in the README for the loop over the usual paths.
+#       -of default=noprint_wrappers=1:nokey=1 rtsp://admin:123456@192.168.1.102:554/stream
 #
 # Both cameras hang off eth0 and each needs its own /32 host route:
-#     ./setup_camera_link.sh 192.168.1.103 192.168.1.101
+#     ./setup_camera_link.sh 192.168.1.103 192.168.1.102
 
 rtsp://192.168.1.103:554/stream
-rtsp://192.168.1.101:554/stream
+rtsp://admin:123456@192.168.1.102:554/stream
