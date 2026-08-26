@@ -43,6 +43,7 @@ a wiring question ever comes back.
 from __future__ import annotations
 
 import math
+import re
 import time
 
 from PySide6.QtCore import Qt, QPointF, QRectF, QSize, QTimer
@@ -1381,6 +1382,330 @@ class TapeBar(QWidget):
         p.restore()
 
 
+def qcol(spec, alpha=None):
+    """QColor from a theme token, INCLUDING the rgba() strings.
+
+    QColor does not parse CSS rgba(): it returns an invalid colour, which
+    paints solid black. Half the theme's tokens - every label tier and the
+    separator - are written in that form because they were authored for
+    style sheets, so anything that reaches QPainter has to come through here.
+    """
+    m = re.match(r"rgba?\(([^)]*)\)", str(spec).strip())
+    if m:
+        parts = [x.strip() for x in m.group(1).split(",")]
+        c = QColor(int(float(parts[0])), int(float(parts[1])),
+                   int(float(parts[2])))
+        c.setAlphaF(float(parts[3]) if len(parts) > 3 else 1.0)
+    else:
+        c = QColor(spec)
+    if alpha is not None:
+        c.setAlphaF(alpha)
+    return c
+
+
+class RoundSaveButton(QWidget):
+    """SAVE, as a round control that doubles as the transfer dial.
+
+    REPLACES the SAVE pill AND the whole footnote line under the recording
+    card, on the operator's call 2026-08-26. Three separate facts used to be
+    spread across three places - whether SAVE had been pressed (a pill), how
+    far the merge had got (a percentage buried mid-sentence), and whether the
+    footage was safe on the card (a line of standing instructions). To an
+    operator standing at the strip waiting for a job to finish those are ONE
+    question, so they are now one control.
+
+    THE HUD LOOK is the operator's call 2026-08-26, with a reference clip of a
+    futuristic transfer ring. It is not decoration for its own sake - each
+    layer is carrying something:
+
+        tick gauge   sixty marks, lit up to the current percentage. Reads at a
+                     glance from across the room, where a thin arc does not.
+        comet arc    the progress itself, brightening toward its head, so the
+                     eye is pulled to the leading edge rather than to the
+                     middle of a uniform band.
+        dashed ring  turns continuously, INDEPENDENT of progress. This is the
+                     liveness signal: the percentage can sit on 61% for half a
+                     minute on a long clip, and a still dial at 61% looks
+                     exactly like a wedged ffmpeg. This one never stops.
+        orbit dot    a second, faster, counter-turning mark. Same job, and it
+                     keeps moving even when the dashed ring is edge-on to the
+                     eye at a glance.
+
+    THE PERCENTAGE MOVED INSIDE THE RING. It was under the button, which is
+    where the operator asked for it on 2026-08-26 - but the +0.5cm they asked
+    for on the same day does not fit in this card WITH a caption line under it.
+    SessionView gets 128px, the heading and tape bar take 34, and a 89px dial
+    plus a 12px caption does not come in under the rest. Inside the ring is
+    where the reference puts it anyway. Say the word and it goes back under, at
+    a smaller ring.
+    """
+
+    # SIZES ARE MILLIMETRES, converted once. This panel publishes its physical
+    # size over EDID - 344x195mm across 1920x1080 = 5.56 px/mm - which is the
+    # same constant SparkleRing sizes itself with. The operator asks for
+    # centimetres because that is what a control on a panel actually is.
+    OUTER = 89                 # was 61: +0.5cm, as asked
+    FACE = 46                  # the solid centre disc
+    PAD = 2                    # bloom room. There is no more than this - see
+    #                            the class docstring on what the card gives.
+    WIDTH = OUTER + 2 * PAD
+
+    RING_W = 5.0               # progress arc thickness
+    TICKS = 60                 # marks around the gauge
+    FPS_MS = 40                # 25fps. This is a Pi with two encoders running.
+    BREATH_S = 2.8             # idle breath period
+    SPIN_S = 3.6               # dashed ring revolution
+    ORBIT_S = 2.1              # the counter-turning dot
+    EASE = 0.18                # per-frame approach to the target percentage
+
+    def __init__(self):
+        super().__init__()
+        self._mode = "idle"        # idle | busy | done | error
+        self._target = 0.0
+        self._frac = 0.0
+        self._press = 0.0
+        self._check = 0.0
+        self._tick = 0.0
+        self._armed = False
+        self.setFixedSize(self.WIDTH, self.WIDTH)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._step)
+        self._timer.start(self.FPS_MS)
+
+    # ---- state in ------------------------------------------------------
+    def set_status(self, mode, frac=0.0):
+        if mode == "done" and self._mode != "done":
+            self._check = 0.0
+        self._mode = mode
+        self._target = max(0.0, min(1.0, float(frac or 0.0)))
+        # A fresh build starts the dial at zero rather than easing down from
+        # wherever the last one finished, which otherwise reads as progress
+        # running backwards.
+        if mode == "busy" and self._frac > self._target + 0.25:
+            self._frac = self._target
+
+    def flash(self):
+        """The panel took a SAVE press."""
+        self._press = 1.0
+
+    def set_armed(self, on):
+        self._armed = bool(on)
+
+    # ---- animation -----------------------------------------------------
+    def _step(self):
+        self._tick += self.FPS_MS / 1000.0
+        self._frac += (self._target - self._frac) * self.EASE
+        self._press *= 0.86
+        if self._press < 0.01:
+            self._press = 0.0
+        if self._mode == "done":
+            self._check += (1.0 - self._check) * 0.16
+        else:
+            self._check = 0.0
+        self.update()
+
+    # ---- paint ---------------------------------------------------------
+    def _tone(self):
+        if self._mode == "error":
+            return QColor(BAD)
+        if self._mode == "done":
+            return QColor(TONES["on"][0])
+        if self._mode == "busy":
+            return QColor(WARN)
+        return QColor(ACCENT)
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        c = QPointF(self.width() / 2.0, self.height() / 2.0)
+        r_out = self.OUTER / 2.0
+        r_face = self.FACE / 2.0
+        r_dash = r_out - 17.0
+
+        tone = self._tone()
+        breath = 0.5 + 0.5 * math.sin(self._tick * math.tau / self.BREATH_S)
+        busy = self._mode == "busy"
+        lit = self._mode in ("busy", "done", "error")
+        frac = (1.0 if self._mode in ("done", "error")
+                else (self._frac if busy else 0.0))
+
+        self._gauge(p, c, r_out, tone, frac, lit, breath)
+        if busy:
+            self._dashes(p, c, r_dash, tone)
+            self._orbit(p, c, r_out - 3.5, tone, breath)
+        self._face(p, c, r_face, tone, breath)
+        p.end()
+
+    # -- layers ----------------------------------------------------------
+    def _gauge(self, p, c, r, tone, frac, lit, breath):
+        """Sixty radial marks: the progress, the trail and the head, in one band.
+
+        The coarse readout. An arc tells you roughly how far round something
+        is; a count of lit marks is a NUMBER you can read without reading, and
+        it is the layer that still works at the far end of a duct. The last
+        twelve marks behind the leading edge brighten and grow, which is what
+        turns a gauge into a comet without adding a second ring to do it.
+        """
+        r_in = r - 6.0
+        tail = 12.0                      # marks the trail spans
+        for i in range(self.TICKS):
+            t = (i + 0.5) / float(self.TICKS)
+            on = lit and t <= frac
+            if on:
+                behind = (frac - t) * self.TICKS
+                k = max(0.0, 1.0 - behind / tail)
+                col = QColor(tone).lighter(int(100 + 22 * k))
+                col.setAlphaF(0.60 + 0.40 * k)
+                w, ext = 2.2 + 1.3 * k, 1.8 * k
+            else:
+                col = qcol(MUTED, 0.16)
+                w, ext = 1.6, 0.0
+            a = math.radians(90.0 - t * 360.0)
+            ca, sa = math.cos(a), math.sin(a)
+            p.setPen(QPen(col, w, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(c.x() + ca * r_in, c.y() - sa * r_in),
+                       QPointF(c.x() + ca * (r + ext), c.y() - sa * (r + ext)))
+
+        # A hairline at the inner edge of the band, so the gauge has a rim to
+        # sit on rather than floating as loose strokes.
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(qcol(MUTED, 0.14), 1.0))
+        p.drawEllipse(c, r_in - 2.0, r_in - 2.0)
+
+        # The leading edge, with a little bloom. This is the mark the eye
+        # tracks, so it is the one thing here allowed to be pure white.
+        if not lit or frac <= 0.002 or frac >= 0.999:
+            return
+        a = math.radians(90.0 - frac * 360.0)
+        head = QPointF(c.x() + math.cos(a) * (r - 2.0),
+                       c.y() - math.sin(a) * (r - 2.0))
+        p.setPen(Qt.NoPen)
+        for n in range(3, 0, -1):
+            col = QColor(tone)
+            col.setAlphaF((0.26 + 0.10 * breath) * (n / 3.0))
+            p.setBrush(col)
+            p.drawEllipse(head, 2.6 + n * 1.5, 2.6 + n * 1.5)
+        p.setBrush(QColor(255, 255, 255, 240))
+        p.drawEllipse(head, 2.2, 2.2)
+
+    def _dashes(self, p, c, r, tone):
+        """Three arcs turning at a constant rate. Liveness, not progress."""
+        rect = QRectF(c.x() - r, c.y() - r, r * 2, r * 2)
+        spin = (self._tick / self.SPIN_S) * 360.0
+        col = QColor(tone)
+        col = QColor(tone).lighter(126)
+        col.setAlphaF(0.80)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(col, 2.2, Qt.SolidLine, Qt.RoundCap))
+        for k in range(3):
+            start = spin + k * 120.0
+            p.drawArc(rect, int(round(start * 16)), int(round(46 * 16)))
+
+    def _orbit(self, p, c, r, tone, breath):
+        """One mark going the other way, faster. A second heartbeat."""
+        a = math.radians(-(self._tick / self.ORBIT_S) * 360.0 + 90.0)
+        x, y = c.x() + math.cos(a) * r, c.y() - math.sin(a) * r
+        p.setPen(Qt.NoPen)
+        col = QColor(tone)
+        col.setAlphaF(0.35 + 0.25 * breath)
+        p.setBrush(col)
+        p.drawEllipse(QPointF(x, y), 3.2, 3.2)
+        p.setBrush(QColor(255, 255, 255, 210))
+        p.drawEllipse(QPointF(x, y), 1.5, 1.5)
+
+    def _face(self, p, c, r_face, tone, breath):
+        # Presses dip it; the arm-blink lifts it. Both are scale, not colour,
+        # because the colour is already carrying the mode.
+        lift = 1.0 + (0.03 * breath if self._armed else 0.0)
+        rf = r_face * (1.0 - 0.055 * self._press) * lift
+
+        if self._mode == "idle":
+            top, bot = QColor("#ffffff"), QColor(theme.LIGHT["gray6"])
+            edge, ink = qcol(LINE), QColor(theme.LIGHT["label"])
+        else:
+            top, bot = QColor(tone), QColor(tone).darker(114)
+            edge, ink = QColor(tone).darker(112), QColor("#ffffff")
+
+        for i in range(3, 0, -1):
+            col = QColor(0, 0, 0)
+            col.setAlphaF(0.045 * (i / 3.0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            g = rf + i * 0.9
+            p.drawEllipse(QPointF(c.x(), c.y() + 1.5), g, g)
+
+        grad = QLinearGradient(c.x(), c.y() - rf, c.x(), c.y() + rf)
+        grad.setColorAt(0.0, top)
+        grad.setColorAt(1.0, bot)
+        p.setBrush(grad)
+        p.setPen(QPen(edge, 1.0))
+        p.drawEllipse(c, rf, rf)
+
+        spec = QColor("#ffffff")
+        spec.setAlphaF(0.55 if self._mode == "idle" else 0.38)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(spec, 1.4))
+        p.drawArc(QRectF(c.x() - rf + 1.2, c.y() - rf + 1.2,
+                         (rf - 1.2) * 2, (rf - 1.2) * 2), 30 * 16, 120 * 16)
+
+        box = QRectF(c.x() - rf, c.y() - rf, rf * 2, rf * 2)
+        if self._mode == "done" and self._check > 0.02:
+            self._draw_check(p, c.x(), c.y(), rf, ink)
+            return
+        if self._mode == "error":
+            f = QFont(self.font())
+            f.setPixelSize(int(rf * 1.15))
+            f.setWeight(QFont.Bold)
+            p.setFont(f)
+            p.setPen(ink)
+            p.drawText(box, Qt.AlignCenter, "!")
+            return
+
+        f = QFont(self.font())
+        p.setPen(ink)
+        if self._mode == "busy":
+            # THE READOUT, in the middle of its own dial. Tabular digits so the
+            # number does not jitter sideways as it counts.
+            f.setPixelSize(17)
+            f.setWeight(QFont.Bold)
+            p.setFont(f)
+            p.drawText(box, Qt.AlignCenter, "%d%%" % round(self._frac * 100))
+        else:
+            f.setPixelSize(12)
+            f.setWeight(QFont.Bold)
+            f.setLetterSpacing(QFont.AbsoluteSpacing, 0.9)
+            p.setFont(f)
+            p.drawText(box, Qt.AlignCenter, "SAVE")
+
+    def _draw_check(self, p, cx, cy, rf, ink):
+        """A tick that DRAWS ITSELF ON rather than appearing.
+
+        Two strokes, revealed in order along their combined length, so the eye
+        follows the stroke and lands on the finished mark. An instant tick on a
+        control that has been turning for a minute is easy to miss.
+        """
+        sz = rf * 0.62
+        a = QPointF(cx - sz * 0.92, cy + sz * 0.05)
+        b = QPointF(cx - sz * 0.22, cy + sz * 0.72)
+        d = QPointF(cx + sz * 0.95, cy - sz * 0.62)
+        l1 = math.hypot(b.x() - a.x(), b.y() - a.y())
+        l2 = math.hypot(d.x() - b.x(), d.y() - b.y())
+        t = min(1.0, self._check) * (l1 + l2)
+        path = QPainterPath(a)
+        if t <= l1:
+            k = t / l1
+            path.lineTo(a.x() + (b.x() - a.x()) * k, a.y() + (b.y() - a.y()) * k)
+        else:
+            path.lineTo(b)
+            k = min(1.0, (t - l1) / l2)
+            path.lineTo(b.x() + (d.x() - b.x()) * k, b.y() + (d.y() - b.y()) * k)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(ink, max(3.0, rf * 0.17), Qt.SolidLine,
+                      Qt.RoundCap, Qt.RoundJoin))
+        p.drawPath(path)
+
+
 class SessionView(QWidget):
     """Recording state, its controls, and a footnote.
 
@@ -1406,6 +1731,7 @@ class SessionView(QWidget):
     # The save button is momentary - measured ~0.18s per press, which is a
     # handful of UI frames and easy to miss. Hold its pill lit long enough to
     # register as feedback that the press was seen.
+    SAVE_INSET = 7              # trims the move to a round 3cm
     SAVE_FLASH_S = 0.9
 
     def __init__(self):
@@ -1440,6 +1766,16 @@ class SessionView(QWidget):
         # controls, and a footnote. label3 is the HIG's tertiary label - the
         # same hue, dropped in alpha - which quiets it without shifting it.
         self.detail = label("idle", REC_DETAIL_PX, theme.LIGHT["label3"])
+        # GONE, operator 2026-08-26. This line carried three things at
+        # once - a percentage, a running commentary, and a block of
+        # standing instructions ('PLUG IN USB', 'nothing to save') that
+        # said the same words on every run and so stopped being read.
+        # The percentage moved onto the SAVE button, where the thing it
+        # measures already is. The widget stays built and still takes
+        # its text so none of the branches below have to be unpicked;
+        # it simply never shows, and a hidden widget costs the layout
+        # nothing. To bring it back, delete this one line.
+        self.detail.setVisible(False)
 
         # PRIMARY. All three buttons were identical grey at rest, so nothing
         # said which one starts the job - and START / STOP is the only one an
@@ -1451,7 +1787,10 @@ class SessionView(QWidget):
                              px=REC_PILL_PX, primary=True)
         self.pause_pill = Pill("PAUSE / RESUME", PILL_TONE["PAUSE / RESUME"],
                                px=REC_PILL_PX)
-        self.save_pill = Pill("SAVE", PILL_TONE["SAVE"], px=REC_PILL_PX)
+        # NOT a pill. SAVE is the only control here whose result takes
+        # time, so it is the only one that needs somewhere to show how
+        # much time is left - see RoundSaveButton.
+        self.save_btn = RoundSaveButton()
 
         # Both rows centred, a stretch on each side, to match the centred
         # captions everywhere else in the strip.
@@ -1471,11 +1810,26 @@ class SessionView(QWidget):
         # used to stretch the pills to fill the card, which blew START / STOP
         # and PAUSE / RESUME up to several times the width of every other
         # control in the strip; same words + same padding is the same density.
+        # SAVE MOVED 3cm RIGHT, operator 2026-08-26. Not by wedging a
+        # spacer in front of it - that widens the centred group, so the
+        # two pills would slide LEFT by half of whatever SAVE moved
+        # right. SAVE goes to the right edge and an empty slot of its own
+        # width goes on the left, which leaves START / STOP and PAUSE /
+        # RESUME centred in the card exactly where they were. 5.56 px/mm:
+        # the dial's centre travels 761 - 7 - 47 = 707 from 539, or 30.2mm.
+        slot = RoundSaveButton.WIDTH + self.SAVE_INSET
+        save_slot = QWidget()
+        save_slot.setFixedWidth(slot)
+        slot_l = QHBoxLayout(save_slot)
+        slot_l.setContentsMargins(0, 0, self.SAVE_INSET, 0)
+        slot_l.setSpacing(0)
+        slot_l.addWidget(self.save_btn, 0, Qt.AlignVCenter)
+        pill_row.addSpacing(slot)
         pill_row.addStretch(1)
         pill_row.addWidget(self.rec_pill)
         pill_row.addWidget(self.pause_pill)
-        pill_row.addWidget(self.save_pill)
         pill_row.addStretch(1)
+        pill_row.addWidget(save_slot)
 
         # Order: heading, then the three buttons centred in the block, then the
         # detail line pinned to the bottom. A stretch either side of the pill row
@@ -1488,7 +1842,12 @@ class SessionView(QWidget):
         # which is what "heading and content all mixed" was describing.
         col = QVBoxLayout(self)
         col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(theme.SPACE_1)
+        # TIGHTER THAN THE GRID, and only here. SessionView gets 128px and
+        # the 89px dial plus the heading and tape bar do not fit at
+        # SPACE_1. The two gaps this affects are inside one group that the
+        # original comment already calls ONE thing, so closing them does
+        # not blur a boundary that meant anything.
+        col.setSpacing(2)
         col.addLayout(head_row)
         # Directly under the state word and clock it belongs to, and inset so it
         # does not run the full card width like a progress bar would.
@@ -1507,11 +1866,12 @@ class SessionView(QWidget):
         tape_row.addWidget(self.tape, 3)
         tape_row.addStretch(1)
         col.addLayout(tape_row)
-        col.addSpacing(theme.SPACE_2)
         col.addLayout(pill_row)
         # Twice the gap above the footnote that sits inside the group, so the
         # eye separates "what I can do" from "what is going on".
-        col.addSpacing(theme.SPACE_3)
+        # No addSpacing() ahead of this any more: the gap it opened was
+        # for the footnote, and the footnote is hidden. Restore the
+        # SPACE_3 here if self.detail is ever shown again.
         col.addWidget(self.detail, 0, Qt.AlignHCenter)
         col.addStretch(1)
 
@@ -1706,14 +2066,20 @@ class SessionView(QWidget):
             fv = status["full_view"]
             if fv.get("state") == "error":
                 self.detail.setText(
-                    f"READY TO TRANSFER  ·  PLUG IN USB  ·  merge failed"
-                    f"  ·  {(fv.get('error') or '')[:40]}")
+                    f"VIDEO SAVED (merge failed)  ·  camera files are safe"
+                    f"  ·  PLUG IN USB  ·  {(fv.get('error') or '')[:34]}")
                 recolour(self.detail, BAD, REC_DETAIL_PX, bold=True)
             else:
+                # LEADS WITH "VIDEO SAVED", operator 2026-08-26: "if already
+                # saved to show video is already saved". The old wording only
+                # said what to do NEXT (plug in the stick) and never said the
+                # thing the operator was waiting to hear - so a strip that had
+                # finished looked much like one still working, and the only way
+                # to be sure was to remember whether the percentage had gone.
+                n = fv.get("built") or 0
                 self.detail.setText(
-                    f"READY TO TRANSFER  ·  PLUG IN USB  ·  "
-                    f"{fv.get('built') or 0} merged video"
-                    f"{'s' if (fv.get('built') or 0) != 1 else ''}")
+                    f"VIDEO SAVED  ·  {n} file{'s' if n != 1 else ''} ready"
+                    f"  ·  PLUG IN USB TO TRANSFER")
                 recolour(self.detail, TONES["on"][0], REC_DETAIL_PX, bold=True)
         elif (status.get("full_view") or {}).get("state") == "error":
             self.detail.setText(
@@ -1735,6 +2101,20 @@ class SessionView(QWidget):
                 f"{hms(status.get('clip_elapsed'))}  ·  {mb:,.0f} MB")
             recolour(self.detail, MUTED, REC_DETAIL_PX)
 
+        # The ring IS the old footnote. Every state that line used to
+        # describe in words now lands on the button: turning while the merge
+        # runs, a tick when the footage is on the card, a cross when it is not.
+        fv = status.get("full_view") or {}
+        fv_state = fv.get("state")
+        if fv_state in ("queued", "normalising", "joining", "building"):
+            self.save_btn.set_status("busy", fv.get("frac") or 0.0)
+        elif fv_state == "error":
+            self.save_btn.set_status("error", 1.0)
+        elif fv.get("ready"):
+            self.save_btn.set_status("done", 1.0)
+        else:
+            self.save_btn.set_status("idle", 0.0)
+
         switches = snapshot.get("switches") or {}
         self.rec_pill.set_value(switches.get("START / STOP"))
         self.pause_pill.set_value(switches.get("PAUSE / RESUME"))
@@ -1743,17 +2123,12 @@ class SessionView(QWidget):
         if presses is not None:
             if self._presses is not None and presses > self._presses:
                 self._flash_until = time.monotonic() + self.SAVE_FLASH_S
+                self.save_btn.flash()
             self._presses = presses
-        if left is not None:
-            # Through the confirm window the SAVE pill pulses on its own: it is
-            # the only control that can keep the recording, and the operator has
-            # a counted number of seconds to find it.
-            self.save_pill.set_value(
-                int(time.monotonic() * self.BLINK_HZ * 2) % 2 == 0)
-        else:
-            self.save_pill.set_value(
-                True if time.monotonic() < self._flash_until
-                else (None if presses is None else False))
+        # Through the confirm window the button breathes on its own: it is
+        # the only control that can keep the recording, and the operator has a
+        # counted number of seconds to find it.
+        self.save_btn.set_armed(left is not None)
 
 
 class InputsPanel(QFrame):
