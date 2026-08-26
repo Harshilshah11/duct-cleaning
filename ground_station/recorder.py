@@ -45,6 +45,7 @@ from __future__ import annotations
 import io
 import os
 import shutil
+import re
 import subprocess
 import threading
 import time
@@ -106,12 +107,36 @@ def _session_started(name):
     The name rather than the mtime on purpose: clearing a backed-up session's
     files touches its directory, so its mtime moves to roughly when the backup
     ran and cannot be compared against the backup's own clock. The name is
-    stamped once, by _start(), and never changes after.
+    stamped once, by _start(), and only ever gains the end time.
+
+    Format, operator's spec 2026-08-26:
+
+        session01 date 26-08-26 start 20-07-56 end 20-15-30
+
+    "/" and ":" are what the spec asked for and neither can be used: "/" is the
+    path separator, and ":" is illegal on the FAT32/exFAT stick this footage is
+    copied to - a directory named with one would be silently skipped or mangled
+    by the transfer. "-" everywhere is the closest legal spelling.
+
+    THE OLD FORMAT STILL PARSES. Sessions recorded before this change are named
+    20260826_200756_SESSION001..., and they are still on the card and still owed
+    a backup - a parser that could not date them would restart the numbering on
+    top of them.
     """
+    # Current: date DD-MM-YY start HH-MM-SS
+    m = re.search(r"date (\d\d-\d\d-\d\d) start (\d\d-\d\d-\d\d)", name)
+    if m:
+        try:
+            return time.mktime(time.strptime("%s %s" % (m.group(1), m.group(2)),
+                                             "%d-%m-%y %H-%M-%S"))
+        except ValueError:
+            return None
+    # Legacy: YYYYMMDD_HHMMSS leading the name
     try:
         return time.mktime(time.strptime(name[:15], "%Y%m%d_%H%M%S"))
     except (ValueError, TypeError):
         return None
+
 
 
 def _next_session_no(root):
@@ -132,12 +157,14 @@ def _next_session_no(root):
     number, so a second SESSION001 is a different directory from the first, on
     the Pi and on the stick alike.
     """
-    import re
     epoch = _reset_epoch(root)
     highest = 0
     try:
         for name in os.listdir(root):
-            m = re.search(r"_SESSION(\d+)$", name)
+            # Both spellings: "session01 date ..." since 2026-08-26, and the
+            # older "..._SESSION001". Case-insensitive and unanchored, because
+            # the number is no longer the last thing in the name.
+            m = re.search(r"session(\d+)", name, re.IGNORECASE)
             if not m:
                 continue
             if epoch:
@@ -539,6 +566,9 @@ class FullViewBuilder(threading.Thread):
         super().__init__(daemon=True)
         self.session_dir = session_dir
         self.clips = clips              # {clip_no: [(slug, path), ...]}
+        # Slug -> FRONT / BACK, used to name the joined outputs. Already passed
+        # in for the burned-in tile captions; _join_all reuses it so the files
+        # on the stick read front.mp4 and back.mp4.
         self.offsets = offsets          # {clip_no: {slug: lead_in_seconds}}
         self.labels = labels            # {slug: "FRONT"}
         self._on_done = on_done
@@ -884,6 +914,125 @@ class FullViewBuilder(threading.Thread):
             return "rename failed: %s" % exc
         return None
 
+    def _join(self, out_stem, parts):
+        """Concatenate `parts` into one file named out_stem. None on success.
+
+        STREAM COPY, NOT RE-ENCODE. Everything reaching here has already been
+        through _normalize_clip, so every part shares a codec, a size and a
+        frame rate - which is exactly the precondition the concat demuxer wants.
+        A copy runs at disk speed instead of ffmpeg speed, so joining a long
+        session costs seconds rather than the minutes a second encode would, and
+        it cannot lose quality because nothing is decoded.
+        """
+        out = os.path.join(self.session_dir, out_stem + config.RECORD_EXT)
+        if not parts:
+            return None
+        if len(parts) == 1:
+            # One clip is already the answer. Renaming beats spawning ffmpeg to
+            # copy a file onto itself, and it cannot fail halfway.
+            try:
+                os.replace(parts[0], out)
+                return None
+            except OSError as exc:
+                return "rename: %s" % exc
+
+        # The list file lives beside the parts so relative paths resolve, and is
+        # named with a leading dot so _sweep_orphans treats it as a temporary.
+        lst = os.path.join(self.session_dir, ".join_%s.txt" % out_stem)
+        try:
+            with open(lst, "w", encoding="utf-8") as fh:
+                for path in parts:
+                    # Single quotes are the concat demuxer's escape, and a path
+                    # this code generates never contains one - but a session
+                    # directory is built from a timestamp and a root the
+                    # operator can change, so it is escaped rather than trusted.
+                    fh.write("file '%s'\n" % path.replace("'", "'\\''"))
+        except OSError as exc:
+            return "list: %s" % exc
+
+        part_out = out + ".part"
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+               "-f", "concat", "-safe", "0", "-i", lst,
+               "-c", "copy", "-movflags", "+faststart", "-f", "mp4", part_out]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE, text=True)
+        except OSError as exc:
+            return "ffmpeg: %s" % exc
+        with self._lock:
+            self._proc = proc
+        err = ""
+        try:
+            err = (proc.communicate(timeout=config.COMBINED_TIMEOUT_S)[1] or "")[:300]
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            err = "timed out"
+        finally:
+            with self._lock:
+                self._proc = None
+        try:
+            os.remove(lst)
+        except OSError:
+            pass
+        if proc.returncode != 0 or err == "timed out":
+            try:
+                os.remove(part_out)
+            except OSError:
+                pass
+            return err or "ffmpeg exit %s" % proc.returncode
+        try:
+            os.replace(part_out, out)
+        except OSError as exc:
+            return "rename: %s" % exc
+        # Only now are the parts expendable. Deleting before the join verified
+        # would turn a failed merge into lost footage.
+        for path in parts:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return None
+
+    def _join_all(self):
+        """Reduce a session to exactly three files: full, and one per camera.
+
+        WHY THIS EXISTS (operator 2026-08-26): "make three video only full front
+        and back". Recording still writes one file per camera PER CLIP, because
+        that is what lets a pause split cleanly and what bounds the loss if
+        power drops mid-run - but an operator wants one video per camera and one
+        combined, not nine files whose numbering only means something to the
+        code that wrote them.
+
+        Named from the camera LABELS, so they read front/back rather than a slug
+        derived from an RTSP hostname.
+        """
+        problems = []
+        by_slug = {}
+        for clip_no in sorted(self.clips):
+            for slug, path in self.clips[clip_no]:
+                if os.path.exists(path):
+                    by_slug.setdefault(slug, []).append(path)
+
+        for slug, parts in by_slug.items():
+            stem = (self.labels.get(slug) or slug).strip().lower() or slug
+            reason = self._join(stem, parts)
+            if reason:
+                problems.append("%s: %s" % (stem, reason))
+
+        # The side-by-side clips, if any were built.
+        fulls = []
+        for clip_no in sorted(self.clips):
+            p = os.path.join(self.session_dir,
+                             "full_%03d%s" % (clip_no, config.RECORD_EXT))
+            if os.path.exists(p):
+                fulls.append(p)
+        if fulls:
+            reason = self._join("full", fulls)
+            if reason:
+                problems.append("full: %s" % reason)
+        return problems
+
     def run(self):
         if not self.clips:
             with self._lock:
@@ -933,6 +1082,20 @@ class FullViewBuilder(threading.Thread):
                 with self._lock:
                     self._built += 1
                     self._frac = 1.0
+
+        # ONE FILE PER CAMERA PLUS ONE COMBINED - see _join_all. Runs even when
+        # some clips failed: the clips that DID build are still worth joining,
+        # and a session that half-merged is more useful than one left as
+        # numbered fragments.
+        if not self._stopping.is_set():
+            with self._lock:
+                self._state, self._frac = "joining", 0.0
+            try:
+                failures.extend(self._join_all())
+            except Exception as exc:            # never take the viewer down
+                failures.append("join: %s" % str(exc)[:120])
+            with self._lock:
+                self._frac = 1.0
 
         with self._lock:
             if failures:
@@ -1165,16 +1328,74 @@ class SessionManager:
             self._built_at = None
 
         self.session_started = datetime.now()
+        # session01 date 26-08-26 start 20-07-56   - the end time is appended
+        # when the run stops, see _finalize_dir_name. Spaces and "-" only: see
+        # the note in _session_started for why the spec's "/" and ":" cannot be
+        # used on a directory that gets copied to a FAT32 stick.
         self.session_dir = os.path.join(
             self.root,
-            f"{_stamp(self.session_started)}"
-            f"_SESSION{_next_session_no(self.root):03d}")
+            "session%02d date %s start %s" % (
+                _next_session_no(self.root),
+                self.session_started.strftime("%d-%m-%y"),
+                self.session_started.strftime("%H-%M-%S")))
         os.makedirs(self.session_dir, exist_ok=True)
         self.clip = 0
         self._written = []
         self._rolled = self._clip_rolled = 0.0
         self._roll_since = self._clip_since = None
         self._begin_clip()
+
+    def _finalize_dir_name(self, stopped_at):
+        """Fold the stop time into the session folder's name.
+
+        Operator 2026-08-26: the folder should say which session it is, on what
+        date, and between which times. The start half is known when the folder
+        is created; the STOP half only exists now, so the directory is renamed
+        rather than named once.
+
+            20260826_200756_SESSION001              during the run
+            20260826_200756_SESSION001_to_201530    after it
+
+        THE FIRST 15 CHARACTERS ARE LOAD-BEARING and must stay a
+        %Y%m%d_%H%M%S stamp: _session_started() slices name[:15] to decide
+        whether a session predates the last verified USB backup, and a session
+        it cannot date is one the numbering will not skip. That is why the stop
+        time is appended rather than the whole name being made prettier.
+
+        Renaming a directory that still has open files in it is safe here - the
+        encoders hold file descriptors, and on Linux those follow the inode, not
+        the path. Waiting for them would block the UI thread for up to
+        _await_closed's timeout on every stop, for no benefit.
+        """
+        old = self.session_dir
+        if not old or not os.path.isdir(old):
+            return
+        base = os.path.basename(old)
+        if " end " in base:                 # already renamed - stop pressed twice
+            return
+        new = os.path.join(os.path.dirname(old),
+                           "%s end %s" % (base, stopped_at.strftime("%H-%M-%S")))
+        try:
+            os.rename(old, new)
+        except OSError:
+            # A failed rename is cosmetic: the footage is exactly where it was
+            # and every path still points at it. Never let it cost a recording.
+            return
+
+        # EVERY REMEMBERED PATH MOVES WITH IT. _written drives the discard, and
+        # _clip_members is what the merge reads - a stale absolute path here
+        # means a session that silently builds nothing.
+        def remap(path):
+            if path == old or path.startswith(old + os.sep):
+                return os.path.join(new, os.path.relpath(path, old))
+            return path
+
+        self.session_dir = new
+        self._written = [remap(p) for p in self._written]
+        self._clip_members = {
+            clip: [(slug, remap(p)) for slug, p in entries]
+            for clip, entries in self._clip_members.items()
+        }
 
     def _stop_session(self):
         self._roll(False)
@@ -1183,6 +1404,10 @@ class SessionManager:
         for rec in self.recorders:
             rec.set_rolling(False)
         self._roll_since = self._clip_since = None
+        # Before the keep/discard decision below, because both of them read the
+        # paths this rewrites - the merge from _clip_members, the discard from
+        # _written. See _finalize_dir_name.
+        self._finalize_dir_name(datetime.now())
 
         # Nothing worth asking about: no time on the clock, or the cameras never
         # delivered a frame so there is no file to keep either way.

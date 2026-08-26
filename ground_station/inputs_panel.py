@@ -1576,7 +1576,29 @@ class SessionView(QWidget):
 
         toast = status.get("toast")
         error = status.get("error")
-        if toast is not None:
+
+        # A RUNNING BUILD OUTRANKS THE TOAST, and that is the whole fix for
+        # "the processing only shows sometimes" (operator 2026-08-26).
+        #
+        # The chain below puts `toast` first, so the SAVED toast covered the
+        # strip for TOAST_S while the merge was already running underneath. On a
+        # long recording the build outlasted the toast and the operator saw
+        # PROCESSING; on a short one it finished first and they saw nothing at
+        # all - the same code, two different experiences, depending only on clip
+        # length. That is exactly what "only some time" describes.
+        #
+        # Progress is a STATE, a toast is a MESSAGE. When the two collide the
+        # state wins: the operator needs to know ffmpeg is still working far
+        # more than they need to be told again that the save they just made
+        # succeeded - and pulling the USB stick during that window is the
+        # failure this whole line exists to prevent.
+        #
+        # Only the IN-PROGRESS states mask it. "ready", "done" and "error" do
+        # not, so the SAVED / DISCARDED / MERGE FAILED toasts still show
+        # normally once there is nothing running to report.
+        fv_busy = ((status.get("full_view") or {}).get("state")
+                   in ("queued", "normalising", "building", "joining"))
+        if toast is not None and not fv_busy:
             text, extra = toast
             # DISCARDED gets the recording red, not amber - footage was deleted,
             # and that has to look different from a save that found nothing.
@@ -1651,7 +1673,7 @@ class SessionView(QWidget):
                 f"  ·  nothing deleted from Pi")
             recolour(self.detail, BAD, REC_DETAIL_PX, bold=True)
         elif ((status.get("full_view") or {}).get("state")
-              in ("queued", "normalising")):
+              in ("queued", "normalising", "joining")):
             # Same reason the BUILDING line exists: this runs after the save,
             # rewrites the per-camera masters in place, and on a long clip it
             # outlasts the SAVED toast. An idle strip here is what makes an

@@ -410,7 +410,20 @@ RECORD_MIN_FREE_MB = int(os.environ.get("RECORD_MIN_FREE_MB", "512"))
 # 15 -> 10 on operator spec 2026-08-19: the window only has to outlast the walk
 # from the panel back to the screen, and RECORD_SAVE_HOLD_S extends it while the
 # button is down, so a hold begun on the last second still lands.
-RECORD_CONFIRM_S = float(os.environ.get("RECORD_CONFIRM_S", "10"))
+# 0 = KEEP EVERYTHING AUTOMATICALLY, operator's instruction 2026-08-26: "its
+# auto save when stop recording, remove save button logic".
+#
+# At 0 the confirm window never opens: _stop_session keeps the run, toasts
+# SAVED and starts the merge immediately, and the GPIO25 press-and-hold is
+# never consulted. The button's other job - banking a clip mid-run - still
+# works, but with the join stage in recorder.py it no longer changes what
+# lands on the stick, only where the internal split points are.
+#
+# THIS IS A DELETING DECISION REVERSED. Any positive value restores the old
+# behaviour: a window of that many seconds after STOP in which footage is
+# DISCARDED unless claimed by a hold. That was in force earlier the same day;
+# it is off now because the operator asked for it, not because it was wrong.
+RECORD_CONFIRM_S = float(os.environ.get("RECORD_CONFIRM_S", "0"))
 
 # How long a run must last before stopping it is worth asking about. Operator's
 # instruction 2026-08-25: "when start recording and its more than 3 second and
