@@ -873,7 +873,31 @@ void setup() {
   // x MILLIS_SCALE because Timer0 is prescaled for D6's PWM - delay() counts in
   // the same 64x-fast milliseconds as everything else here. Without it this
   // would be a 16 ms pause, not a second.
-  delay(1000UL * MILLIS_SCALE);
+  // 3 s, RAISED FROM 1 s 2026-08-26 on a very specific report: the board fails
+  // to come up ONLY when both it and the Pi have been powered off for more than
+  // five minutes. A shorter outage always works, and so does unplugging and
+  // replugging power once after a failure.
+  //
+  // THAT IS A CAPACITOR-DISCHARGE SIGNATURE, not a logic fault. After a brief
+  // power-off the bulk capacitors are still part-charged and the 5 V rail snaps
+  // up; after five minutes they are flat and the rail crawls up through a
+  // regulator that is already burning (12-5) x 0.23 A of heat it cannot shed.
+  // The replug works for the same reason - the caps are charged from the failed
+  // attempt, so the second power-up is the fast one.
+  //
+  // A slow rail is exactly what the W5100's one-shot init cannot survive, so
+  // the single reset has to be aimed later still. 3 s is chosen to be longer
+  // than any plausible RC rise on this rail rather than tuned to it; it is paid
+  // once at boot and nothing is waiting on it.
+  //
+  // IT MAY NOT BE ENOUGH, AND THE REASON IS NOT SOFTWARE. If the AVR itself
+  // starts before Vcc is valid it can come up in an undefined state and never
+  // run this sketch at all - in which case no delay, retry or reset here can
+  // help, because none of them execute. The way to tell the two apart is to
+  // reproduce the failure and then read the serial banner: if it prints, the
+  // sketch is running and the shield is the problem; if the port is silent, the
+  // processor never started. Fix the rail either way.
+  delay(3000UL * MILLIS_SCALE);
 
   Ethernet.begin(mac, ip);
 
