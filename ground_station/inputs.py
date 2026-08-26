@@ -49,6 +49,7 @@ hardware bus broken for anything that runs later.
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
@@ -355,6 +356,28 @@ AXIS_TRAVEL_Y_NEG = float(os.environ.get("INPUTS_AXIS_TRAVEL_Y_NEG", "0.645"))
 # the wheels - and the dot was correct. The two are flipped together in this one
 # change so the display ends up exactly where it was; see the note at `ox` in
 # that file. If you ever flip one of them alone, check the other.
+# --- which stick axis is which -----------------------------------------------
+# SWAP_XY exchanges the two ADC channels' ROLES: A0 becomes forward/back and A1
+# becomes left/right, instead of the other way round.
+#
+# TRUE 2026-08-26. Operator: "my forward backward is left right and left right
+# is forward backward". That is a wiring fact, not a preference - the stick's
+# two pots are landed on the opposite ADC inputs to what this file assumed - and
+# it is exactly the kind of thing this layer exists to absorb. The alternative
+# is unplugging two wires at the panel, which is worse for the same result.
+#
+# APPLIED BEFORE INVERT_X / INVERT_Y ON PURPOSE, so those two keep meaning what
+# their names say from the OPERATOR's seat: INVERT_X flips left/right as the
+# hand experiences it, INVERT_Y flips forward/back. Swapping after them would
+# leave INVERT_X secretly controlling forward/back, which is exactly the sort of
+# trap that has cost this rig a day at a time.
+#
+# NOT APPLIED TO THE CALIBRATION. AXIS_TRAVEL_* and the centre learner still key
+# off the PHYSICAL channel (ch 0 / ch 1) inside _norm_axis, because those were
+# measured against real electrical travel and the wiring did not change - only
+# the label on it did.
+SWAP_XY = os.environ.get("INPUTS_SWAP_XY", "1") == "1"
+
 INVERT_X = os.environ.get("INPUTS_INVERT_X", "0") == "1"
 # Y FLIPPED TO 0 (2026-08-25). Operator: "my forward backward is interchange in
 # my frontend". The panel's forward/reverse arrows, the FRONT/BACK camera
@@ -793,10 +816,111 @@ POT_MEDIAN_S = float(os.environ.get("INPUTS_POT_MEDIAN_S", "0"))
 POT_GAMMA = float(os.environ.get("INPUTS_POT_GAMMA", "2.0"))
 POT_LINEARISE = os.environ.get("INPUTS_POT_LINEARISE", "1") == "1"
 
+# --- the measured taper, and why the power law above was never going to work --
+# MEASURED 2026-08-26, 16 separate bottom-to-top sweeps of the knob, median at
+# each 5% of travel. Time is the stand-in for shaft angle, which is why it took
+# SIXTEEN sweeps: any one hand speeds up and slows down, but the errors are
+# random and the median cancels them. The agreement is tight (inter-quartile
+# spread under 3.3 points) everywhere except the 70-80% knee, where the pot's
+# own steepness magnifies any speed wobble - that region is the least certain
+# part of this table and the first place to re-measure if the feel is off.
+#
+# WHAT IT SHOWS, and it is worse than "a log taper":
+#
+#     the first 70% of the knob covers 19% of the electrical range
+#     the last  30% of the knob covers 72%
+#
+# The operator's report was "after 50 its fast increase", and that is exactly
+# this: nothing happens for two thirds of the turn, then it arrives all at once.
+#
+# WHY NO EXPONENT FIXES IT. Fitted against the measured profile:
+#
+#     gamma 2.0 (what was here)   rms error 14.6 points
+#     gamma 2.55 (best possible)  rms error 11.9
+#     log curve, C=33 (best)      rms error  8.2
+#     this table                  rms error  0.0
+#
+# A power law is the wrong SHAPE - it cannot bend the way this pot bends - and
+# the best gamma available is only 2.7 points better than the one already set.
+# That is why POT_GAMMA was retuned twice and still felt wrong: the knob was
+# never going to be fixed by choosing a better exponent.
+#
+# A TABLE HAS NO SHAPE OF ITS OWN, which is the whole point: it follows whatever
+# the pot actually does, including the knee, and it is re-measurable in one
+# sweep if the pot is ever replaced.
+#
+# STILL A MITIGATION, NOT A REPAIR. This straightens the READING; it cannot
+# invent resolution the pot never encoded. Below the knee the whole bottom two
+# thirds of the turn is squeezed into ~3300 counts, so it stays coarse - it just
+# stops pretending otherwise. A LINEAR pot needs none of this: fit one, set
+# INPUTS_POT_CURVE=none, and delete the table.
+POT_LUT_DEFAULT = ("158,348,570,802,980,1171,1372,1624,1874,2135,2372,"
+                   "2595,2806,3066,3322,3917,5287,8181,11010,13168,16110")
+try:
+    POT_LUT = [float(x) for x in
+               os.environ.get("INPUTS_POT_LUT", POT_LUT_DEFAULT).split(",")
+               if x.strip()]
+except ValueError:
+    POT_LUT = []
+
+# Which correction to apply:
+#   lut    the measured table above                            [default]
+#   log    100*ln(1+C*r)/ln(1+C), C = INPUTS_POT_LOG_C - a smooth
+#          approximation, worse than the table but immune to a bad measurement
+#   gamma  the old power law, POT_GAMMA
+#   none   raw proportion, for a LINEAR pot
+POT_CURVE = os.environ.get("INPUTS_POT_CURVE", "lut").strip().lower()
+POT_LOG_C = float(os.environ.get("INPUTS_POT_LOG_C", "33"))
+
+
+def _lut_pct(raw):
+    """Counts -> knob position 0..100, interpolating the measured table.
+
+    The table is raw counts at evenly spaced knob positions, so this is its
+    INVERSE: find which pair of breakpoints the reading falls between and
+    report where it sits across that step. Linear inside a step, because 5% of
+    travel is finer than anything the operator can feel or the lamp can show.
+    """
+    n = len(POT_LUT)
+    if n < 2:
+        return None
+    step = 100.0 / (n - 1)
+    if raw <= POT_LUT[0]:
+        # Below the first breakpoint the table says nothing, so fall back to a
+        # straight line into zero rather than clamping - the sub-LSB floor in
+        # _pot_pct has already decided what counts as "off".
+        return 0.0 if POT_LUT[0] <= 0 else max(0.0, step * raw / POT_LUT[0])
+    if raw >= POT_LUT[-1]:
+        return 100.0
+    for i in range(n - 1):
+        a, b = POT_LUT[i], POT_LUT[i + 1]
+        if a <= raw <= b:
+            return step * (i + (0.0 if b == a else (raw - a) / (b - a)))
+    return 100.0
+
 
 def _linearise_pot(pct):
-    """Straighten the log taper. See POT_GAMMA."""
-    if not POT_LINEARISE or pct is None or POT_GAMMA <= 1.0:
+    """Straighten the taper. See POT_LUT_DEFAULT for what is being straightened.
+
+    Takes and returns a PERCENTAGE, so `pct` arrives as the raw proportion of
+    full scale and leaves as the knob's position. The conversion back to counts
+    for the table is exact - both are the same number in different units.
+    """
+    if pct is None:
+        return pct
+    if POT_CURVE == "none":
+        return pct
+    if pct <= 0.0:
+        return 0.0
+    if pct >= 100.0:
+        return 100.0
+    if POT_CURVE == "lut":
+        out = _lut_pct(pct / 100.0 * FULL_SCALE)
+        if out is not None:
+            return out
+    if POT_CURVE == "log" and POT_LOG_C > 0:
+        return 100.0 * math.log1p(POT_LOG_C * pct / 100.0) / math.log1p(POT_LOG_C)
+    if not POT_LINEARISE or POT_GAMMA <= 1.0:
         return pct
     if pct <= 0.0:
         return 0.0
@@ -2150,6 +2274,18 @@ class InputReader(threading.Thread):
 
         x_norm = self._norm_axis(0, x_raw)
         y_norm = self._norm_axis(1, y_raw)
+        # The stick's pots are landed on the opposite ADC inputs to what the
+        # channel numbering assumes - see SWAP_XY. Swapped HERE, after
+        # _norm_axis has applied each channel's own measured travel and before
+        # the inversions below, so the calibration stays with the wire and the
+        # INVERT_* flags stay meaningful to the operator.
+        #
+        # The RAW pair is swapped with it. Nothing downstream computes from
+        # these, but the panel dot and motor_cam.log both print them, and a log
+        # whose x_raw belongs to the y axis is worse than no log at all.
+        if SWAP_XY:
+            x_norm, y_norm = y_norm, x_norm
+            x_raw, y_raw = y_raw, x_raw
         # Orientation applied AFTER normalisation, so the centre learner and
         # every validation gate reason about raw electrical travel and only
         # the demand the motors see is flipped. See INVERT_X / INVERT_Y.
@@ -2170,7 +2306,17 @@ class InputReader(threading.Thread):
         _pct = self._pot_pct(pot_raw) if pot_raw is not None else None
         analog["pot"] = (
             {"pct": _pct, "pct_view": self._pot_view_pct(_pct),
-             "raw": pot_raw, "volts": pot_raw / COUNTS_PER_VOLT}
+             # INTEGER COUNTS, and this is not cosmetic. _pot_kalman publishes a
+             # FRACTIONAL estimate - that is the whole point of it - and _pct
+             # above keeps using that full precision. But "raw" is an ADC count
+             # and every consumer formats it as one: main.py's correlation log
+             # uses "{v:5d}", which raises ValueError on a float. That
+             # exception was swallowed by log_correlation's own "never allowed
+             # to raise" try/except, so motor_cam.log simply STOPPED on
+             # 2026-08-25 20:40 - the same minute the Kalman went live - and
+             # nothing said why. Round here, at the producer, so the published
+             # contract matches what it has always been.
+             "raw": int(round(pot_raw)), "volts": pot_raw / COUNTS_PER_VOLT}
             if pot_raw is not None else
             {"pct": None, "pct_view": None, "raw": None, "volts": None})
         # TEMPORARY joystick capture, 2026-08-25 - remove with this comment.

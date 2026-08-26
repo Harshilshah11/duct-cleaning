@@ -1037,7 +1037,12 @@ class GroundStationWindow(QWidget):
             # unrelated values is a hand. Diagnosing the phantom demand of
             # 2026-08-17 needed exactly this and had to infer it from the wire.
             def _c(v):
-                return "----" if v is None else f"{v:5d}"
+                # int(round()) rather than trusting the producer: this
+                # formatter is integer-only, and the one time a float reached
+                # it the whole correlation log went silent for a night behind
+                # the try/except below. Instrumentation that can disable itself
+                # on a type change is worse than instrumentation that rounds.
+                return "----" if v is None else f"{int(round(v)):5d}"
             parts.append(f"raw=x{_c(joy.get('x_raw'))},y{_c(joy.get('y_raw'))}"
                          f",p{_c(pot.get('raw'))}")
             parts.append(f"adc={snap.get('adc_hz') or 0:.1f}Hz")

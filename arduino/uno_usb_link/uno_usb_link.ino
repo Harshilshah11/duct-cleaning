@@ -1,5 +1,5 @@
 /*
- * uno_eth_link — Arduino Uno + W5100/W5500 Ethernet shield, driving a dual
+ * uno_usb_link — Arduino Uno over the USB tether, driving a dual
  * channel motor driver from ground station joystick data (guide Steps 8-9).
  *
  *   Pi -> Uno  "CMD <seq> M <l> <r>\n"                        wheels only
@@ -50,7 +50,8 @@
  * this job only because the actuator stopped needing a speed demand in the same
  * change; before that, one pot could not serve both.
  *
- * The ACK goes to udp.remoteIP()/remotePort(), NOT to a hardcoded Pi address:
+ * The ACK goes back up the same USB port the command arrived on - there is
+ * only one peer on a tether, so there is nothing to address:
  * the Pi's sending socket is on an ephemeral port, so a fixed reply port would
  * land nowhere. This also means any machine on the LAN can test the link.
  *
@@ -137,20 +138,81 @@
  * Build: Arduino IDE, board "Arduino Uno", stock Ethernet library.
  */
 
-#include <SPI.h>
-#include <Ethernet.h>
-#include <EthernetUdp.h>
-
-// --- Network (address plan from ground_station/config.py) --------------------
-byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x20};
-IPAddress ip(192, 168, 50, 20);
-const uint16_t LISTEN_PORT = 5005;
+// NO NETWORK INCLUDES. This is the USB-tether twin of uno_eth_link: same pins,
+// same driver logic, same failsafe, same command grammar - only the wire is
+// different. Ported 2026-08-26 because the Ethernet link was flapping (17 carrier
+// transitions in 9 minutes) and the shield was unreachable, while USB enumerated
+// clean. Everything below the transport is BYTE-IDENTICAL to uno_eth_link.ino by
+// construction; if you fix a driver bug there, port it here and vice versa.
+//
+// BAUD IS 250000, AND IT MUST EQUAL uno_serial.py's UNO_BAUD ON THE PI. This
+// port carries commands AND ACKs, so the two ends are one link: mismatch them
+// and every byte arrives as framing garbage, which presents as "sent 50 /
+// acked 0" - indistinguishable from a board running the wrong sketch.
+//
+// 250000 RATHER THAN A ROUNDER-LOOKING 115200, and the reason is the AVR's baud
+// generator, not fashion. At 16 MHz with U2X the divisor is exact:
+//
+//     250000 -> UBRR=7   actual 250000.0   error  0.00%
+//     115200 -> UBRR=16  actual 117647.1   error +2.12%
+//
+// 2.12% is inside the ~4% a UART tolerates, so 115200 works - but it works with
+// no margin to spare, and margin is what absorbs a long cable and a warm clock.
+// 250000 is both FASTER and EXACT, which is the rare case where the quicker
+// option is also the safer one.
+//
+// Raising it further is not free: 500000 is also exact (UBRR=3), but the Uno's
+// 64-byte RX buffer then fills in 1.3 ms and this sketch pauses 5 ms per loop.
+// 250000 fills it in 2.6 ms against the same pause and still has headroom
+// because the Pi only sends ~30 bytes every 20 ms. Do not go up without
+// shortening the pause in loop() to match.
+const unsigned long SERIAL_BAUD = 250000;
 
 // --- Motor driver pins (see the pin-map note above before changing) ----------
 const uint8_t DIR1 = 9;    // channel 1 direction (LEFT)
-const uint8_t PWM1 = 3;    // channel 1 speed, Timer2  (~490 Hz)
+const uint8_t PWM1 = 3;    // channel 1 speed, Timer2 OC2B - 62.5 kHz, see PWM_FAST
 const uint8_t DIR2 = 8;    // channel 2 direction (RIGHT)
-const uint8_t PWM2 = 6;    // channel 2 speed, Timer0  (~980 Hz, see pin note)
+const uint8_t PWM2 = 6;    // channel 2 speed, Timer0 OC0A - BACK ON D6 2026-08-26, operator's instruction
+//
+// BOTH WHEEL PWMs ARE ON TIMER2, and that is the point of the D11 choice, not a
+// coincidence to be tidied away. D3 is OC2B and D11 is OC2A - two compare
+// outputs of the SAME timer - so they share one prescaler and one waveform
+// mode and cannot drift to different frequencies. The old map had D3 on Timer2
+// and D6 on Timer0, which meant two prescalers to keep in step; the pin note
+// below warns that channels on different frequencies answer the same demand
+// differently and read as a mechanical fault - a pull to one side on a straight
+// run. That is now structurally impossible rather than merely configured away.
+//
+// D11 IS NOT A TIMER0 PIN. If a comment, a note or a wiring diagram says it is,
+// that is stale: Timer0's PWM pins are D5 and D6 only, and nothing here uses
+// Timer0 for PWM any more - which is exactly why MILLIS_SCALE is back to 1.
+//
+// D6 -> D11, on the operator's instruction, after D6 was eliminated as a
+// software fault. What was ruled out first, so nobody re-checks it:
+//
+//   the Pi sends both wheels the same demand   logged "L=+77 R=+77"
+//   the pin map matched the working Ethernet build  DIR2=8, PWM2=6
+//   applyMotor() drives both channels identically
+//   PWM frequency - dead at 62.5 kHz AND at the core's stock rate
+//
+// Everything upstream of the pin was proven good and the channel was still
+// dead, which leaves the pin, its wiring or its driver. D6 is also one of the
+// two Timer0 PWM pins, and the light on the OTHER Timer0 pin (D5) was dead at
+// the same time - two adjacent pins on one timer failing together.
+//
+// WHY D11 AND NOT D10, the only other free PWM pin: D11 is on TIMER2, the same
+// timer as D3, which is the left wheel and the one channel that never stopped
+// working. The two wheels now share a timer, so they run at the same frequency
+// BY CONSTRUCTION rather than by keeping two prescaler settings in step. The
+// pin note warns that mismatched channel frequencies read as a mechanical
+// fault - a pull to one side on a straight run - and that class of bug is now
+// impossible here. D10 is Timer1: a third timer at a third rate, keeping the
+// problem alive for no gain.
+//
+// REQUIRES ONE WIRE MOVED: the right driver's PWM input from D6 to D11. DIR2
+// stays on D8. If the channel is STILL dead after that, the pin was never the
+// fault - it is the driver or its wiring, and the Uno's own 5V rail is the next
+// suspect given it dropped off USB five times the same afternoon.
 
 // --- Linear actuator: DIR + PWM, DIR on D7 (pinout corrected 2026-08-15) -----
 // Direction comes from the ground station's 3-position actuator switch
@@ -252,11 +314,16 @@ const int ACT_DUTY_EXTEND = 255;
 // and the brush would have jumped from 250 Hz to 16 kHz, far faster than
 // loop() can service, and the duty would have collapsed into noise.
 //
-// MILLIS_SCALE is declared further down with the failsafe, so the factor is
-// spelled out here rather than referenced - keep the two in step.
+// x64 IS BACK, because Timer0 is prescaled again and micros() counts 64x fast
+// with it. 4000 us * 64 = 250 Hz real, which is what the rod, the brush and the
+// lamp were all tuned for.
 //
-// 4000 us * 64 = 250 Hz real, which is what both mechanisms were tuned for.
+// THIS BIT US ONCE ALREADY: when D6 stopped being a wheel the prescaler went
+// away and this factor did not, which left every soft-PWM channel running at
+// ~4 Hz. The rod and the brush hid it behind their inertia; the LAMP flickered
+// visibly. See MILLIS_SCALE - the two are the same setting.
 const unsigned long ACT_PWM_PERIOD_US = 4000UL * 64UL;
+
 
 // The duty currently demanded on D4, 0..255. Written by applyActuator(), acted
 // on by serviceActuatorPwm() every pass of loop().
@@ -277,8 +344,48 @@ const bool INVERT_ACT = false;
 // Uno (A0 == D14) and is what makes this fit at all: every real digital pin is
 // spoken for. It carries the driver channel's direction line, which a lamp does
 // not actually need — see applyLight().
+// ---------------------------------------------------------------------------
+// PIN MAP vs THE ETHERNET SHIELD - READ BEFORE GOING BACK TO uno_eth_link.ino
+//
+// This USB build now uses D11 (right wheel PWM) and D12 (lamp return leg).
+// BOTH BELONG TO THE SPI BUS the W5100/W5500 shield runs on:
+//
+//     D10  shield chip select        D12  MISO
+//     D11  MOSI                      D13  SCK   (also STATUS_LED here)
+//     D4   SD-card chip select on shields with a card slot
+//
+// So this pin map and the Ethernet shield CANNOT COEXIST. On the USB tether
+// that costs nothing - there is no shield in the stack and those pins are just
+// ordinary I/O. But if the Ethernet build is ever flashed again, the wheel and
+// the lamp have to move back off D11/D12 first, or the shield and the motors
+// will fight over the same three wires and neither will work.
+//
+// That is not hypothetical: D4 already carries this warning in the actuator's
+// note above, and it cost this rig a day when the SD chip-select and the rod's
+// gate turned out to be the same pin.
+// ---------------------------------------------------------------------------
 const uint8_t LIGHT_DIR = A0;
-const uint8_t LIGHT_PWM = 5;   // Timer0 (~980 Hz) — same 0-duty caveat as D6
+// THE LAMP'S PWM, set to D5 on the operator's pin map 2026-08-26.
+//
+// D5 is Timer0 OC0B, and Timer0 is ALREADY at prescaler 1 for D6's wheel PWM -
+// so this pin gets 62.5 kHz with no extra setup, the same way D6 does. The two
+// share a timer: do not un-prescale Timer0 while either lives here, or both the
+// wheel and the lamp change frequency together. See MILLIS_SCALE.
+//
+// HISTORY, because this pin has been contested all day and the record is worth
+// more than the current value:
+//
+//   A0 / D12   software-chopped from loop(). Smooth at 255, fluctuating at every
+//              other level - a polled chopper mistimes both edges of a partial
+//              duty, and 255 is the one level that has no edges.
+//   D5         tried, reported dead.
+//   D10 / D11  both driven at once to test in one flash; D10 reported working.
+//   D5         set again here, per the operator's map.
+//
+// IF IT IS DARK AGAIN, D5 is the pin to suspect first - it and D6 are Timer0's
+// only two PWM outputs and both have been reported dead at least once today.
+// D10 and D11 are free and both are on healthy timers.
+const uint8_t LIGHT_PWM = 5;   // Timer0 OC0B - hardware PWM, 62.5 kHz
 
 // --- Brush motor: DIR + PWM on a driver channel (rewired 2026-08-14) ---------
 // Driven from the panel's TOGGLE switch (Pi GPIO13).
@@ -333,6 +440,7 @@ const bool BRUSH_ACTIVE_HIGH = true;
 // invisible, exactly as it does for the rod.
 int brushDuty = 0;
 
+
 // The smallest duty that actually TURNS the brush rather than buzzing it, the
 // same physics as MIN_DUTY on the wheels. Any non-zero demand is stretched
 // onto BRUSH_MIN_DUTY..255 so the bottom of the knob's travel is already a
@@ -344,16 +452,16 @@ const int BRUSH_MIN_DUTY = 90;
 // feeds BOTH this link and uno_serial.py, so a sign flip there would silently
 // desync the two transports.
 const bool INVERT_1 = false;
-// TRUE, synced from uno_usb_link 2026-08-26. The right wheel ran BACKWARDS on
-// the rig once its channel started working again - a motor-lead polarity, not
-// a code fault, and the same on this build because it is the same motor and
-// the same driver. The USB twin has carried this since it was found; this one
-// had not been flashed since, so it still had the old value.
+// TRUE 2026-08-26: the right wheel came back on D11 but ran BACKWARDS - it
+// drove reverse while the left drove forward on the same demand. That is a
+// motor-lead polarity, not a code fault: the channel was dead until this
+// afternoon, so nothing had ever established which way round its leads were.
 //
-// KEEP THE TWO SKETCHES IN STEP. They share every pin and every driver; only
-// the transport differs. A fix found on one is a fix owed to the other, and a
-// wheel that reverses when you change transport is exactly the kind of bug
-// that costs an afternoon.
+// Flipped HERE rather than by swapping the two motor leads, because the leads
+// are the harder thing to get at and this is the constant that exists for it.
+// If the leads are ever re-terminated, set this back to false rather than
+// stacking a second inversion on top - the two cancel and the wheel silently
+// goes backwards again.
 const bool INVERT_2 = true;
 
 // --- Failsafe ----------------------------------------------------------------
@@ -372,7 +480,50 @@ const bool INVERT_2 = true;
 // not drive.
 //
 // If Timer0 is ever put back to its stock prescaler, set this to 1.
-const unsigned long MILLIS_SCALE = 64;
+// PWM_FAST — do the wheel pins run at 62.5 kHz, or at the core's stock rates?
+//
+// TRUE was the 2026-08-24 setting: both wheel timers to prescaler 1, giving
+// 62.5 kHz on D3 and D6. FALSE leaves the Arduino core alone: D3 at ~490 Hz
+// (Timer2, phase-correct) and D6 at ~980 Hz (Timer0, fast).
+//
+// SET FALSE 2026-08-26 TO TEST A DEAD RIGHT CHANNEL. The right wheels stopped
+// responding entirely while the left ran normally, on identical demands - the
+// Pi logs "L=+77 R=+77" and only one side turns. 62.5 kHz is above what many
+// driver modules can switch: an L298N and most of its clones give up somewhere
+// between 20 and 40 kHz, and a driver that cannot follow its gate signal reads
+// as a dead channel, not as a slow one. If the two sides use different driver
+// modules - which nothing in this sketch knows - the faster setting can kill
+// one and not the other.
+//
+// If the right side comes back with this false, the frequency was the fault and
+// the fix is to pick a rate BOTH drivers can switch, not to go back to 62.5.
+// If it stays dead, the fault is downstream of the Uno - wiring, driver or
+// motor - and this should go back to true.
+// TESTED FALSE 2026-08-26 AND IT WAS NOT THE FAULT: the right channel stayed
+// dead at the core's stock 490/980 Hz too, so the driver was never failing to
+// switch a 62.5 kHz gate. Back to true - the fast rate is inaudible and buys a
+// smoother drive, and there is no reason to keep a whinier one that fixed
+// nothing. Whatever is wrong with the right channel is DOWNSTREAM of this chip.
+const bool PWM_FAST = true;
+
+// SCALED BY THE PRESCALER, and it MUST track PWM_FAST. With Timer0 at prescaler
+// 1 the core's millis() runs 64x fast, so every duration this sketch measures
+// is multiplied to compensate. Leave this at 64 with PWM_FAST false and the
+// 300 ms failsafe becomes 19 SECONDS - a robot that keeps driving for nineteen
+// seconds after the link dies. That is why it is derived here rather than
+// written as a number.
+// 64 AGAIN, because Timer0 is back at prescaler 1 for D6's PWM and that makes
+// the core's millis() tick 64x fast. Every duration in this sketch is written
+// as `X * MILLIS_SCALE` so they all follow this one number.
+//
+// GET THIS WRONG AND THE FAILSAFE STOPS MEANING 300 ms. At 1 with a prescaled
+// Timer0 it becomes 4.7 ms and the wheels stutter; at 64 with a stock Timer0 it
+// becomes 19 SECONDS of a robot still driving after the link has died. It has
+// been both today.
+//
+// ONE SETTING IN THREE PLACES: this, ACT_PWM_PERIOD_US, and the TCCR0B line in
+// setup(). Change one, change all three.
+const unsigned long MILLIS_SCALE = 64UL;
 
 // 300 ms REAL: long enough to ride out a handful of dropped datagrams at the
 // 50 Hz command rate, short enough that the robot stops within a third of a
@@ -411,57 +562,14 @@ const int MIN_DUTY = 90;
 const uint16_t RX_BUFFER = 96;
 char packet[RX_BUFFER];
 
-EthernetUDP udp;
+// The UDP socket's replacement: a line assembler over the USB CDC port. The
+// W5x00 handed us whole datagrams with their own boundaries; a serial stream has
+// none, so the newline in "CMD <seq> ...\n" becomes the frame marker and this
+// buffer holds the partial line between passes.
+uint16_t rxLen = 0;
+bool rxOverflow = false;
 
 unsigned long lastPacketMs = 0;
-
-// --- the shield re-init, and the fault it exists for -------------------------
-// SYMPTOM 2026-08-26: on barrel-jack power alone the board never answers on
-// Ethernet; plug USB in and it works; REMOVE USB again and it KEEPS working.
-// That last part is the tell - a cable, a subnet or a firmware fault would
-// break again the moment USB came out.
-//
-// CAUSE: the W5100's reset is not reliably asserted on a slow power ramp. From
-// cold, the regulator brings 5 V up over milliseconds, Ethernet.begin() in
-// setup() runs against a chip still in reset, and the shield is left
-// uninitialised - deaf, with a perfectly good cable. Plugging USB pulls DTR,
-// which RESETS THE AVR; setup() runs again against a shield that is now fully
-// powered, and it comes up. Nothing about USB matters except that it happens to
-// reset the processor.
-//
-// FIX: provide that second reset ourselves instead of needing a human with a
-// cable. If nothing has arrived over UDP for this long, re-run Ethernet.begin()
-// and reopen the socket. On a healthy link this NEVER fires - the Pi sends at
-// SEND_HZ and the counter is refreshed constantly - so it is free when not
-// needed.
-//
-// 5 s: long enough that a brief carrier drop does not thrash the chip (re-init
-// leaves it deaf for ~60 ms), short enough that a cold start is driving within
-// a few seconds of power-up.
-const unsigned long ETH_REINIT_MS = 5000UL * MILLIS_SCALE;
-
-
-// --- is the USB port allowed to DRIVE the robot? -----------------------------
-// FALSE on the operator's instruction 2026-08-26: "data transfer only via
-// ethernet". USB is a FLASHING CABLE on this rig, nothing more.
-//
-// The Pi already agrees - UNO_TRANSPORT is pinned to "udp" in uno_motors.py -
-// so this is the board saying the same thing. Both ends stating one data path
-// is worth more than either end assuming it: with the serial parser live, a
-// bench script or a stray terminal could drive the wheels over a cable that was
-// only plugged in to reflash, and nothing would report it as unusual.
-//
-// WHAT STAYS: Serial itself is untouched. The boot banner still prints, the
-// board is still flashed over USB, and a serial monitor still shows what it
-// always did. Only the COMMAND parser on that port is switched off.
-//
-// WHAT YOU LOSE: the second wire. Until 2026-08-26 this build accepted commands
-// from either transport and a dead Ethernet link simply failed over to USB. That
-// redundancy is now off by choice - set this true to get it back, and the Pi's
-// UNO_TRANSPORT=auto with it.
-const bool SERIAL_COMMANDS = false;
-unsigned long lastUdpMs = 0;
-unsigned long lastEthTryMs = 0;
 bool linkUp = false;
 uint16_t lastSeq = 0;
 unsigned long packetsReceived = 0;
@@ -482,6 +590,32 @@ int printedA = 0;
 int printedB = 0;
 int printedLight = 0;
 unsigned long lastPrintMs = 0;
+
+// Bench telemetry on/off. OFF by default since 2026-08-26.
+//
+// WHY IT HAD TO GO: the telemetry line is about 65 characters, and the Uno's
+// serial TRANSMIT buffer is 64 bytes. One byte over, and Serial.print() stops
+// being a queue and becomes a BLOCKING wait - roughly 2 ms at 250000 baud while
+// the line drains. loop() is stopped dead for that whole time, and with it the
+// software choppers that drive the lamp, the rod and the brush.
+//
+// The lamp is the one that shows it. Its on-window at low brightness is ~150 us,
+// so a 2 ms freeze is more than ten whole cycles held at whatever level the pin
+// happened to be on - a visible flash or dropout, repeating every 200 ms while
+// the knob is moving. At FULL brightness the pin is held high anyway and the
+// freeze is invisible, which is exactly the reported symptom: "very fluctuate in
+// low pwm, complete work on full pwm".
+//
+// The rod and the brush have inertia and hide it. A lamp does not.
+//
+// NOTHING NEEDS THIS TO RUN. The Pi already logs L/R/act/brush/light every
+// second in motor_cam.log, from the demand it SENT, and reads the link's health
+// from ACKs - which are only ~10 bytes and never fill the buffer. This print was
+// a bench aid from before that logging existed.
+//
+// Set true to get it back when debugging on a serial monitor, and expect the
+// lamp to flicker while it is on.
+const bool TELEMETRY = false;
 
 const uint8_t STATUS_LED = LED_BUILTIN;
 
@@ -647,36 +781,46 @@ void applyLight(int level) {
   if (level < 0) level = 0;
   if (level > MAX_PWM) level = MAX_PWM;
 
-  // LIGHT_DIR IS THE RETURN LEG. IT STAYS LOW. ALWAYS.
+  // HARDWARE PWM ON D5. Moved here 2026-08-26 with the operator's approval, and
+  // it is the fix rather than another tuning of one.
   //
-  // This channel is a TWO-LEG BRIDGE, not a direction line plus a gate, and the
-  // lamp sees the DIFFERENCE between its two legs. That was settled on the rig
-  // 2026-08-26 by three observations, not by reading the driver's part number:
+  // WHAT WAS WRONG WITH THE SOFTWARE CHOPPER, because the symptom named it
+  // exactly: "255 does not fluctuate, 0-250 does". A polled chopper only moves
+  // the pin when loop() gets round to calling it, so every partial duty has two
+  // edges per cycle and each lands late by however long loop() was busy
+  // elsewhere. Varying on-time IS varying brightness. At 255 the pin is simply
+  // HELD HIGH - zero edges, nothing to mistime - which is why that one value was
+  // always rock steady. No period could fix that; changing it only made the
+  // fixed timing error a smaller fraction of a longer window.
   //
-  //     DIR=HIGH PWM=0      lamp ON     <- "light is on in bot", knob at zero
-  //     DIR=LOW  PWM=0      lamp OFF    <- correct
-  //     DIR=HIGH PWM=level  lamp OFF    <- "when i turn pot light not on"
+  // A TIMER HAS NO SUCH PROBLEM. OC0B toggles D5 in silicon on exact clock
+  // counts, and nothing loop() does can disturb it.
   //
-  // The third line is the one that names the fault. With DIR pinned high,
-  // brightness went as (MAX_PWM - level): the knob ran BACKWARDS, full off at
-  // full demand, and the lamp was brightest at zero. Holding DIR low instead
-  // makes brightness simply follow the PWM leg, which is what everything
-  // upstream - the pot table, light_demand(), the panel readout - already
-  // assumes.
+  // 62.5 kHz FOR FREE: D5 is Timer0, which is ALREADY at prescaler 1 for D6's
+  // wheel PWM, so this pin inherits the same 62.5 kHz with no extra setup. The
+  // two are one setting - see MILLIS_SCALE, and do not un-prescale Timer0 while
+  // the lamp lives here.
   //
-  // THE LEGS CANNOT BE SWAPPED, so do not try it as a fix: LIGHT_DIR is A0,
-  // which has no timer behind it and cannot carry a PWM at all. The static leg
-  // has to be that one, which means it has to be the LOW one.
+  // A0 IS THE RETURN LEG and is simply held at ground. D12 is no longer used by
+  // the lamp at all.
   digitalWrite(LIGHT_DIR, LOW);
 
-  if (level == 0) {
-    // D5 is a Timer0 pin, so analogWrite(pin, 0) can still emit a narrow pulse
-    // every period. On a motor that is a creep; on a lamp it is a faint glow
-    // that will not go out. digitalWrite is the only certain dark.
+  if (level <= 0) {
+    // NOT analogWrite(pin, 0): a zero duty can still emit a narrow pulse every
+    // period, which on a lamp is a faint glow that will not go out.
+    // digitalWrite is the only certain dark.
     digitalWrite(LIGHT_PWM, LOW);
+  } else if (level >= MAX_PWM) {
+    digitalWrite(LIGHT_PWM, HIGH);
   } else {
     analogWrite(LIGHT_PWM, level);
   }
+}
+
+/* The lamp no longer needs software chopping - D5 is a timer pin and OC0B does
+ * it in hardware. Kept as an empty function so the two call sites in loop() stay
+ * valid; the compiler removes it. Delete both calls if you ever tidy loop(). */
+void serviceLightPwm() {
 }
 
 /* Both motors to neutral. Runs on every failsafe trip, so it is unconditional
@@ -733,34 +877,10 @@ void mixJoystick(int x, int y, int *left, int *right) {
 }
 
 void setup() {
-  // 250000 on the operator's order 2026-08-26, up from 9600 - match the serial
-  // monitor to this or the log reads as garbage. ONE RATE ACROSS THE PROJECT
-  // was the instruction, and this line is what makes that true: the Pi, the USB
-  // sketch and this console now all read 250000, so there is no second number
-  // to remember or to get wrong at 2am.
-  //
-  // BE CLEAR WHY THIS ONE WAS FREE TO CHANGE, because the rule is not the same
-  // on both builds. Here the port is a CONSOLE: commands arrive over UDP and
-  // ACKs leave the same way, so nothing on the other end has to agree with it
-  // and picking a number is a preference. On the USB twin the SAME port carries
-  // the commands, so its rate and the Pi's UNO_BAUD are one setting in two
-  // files - change one, reflash the other, or the link is dead rather than
-  // slow. Uniformity here is convenience; there it is a hard constraint.
-  //
-  // 250000 is also the EXACT rate for a 16 MHz AVR - UBRR=7 with U2X divides
-  // evenly, where 115200 lands on 117647 (+2.12%) and spends half a UART's
-  // error budget standing still. Nothing on a console depends on that, but
-  // there is no reason to take the worse number when they cost the same.
-  //
-  // It buys headroom rather than speed: the telemetry block at the bottom of
-  // loop() prints on every change, rate-limited to 200 ms, and at 9600 a long
-  // line took ~90 ms of that budget. At 250000 it takes under 4 ms, so the
-  // print can no longer sit in the way of a command being serviced.
-  //
-  // YOUR SERIAL MONITOR MUST SUPPORT 250000 or the banner reads as garbage -
-  // the Arduino IDE offers it, `screen /dev/ttyACM0 250000` takes it, and some
-  // older terminal programs stop at 115200.
-  Serial.begin(250000);
+  // 250000, NOT the Ethernet sketch's console rate: this port is the command
+  // and ACK channel and must match uno_serial.py's UNO_BAUD on the Pi exactly.
+  // See SERIAL_BAUD above for why 250000 and not 115200.
+  Serial.begin(SERIAL_BAUD);
 
   // Outputs are driven to a stopped state BEFORE they become outputs, so the
   // pins cannot glitch high in the gap between pinMode and the first write.
@@ -774,6 +894,10 @@ void setup() {
   // RETRACT drive, and that park is why the rod ran from reset forever.
   digitalWrite(ACT_DIR, ACT_LEVEL_EXTEND);
   digitalWrite(ACT_PWM, LOW);
+  // BOTH LOW = dark at this polarity (no differential), and this runs before
+  // pinMode so the lamp cannot flash during the gap. Do NOT "tidy" these to
+  // match applyLight's A0-HIGH/D5-HIGH off state: A0 HIGH with D5 still an
+  // input would light the lamp through the pull-up for that instant.
   digitalWrite(LIGHT_DIR, LOW);
   digitalWrite(LIGHT_PWM, LOW);
   // The brush's OFF level is written BEFORE pinMode, and on an active-LOW
@@ -813,8 +937,21 @@ void setup() {
   // Matching matters - the pin note warns that channels on different
   // frequencies respond differently to the same demand and read as a
   // mechanical fault, which is a pull to one side on a straight run.
-  TCCR2A |= _BV(WGM21);
-  TCCR2B = (TCCR2B & 0b11111000) | 0b001;
+  if (PWM_FAST) {
+    TCCR2A |= _BV(WGM21);
+    TCCR2B = (TCCR2B & 0b11111000) | 0b001;
+
+    // TIMER1 left configured for 8-bit fast PWM at prescaler 1. The lamp is on
+    // D5 (Timer0) now, so nothing uses this - it is harmless, and it means D10
+    // or D9 are ready to carry the lamp at 62.5 kHz if D5 fails again.
+    // The core leaves Timer1 in 8-bit PHASE-CORRECT at prescaler 64, which is
+    // 490 Hz - fine for a servo, useless as a fair comparison against D11.
+    //   16 MHz / 256 counts / 1 = 62500 Hz
+    // Timer1 drives nothing else here: D9 is a direction line, so no other
+    // channel notices this.
+    TCCR1A = _BV(WGM10);                    // 8-bit fast PWM, low bits
+    TCCR1B = _BV(WGM12) | _BV(CS10);        // ... high bit, prescaler 1
+  }
 
   // Timer0: D6
   // Prescaler = 1 -> about 62.5 kHz
@@ -824,7 +961,17 @@ void setup() {
   // internal timeouts, any future delay()) is NOT compensated and will be 64x
   // short. There are no delay() calls in this sketch today, and the link runs
   // on a static IP so nothing here waits on a DHCP timeout.
-  TCCR0B = (TCCR0B & 0b11111000) | 0b001;
+  if (PWM_FAST) {
+    // TIMER0 BACK TO PRESCALER 1, because D6 is a wheel again and has to match
+    // D3's 62.5 kHz. Two wheels on different PWM frequencies answer the same
+    // demand differently and read as a mechanical fault - a pull to one side on
+    // a straight run - which is why this is not optional.
+    //
+    // THE PRICE IS A 64x FAST millis(). MILLIS_SCALE below compensates every
+    // duration this sketch measures; ACT_PWM_PERIOD_US carries the same factor.
+    // All three move together or none of them do.
+    TCCR0B = (TCCR0B & 0b11111000) | 0b001;
+  }
 
   // NOTE: STATUS_LED is LED_BUILTIN = D13, which is also the SPI clock the
   // shield uses. With the shield fitted this lamp tracks Ethernet traffic
@@ -845,76 +992,16 @@ void setup() {
   // gone; safeState() above has already left D4 LOW. See the ACT_DIR/ACT_PWM
   // block.
 
-  // Static IP — no DHCP. Ethernet.begin(mac, ip) cannot fail or block, unlike
+  // NO ADDRESSING AT ALL on this build - the tether has exactly one peer. The
+  // Ethernet twin needed a static IP here because DHCP would stall ~60 s, unlike
   // the DHCP form which stalls ~60 s when no server answers. On a point-to-point
   // tether there is no DHCP server at all, so static is the only sane choice.
-  // --- LET THE 5V RAIL SETTLE BEFORE TOUCHING THE W5100 --------------------
-  // Added 2026-08-26 for the cold-start failure: on barrel-jack power the board
-  // comes up but the shield never answers, while on USB it always works.
-  //
-  // THE ONE-SHOT PROBLEM. W5100::init() begins with `if (initialized) return 1`,
-  // so the chip gets exactly ONE hardware reset per boot, taken here. If the 5 V
-  // rail has not settled when that happens, the shield is dead until the next
-  // RESET - and no amount of calling Ethernet.begin() again will redo it. So the
-  // single shot has to be aimed well rather than repeated.
-  //
-  // On this rig the rail is slow and weak: 12 V into the Uno's LINEAR regulator
-  // means (12-5) x 0.23 A of heat it cannot shed, so it sags and recovers rather
-  // than snapping up. USB feeds 5 V straight in and skips all of that, which is
-  // exactly why USB "fixes" a problem that has nothing to do with data.
-  //
-  // A second of grace costs nothing at boot and gives the regulator time to
-  // reach a steady state before the W5100 is asked to come out of reset.
-  //
-  // x MILLIS_SCALE because Timer0 is prescaled for D6's PWM - delay() counts in
-  // the same 64x-fast milliseconds as everything else here. Without it this
-  // would be a 16 ms pause, not a second.
-  delay(1000UL * MILLIS_SCALE);
-
-  Ethernet.begin(mac, ip);
-
-  // WHAT THE SHIELD ACTUALLY REPORTS, printed every boot. This is the line that
-  // separates "no power / dead chip" from "chip fine, cable out" - and it had
-  // never been looked at, which is why the cold-start fault was guessed at for
-  // an hour instead of read off the board.
-  Serial.print(F("W5100: "));
-  EthernetHardwareStatus hw = Ethernet.hardwareStatus();
-  if (hw == EthernetNoHardware) {
-    Serial.print(F("NOT DETECTED (no power to the shield, or not seated)"));
-  } else if (hw == EthernetW5100) {
-    Serial.print(F("W5100 ok"));
-  } else {
-    Serial.print(F("detected, type "));
-    Serial.print((int)hw);
-  }
-  Serial.print(F("   link: "));
-  EthernetLinkStatus ls = Ethernet.linkStatus();
-  Serial.println(ls == LinkON ? F("UP") : (ls == LinkOFF ? F("DOWN") : F("unknown")));
-
-  // RETRY THE INIT while the chip reports absent. Each pass is a fresh
-  // Ethernet.begin(), which is a no-op on an already-initialised chip but the
-  // only thing worth trying if init() never got a working chip in the first
-  // place - and the delay between passes is more rail-settling time.
-  for (uint8_t tries = 0; tries < 5 &&
-       Ethernet.hardwareStatus() == EthernetNoHardware; tries++) {
-    delay(300UL * MILLIS_SCALE);
-    Ethernet.begin(mac, ip);
-    Serial.print(F("W5100 retry "));
-    Serial.print(tries + 1);
-    Serial.println(Ethernet.hardwareStatus() == EthernetNoHardware
-                   ? F(": still absent") : F(": DETECTED"));
-  }
-
-  udp.begin(LISTEN_PORT);
-  // Seeded so the watchdog measures from BOOT, not from zero - otherwise it
-  // fires on the first pass, before the Pi has had a chance to send anything.
-  lastUdpMs = millis();
-  lastEthTryMs = millis();
-
-  Serial.print(F("uno_eth_link: ETHERNET ONLY (serial commands off). UDP on "));
-  Serial.print(Ethernet.localIP());
-  Serial.print(F(":"));
-  Serial.println(LISTEN_PORT);
+  // Nothing to bring up: the CDC port is already open by the time setup() runs.
+  // This banner is printed anyway because the Pi's _open() sleeps OPEN_SETTLE_S
+  // and then reset_input_buffer()s, so it is flushed before the first command -
+  // it exists for whoever opens a serial monitor, exactly like the old one.
+  Serial.print(F("uno_usb_link on USB serial @"));
+  Serial.println(SERIAL_BAUD);
   Serial.println(F("DIR1=D9 PWM1=D3 (left)  DIR2=D8 PWM2=D6 (right)"));
   // Printed because a silently stale board is the expensive failure here: the
   // link ACKs and the pins look right whatever build is loaded, so every value
@@ -948,48 +1035,50 @@ void setup() {
   Serial.print(F(" floor "));
   Serial.print(BRUSH_MIN_DUTY);
   Serial.println(F(" (TOGGLE on/off, Pi sends 0 or 255)"));
-  Serial.println(F("LIGHT_DIR=A0 LIGHT_PWM=D5 (pot-dimmed, 0-255)"));
+  Serial.print(F("LIGHT: HARDWARE PWM D5 (Timer0, 62.5kHz), return A0 "));
+  Serial.println(F("[D12 no longer used]"));
+  // DIVIDED BY MILLIS_SCALE, because FAILSAFE_MS is counted in the 64x-fast
+  // milliseconds a prescaled Timer0 produces. Printing the raw constant said
+  // "19200 ms" on a board whose failsafe is really 300 ms, which reads like a
+  // robot that keeps driving for nineteen seconds after the link dies - alarming
+  // and wrong. The banner exists to be trusted at a glance, so it prints real
+  // time.
   Serial.print(F("failsafe after "));
+  Serial.print(FAILSAFE_MS / MILLIS_SCALE);
+  Serial.print(F(" ms of silence  (raw "));
   Serial.print(FAILSAFE_MS);
-  Serial.println(F(" ms of silence"));
+  Serial.print(F(" @ MILLIS_SCALE "));
+  Serial.print(MILLIS_SCALE);
+  Serial.println(F(")"));
 }
 
-/* ---------------------------------------------------------------------------
- * DUAL TRANSPORT: this build listens on the Ethernet shield AND the USB serial
- * port at the same time, on the operator's instruction 2026-08-26.
+/* Assemble one newline-terminated command out of the serial stream.
  *
- * WHY BOTH IS WORTH THE CODE ON THIS RIG. Neither link has been reliable: the
- * Ethernet carrier flapped 17 times in nine minutes on 2026-08-25, and the USB
- * device dropped off the Pi six times on 2026-08-26. They fail for completely
- * unrelated reasons - one is a cable and a shield, the other is a bus and a
- * power rail - so the chance of both being down at the same instant is far
- * smaller than either alone. Whichever is alive drives the robot.
+ * Returns true exactly once per complete line, with `packet` NUL-terminated and
+ * ready for the same sscanf ladder the Ethernet build used. This is the only
+ * function in this sketch with no counterpart in uno_eth_link.ino - the W5x00
+ * did this framing in hardware.
  *
- * THE FAILSAFE IS SHARED, AND THAT IS THE POINT. lastPacketMs is refreshed by a
- * command from EITHER source, so the 300 ms timeout only trips when BOTH have
- * gone quiet. A link dying while the other is talking is now a non-event.
+ * An over-long line is swallowed to its newline rather than parsed as a
+ * truncated command: half a command is not a safe thing to hand to sscanf,
+ * because "CMD 7 M 200 2" is a VALID parse of a truncated "CMD 7 M 200 250".
  *
- * THE ACK GOES BACK THE WAY THE COMMAND CAME. The Pi judges link health from
- * ACKs, and it is only ever using one transport at a time - answering on the
- * wrong one would read as total loss on the transport it is actually watching.
- * --------------------------------------------------------------------------- */
-
-// Serial framing state. UDP delivers whole datagrams with their own boundaries;
-// a serial stream has none, so the newline in "CMD <seq> ...\n" is the frame
-// marker and this holds the partial line between passes.
-uint16_t rxLen = 0;
-bool rxOverflow = false;
-
+ * Returning mid-drain is deliberate. Any bytes still in the UART are picked up
+ * on the next pass; at 50 Hz commands and 115200 baud the 64-byte hardware
+ * buffer holds about 5.5 ms of traffic and the loop pauses 5 ms, so it cannot
+ * back up in practice.
+ */
 bool pumpSerial() {
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (c == '\r') {
-      continue;
+      continue;                       // tolerate CRLF senders
     }
     if (c == '\n') {
-      if (rxOverflow) {
+      if (rxOverflow) {               // drop the whole over-long line
         rxLen = 0;
         rxOverflow = false;
+        Serial.println(F("WARN: over-long line dropped"));
         continue;
       }
       packet[rxLen] = '\0';
@@ -997,11 +1086,9 @@ bool pumpSerial() {
       if (packet[0] != '\0') {
         return true;
       }
-      continue;
+      continue;                       // bare newline is not a command
     }
     if (rxLen >= RX_BUFFER - 1) {
-      // Swallow an over-long line to its newline rather than parse a truncated
-      // one: "CMD 7 M 200 2" is a VALID parse of a truncated "CMD 7 M 200 250".
       rxOverflow = true;
       continue;
     }
@@ -1010,156 +1097,101 @@ bool pumpSerial() {
   return false;
 }
 
-/* Parse and act on whatever is in `packet`. Returns true if it was understood.
- *
- * Extracted from loop() so the UDP and serial paths run the SAME code - two
- * copies of this ladder would drift, and the one that drifted would be the one
- * nobody was testing that week. */
-bool handleCommand(unsigned int *seqOut) {
-  unsigned int seq = 0;
-  int left = 0, right = 0, jx = 0, jy = 0, act = 0, brush = 0, light = 0;
-  bool understood = false;
-
-  int nf = sscanf(packet, "CMD %u M %d %d %d %d %d",
-                  &seq, &left, &right, &act, &brush, &light);
-  if (nf >= 3) {
-    if (nf < 4) act = 0;
-    if (nf < 5) brush = 0;
-    if (nf < 6) light = 0;
-    applyMotor(DIR1, PWM1, left, INVERT_1);
-    applyMotor(DIR2, PWM2, right, INVERT_2);
-    applyActuator(act, INVERT_ACT);
-    applyBrush(brush);
-    applyLight(light);
-    curL = left; curR = right; curA = act; curB = brush; curLight = light;
-    understood = true;
-  } else if (sscanf(packet, "CMD %u J %d %d", &seq, &jx, &jy) == 3) {
-    mixJoystick(jx, jy, &left, &right);
-    applyMotor(DIR1, PWM1, left, INVERT_1);
-    applyMotor(DIR2, PWM2, right, INVERT_2);
-    applyActuator(0, INVERT_ACT);
-    applyBrush(0);
-    applyLight(0);
-    curL = left; curR = right; curA = 0; curB = 0; curLight = 0;
-    understood = true;
-  } else if (sscanf(packet, "CMD %u STOP", &seq) == 1) {
-    curL = 0; curR = 0; curA = 0; curB = 0; curLight = 0;
-    safeState();
-    understood = true;
-  } else if (sscanf(packet, "CMD %u", &seq) == 1) {
-    understood = true;                 // bare keepalive - refreshes the failsafe
-  }
-
-  if (understood) {
-    *seqOut = seq;
-    lastSeq = (uint16_t)seq;
-    packetsReceived++;
-    lastPacketMs = millis();           // shared by both transports - see above
-    if (!linkUp) {
-      linkUp = true;
-    }
-    digitalWrite(STATUS_LED, HIGH);
-  }
-  return understood;
-}
-
 void loop() {
   // First thing every pass: the rod's 50% stage and the brush's pot-set speed
   // are both synthesised in software, so the more often these run the cleaner
   // their duty. Everything else in this loop is either instant or rate-limited.
   serviceActuatorPwm();
   serviceBrushPwm();
+  serviceLightPwm();
 
-  // --- ETHERNET ------------------------------------------------------------
-  int size = udp.parsePacket();
-  if (size > 0) {
-    int n = udp.read(packet, RX_BUFFER - 1);
-    if (n < 0) {
-      n = 0;
-    }
-    packet[n] = '\0';
-    // Anything longer than the buffer is still queued in the W5x00; drop the
-    // remainder so the next parsePacket() starts on a clean packet boundary.
-    if (size > n) {
-      udp.flush();
-    }
-    lastUdpMs = millis();          // proof the shield is alive - see ETH_REINIT_MS
+  if (pumpSerial()) {
     unsigned int seq = 0;
-    if (handleCommand(&seq)) {
-      // Straight back to whoever sent it - see the DUAL TRANSPORT note.
-      udp.beginPacket(udp.remoteIP(), udp.remotePort());
-      udp.print(F("ACK "));
-      udp.print(lastSeq);
-      udp.print(F("\n"));
-      udp.endPacket();
-    }
-  }
+    int left = 0;
+    int right = 0;
+    bool understood = false;
 
-  // --- USB SERIAL ----------------------------------------------------------
-  // Off by default - see SERIAL_COMMANDS. The port is drained either way so a
-  // terminal typing at it cannot silently fill the RX buffer and stall the
-  // Ethernet side; the bytes are simply discarded rather than obeyed.
-  if (pumpSerial() && SERIAL_COMMANDS) {
-    unsigned int seq = 0;
-    if (handleCommand(&seq)) {
+    int jx = 0;
+    int jy = 0;
+    int act = 0;
+    int brush = 0;
+    int light = 0;
+
+    // ONE pattern for every length of M, judged by how many fields sscanf
+    // actually filled. Testing the short patterns as separate branches does not
+    // work: "CMD %u M %d %d" happily matches the LONGER string too — sscanf
+    // simply stops early and returns 3 — so a shorter branch placed first would
+    // silently swallow <act>/<brush> and freeze them at their last value.
+    //
+    // Anything the sender omitted stays 0, which is also the safe default: a
+    // sender that cannot talk about the actuator, the brush or the light must
+    // never be able to leave any of them running.
+    int nf = sscanf(packet, "CMD %u M %d %d %d %d %d",
+                    &seq, &left, &right, &act, &brush, &light);
+    if (nf >= 3) {
+      if (nf < 4) act = 0;
+      if (nf < 5) brush = 0;
+      if (nf < 6) light = 0;
+      applyMotor(DIR1, PWM1, left, INVERT_1);
+      applyMotor(DIR2, PWM2, right, INVERT_2);
+      applyActuator(act, INVERT_ACT);
+      applyBrush(brush);
+      applyLight(light);
+      curL = left;
+      curR = right;
+      curA = act;
+      curB = brush;
+      curLight = light;
+      understood = true;
+    } else if (sscanf(packet, "CMD %u J %d %d", &seq, &jx, &jy) == 3) {
+      // Raw stick from joystick_link.py, already centred and deadbanded on the
+      // Pi but NOT mixed. Mixing happens here for this form only.
+      mixJoystick(jx, jy, &left, &right);
+      applyMotor(DIR1, PWM1, left, INVERT_1);
+      applyMotor(DIR2, PWM2, right, INVERT_2);
+      // J carries no actuator, brush or light, so none of them run.
+      applyActuator(0, INVERT_ACT);
+      applyBrush(0);
+      applyLight(0);
+      curL = left;
+      curR = right;
+      curA = 0;
+      curB = 0;
+      curLight = 0;
+      understood = true;
+    } else if (sscanf(packet, "CMD %u STOP", &seq) == 1) {
+      curL = 0;
+      curR = 0;
+      curA = 0;
+      curB = 0;
+      curLight = 0;
+      safeState();
+      understood = true;
+    } else if (sscanf(packet, "CMD %u", &seq) == 1) {
+      // A bare keepalive with no payload. Valid: it proves the link is alive
+      // and refreshes the failsafe without changing the motor demand.
+      understood = true;
+    }
+
+    if (understood) {
+      lastSeq = (uint16_t)seq;
+      packetsReceived++;
+      lastPacketMs = millis();
+
+      if (!linkUp) {
+        linkUp = true;
+        Serial.println(F("LINK UP"));
+      }
+      digitalWrite(STATUS_LED, HIGH);
+
+      // Same three bytes plus the number the Pi's _drain_acks() greps for. It
+      // matches on the "ACK " prefix and ignores every other line, which is why
+      // the telemetry block below can keep printing to this same port.
       Serial.print(F("ACK "));
       Serial.println(lastSeq);
-    }
-  }
-
-  // --- shield watchdog -----------------------------------------------------
-  // See ETH_REINIT_MS. Deliberately independent of linkUp and of the serial
-  // side: the state it recovers is a shield that NEVER came up, which nothing
-  // else in this sketch would ever notice.
-  {
-    unsigned long nowE = millis();
-    if (nowE - lastUdpMs > ETH_REINIT_MS && nowE - lastEthTryMs > ETH_REINIT_MS) {
-      lastEthTryMs = nowE;
-
-      // RELEASE THE SOCKET BEFORE REOPENING IT. This one line is the whole fix
-      // for "the Uno answers ping but the ground station never reconnects".
-      //
-      // MEASURED 2026-08-26: after the Pi's eth0 went down and came back, the
-      // W5100 kept answering ICMP - its IP stack is in hardware and never
-      // stopped - while its UDP SOCKET stayed deaf. tcpdump showed the Pi
-      // sending at 50 Hz and not one reply coming back, indefinitely.
-      //
-      // WHY THE OLD RE-INIT DID NOT CLEAR IT. EthernetUDP::begin() looks for a
-      // FREE socket. The wedged one was still allocated, so begin() found
-      // nothing, returned 0, and did nothing at all - every 5 seconds, forever.
-      // It looked like a working retry and was a no-op.
-      //
-      // stop() closes the socket and hands it back, so the begin() below gets a
-      // clean one. Harmless when the link is healthy: this whole block only runs
-      // after ETH_REINIT_MS of total silence, which a working link never reaches.
-      udp.stop();
-
-      // Then the config, in case that was what was lost.
-      Ethernet.begin(mac, ip);
-      udp.begin(LISTEN_PORT);
-
-      // NO WATCHDOG RESET HERE, AND IT MUST NOT COME BACK IN THIS FORM.
-      //
-      // Added 2026-08-26 to force the hardware reset that Ethernet.begin() does
-      // not perform, and REMOVED THE SAME HOUR: it put the board in a RESET
-      // LOOP - 6 boots in 35 seconds, banners truncated mid-print. On this AVR a
-      // watchdog reset leaves the timer ARMED with its short timeout, and the
-      // bootloader takes longer than that to hand over, so the board resets
-      // again before it ever reaches setup(). Clearing MCUSR and calling
-      // wdt_disable() first does not help - execution never gets that far.
-      //
-      // THE CURE WAS WORSE THAN THE DISEASE. A wedged shield still leaves a
-      // working board on USB; a reset loop kills every transport at once, which
-      // is exactly what "now it is not connected via usb either" was.
-      //
-      // IF THE SHIELD WEDGE NEEDS SOLVING, the honest options are hardware:
-      // wire a spare pin to the shield's RESET line and pulse it, or fix the 5V
-      // rail so the W5100 comes up cleanly at all - which on this rig is the
-      // real root cause (12V through the Uno's linear regulator browns the
-      // shield out). Do not reach for the watchdog again.
-      // Not announced on Serial: on this build the serial port is a COMMAND
-      // transport too, and a warning would sit in the TX buffer competing with
-      // ACKs - the exact stall that made the lamp flicker earlier today.
+    } else {
+      Serial.print(F("WARN: unparsable line: "));
+      Serial.println(packet);
     }
   }
 
@@ -1180,7 +1212,8 @@ void loop() {
 
   // Report on change (rate-limited, or a moving stick floods the port at 50 Hz)
   // and on a 3 s heartbeat, so a resting link still proves itself.
-  unsigned long now = millis();
+  if (TELEMETRY) {
+    unsigned long now = millis();
   bool changed = (curL != printedL || curR != printedR || curA != printedA
                   || curB != printedB || curLight != printedLight)
                  && (now - lastPrintMs) > 200UL * MILLIS_SCALE;
@@ -1205,6 +1238,7 @@ void loop() {
     Serial.print(curLight);
     Serial.print(F("  pkts="));
     Serial.println(packetsReceived);
+  }
   }
 
   // 5 ms pause per pass, on the operator's order 2026-08-18: it holds the loop
@@ -1231,5 +1265,6 @@ void loop() {
   while (micros() - pauseStart < 5000UL) {
     serviceActuatorPwm();
     serviceBrushPwm();
+    serviceLightPwm();
   }
 }

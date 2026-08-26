@@ -52,6 +52,121 @@ import threading
 import time
 
 from uno_link import UNO_HOST, UNO_PORT, UnoLink
+
+# --- which wire ---------------------------------------------------------------
+# UDP over the Ethernet shield was the only transport until 2026-08-26. On
+# 2026-08-25 that link flapped 17 times in 9 minutes and then stopped answering
+# altogether while both cameras on the SAME cable kept replying - so the fault
+# was the Uno's shield, not the wire - and the USB tether was brought up as a
+# second path. uno_usb_link.ino is the same sketch with the transport swapped,
+# so the command grammar and every driver behaviour are unchanged.
+#
+# "auto" is the default and prefers SERIAL WHEN A BOARD IS PLUGGED IN, because
+# that is the path that can be proven at a glance: a serial port either exists
+# or it does not, whereas a silent UDP socket is indistinguishable from a
+# healthy one that nobody is answering - which is exactly the failure that cost
+# an evening. Unplug the USB and it falls back to Ethernet on the next start.
+#
+#   UNO_TRANSPORT=serial   force the USB tether  (needs uno_usb_link.ino)
+#   UNO_TRANSPORT=udp      force the Ethernet shield (needs uno_eth_link.ino)
+#   UNO_TRANSPORT=auto     serial if a port is present, else udp   [default]
+#
+# THE SKETCH MUST MATCH THE TRANSPORT. A board flashed with uno_eth_link.ino
+# does not listen on serial at all - it ACKs nothing, which reads as a dead link
+# rather than as a wrong build. That is precisely what 50 sent / 0 acked meant
+# on 2026-08-25 before the USB sketch existed.
+# DEFAULT "udp" ON THE OPERATOR'S INSTRUCTION 2026-08-26: Ethernet is the data
+# path, and the USB cable is for FLASHING ONLY.
+#
+# WHY THIS IS A REAL SETTING AND NOT A PREFERENCE. On "auto" the Pi picks serial
+# whenever a serial port exists - so the moment the USB cable goes in to reflash
+# the board, the drive path silently moves onto it, and moves back when the cable
+# comes out. That is fine as redundancy and confusing as a default: the robot
+# changes which wire it is driven over depending on whether someone happens to
+# be holding a USB cable. Pinning it to udp makes the data path one fixed,
+# stated thing.
+#
+# THE FIRMWARE STILL LISTENS ON BOTH. uno_eth_link.ino accepts commands from the
+# shield AND the USB port and refreshes one shared failsafe, so nothing on the
+# board needs changing to move between them - only this line. Set
+# UNO_TRANSPORT=serial to drive over USB for a bench session, or =auto to get
+# the old automatic behaviour back.
+UNO_TRANSPORT = os.environ.get("UNO_TRANSPORT", "udp").strip().lower()
+
+# How long to wait before retrying a link that failed to open or died.
+#
+# THE LINK IS NOT OPENED ONCE. It was until 2026-08-26, and the failure that
+# changed it is worth recording: the Uno dropped off USB at 10:43, came back at
+# 11:07 as a NEW device node, and the viewer never noticed - the thread kept
+# writing to a file descriptor whose device no longer existed, reporting
+# "uno=DOWN" for 24 minutes while a perfectly healthy board sat one reopen
+# away. Nobody even held the port. Only restarting the whole viewer fixed it.
+#
+# That is not a rare case on this rig. The same day saw two Pi hard resets, an
+# Ethernet link that flapped 17 times in 9 minutes, and two USB disconnects. A
+# transport that cannot survive its cable being re-enumerated is the wrong
+# shape for this hardware, so the loop below now closes and reopens instead.
+#
+# 3 s rather than something tighter: reopening a serial port RESETS the Uno
+# (DTR) and costs OPEN_SETTLE_S of bootloader wait, so a fast retry loop would
+# hold the board in reset and look exactly like the fault it is trying to fix.
+LINK_RETRY_S = float(os.environ.get("UNO_LINK_RETRY_S", "3.0"))
+
+# How long the link may go without a single ACK before it is REOPENED rather
+# than merely reported dead.
+#
+# AN EXCEPTION IS NOT THE ONLY WAY A LINK DIES, and assuming it was is why the
+# first version of the reconnect did not work. On 2026-08-26 the Uno dropped off
+# USB and came back as a new device node; the write() calls into the old handle
+# kept SUCCEEDING - Linux buffers them into a port that no longer exists and
+# discards them - so nothing ever raised, the reopen never fired, and the viewer
+# sat at "uno=DOWN" with a healthy board plugged in and a valid /dev/ttyACM0
+# next to it.
+#
+# So health, not exceptions, is the trigger: no ACK for this long means the
+# handle is pointed at nothing whether or not it admits it. 4 s is comfortably
+# longer than ACK_WINDOW at SEND_HZ (a real link fills that window in well under
+# a second), so a busy Pi cannot trip it, and short enough that an operator sees
+# the robot come back rather than giving up on it.
+# 3.0 on the operator's instruction 2026-08-26 - "auto reconnect every 3
+# second". Matched to LINK_RETRY_S so the whole recovery is one number: at
+# most 3 s to notice the link is dead, then a reopen attempt every 3 s until
+# it takes. Worst case from unplug to driving again is about 6 s, most of
+# which is the Uno's own bootloader settle after the port is opened.
+#
+# DO NOT DROP IT MUCH BELOW 3 s. Reopening the port pulls DTR and RESETS the
+# Uno, so an over-eager retry holds the board in reset and looks exactly like
+# the dropout it is trying to recover from. 3 s comfortably clears both the
+# ACK window at SEND_HZ and OPEN_SETTLE_S.
+LINK_DEAD_S = float(os.environ.get("UNO_LINK_DEAD_S", "3.0"))
+
+
+def open_link(host, port, prefer=None):
+    """Build a transport. `prefer` overrides the auto choice for this attempt.
+
+    ALTERNATES ON AUTO, and that is the whole point of the argument. The Uno now
+    listens on UDP and USB serial at the same time (see uno_eth_link.ino), so a
+    dead link is a reason to try the OTHER wire, not to keep reopening the one
+    that is not answering. Without this, a board present on USB but silent -
+    exactly what a re-enumerated port or a wrong firmware looks like - would be
+    retried forever while a perfectly good Ethernet link sat unused.
+    """
+    want = prefer or UNO_TRANSPORT
+    if want == "auto":
+        try:
+            from uno_serial import find_port
+            want = "serial" if find_port() else "udp"
+        except Exception:
+            want = "udp"
+    if want == "serial":
+        from uno_serial_link import SerialLink
+        return SerialLink()
+    return UnoLink(host, port)
+
+
+def other_transport(name):
+    """The wire that is not this one. Used to fail over - see open_link()."""
+    return "udp" if name == "serial" else "serial"
 # Shared with the USB serial transport so both agree on what a stick means.
 from uno_serial import (MAX_PWM, SAMPLE_STALE_S, SEND_HZ, act_demand,
                         brush_demand, light_demand, mix)
@@ -406,16 +521,68 @@ class MotorLink(threading.Thread):
     # -- internals ------------------------------------------------------------
 
     def run(self):
-        try:
-            self._link = UnoLink(self._host, self._port)
-        except Exception as exc:
-            with self._lock:
-                self._state["error"] = f"socket failed: {exc}"
-            return
+        # Opened INSIDE the loop, not before it - see LINK_RETRY_S. A link that
+        # cannot be opened at startup is the same condition as one that dies
+        # later (no Uno right now), and both are recoverable, so neither is
+        # allowed to end this thread.
+        self._link = None
+        last_try = 0.0
+        last_ack_at = time.monotonic()
+        # Which wire the last attempt used, so the next one can try the other.
+        self._last_wire = None
 
         period = 1.0 / max(1.0, SEND_HZ)
         try:
             while not self._stop.is_set():
+                if self._link is None:
+                    now = time.monotonic()
+                    if now - last_try < LINK_RETRY_S:
+                        self._stop.wait(0.2)
+                        continue
+                    last_try = now
+                    # On auto, alternate wires each attempt so a silent-but-
+                    # present transport cannot trap us. On an explicit
+                    # UNO_TRANSPORT the operator has chosen; honour it.
+                    # RESOLVE THE WIRE HERE, AND RECORD IT BEFORE TRYING IT.
+                    #
+                    # The obvious version of this - remember the wire that WORKED
+                    # - deadlocks, and did on the rig 2026-08-26. With the USB
+                    # cable out, "udp" was the last success, so every retry chose
+                    # serial; SerialLink() then raised because there is no port,
+                    # which left the record untouched, so the next retry chose
+                    # serial again. Forever. The Uno would come back on Ethernet
+                    # and the Pi would never look at it - the only cure was
+                    # restarting the viewer, which is exactly what "it only
+                    # reconnects if I power off the Pi too" meant.
+                    #
+                    # Recording the ATTEMPT rather than the SUCCESS makes the
+                    # alternation unconditional: a wire that cannot even be
+                    # opened still counts as tried, so the next pass moves on.
+                    if UNO_TRANSPORT != "auto":
+                        wire = UNO_TRANSPORT
+                    elif self._last_wire:
+                        wire = other_transport(self._last_wire)
+                    else:
+                        try:
+                            from uno_serial import find_port
+                            wire = "serial" if find_port() else "udp"
+                        except Exception:
+                            wire = "udp"
+                    self._last_wire = wire
+                    try:
+                        self._link = open_link(self._host, self._port, wire)
+                    except Exception as exc:
+                        with self._lock:
+                            self._state["ok"] = False
+                            self._state["error"] = f"link failed: {exc}"
+                        continue
+                    # A reopened link is a NEW device with its own counters, so
+                    # the ACK window starts empty. Carrying the old window over
+                    # would report the fresh link as dead for ACK_WINDOW frames.
+                    self._recent = []
+                    last_ack_at = time.monotonic()
+                    with self._lock:
+                        self._state["error"] = None
                 started = time.monotonic()
                 try:
                     # Demands are PULLED here, on this thread, whenever a
@@ -479,6 +646,12 @@ class MotorLink(threading.Thread):
                     else:
                         alive = any(self._recent)
 
+                    # An ACK - any ACK - proves the handle still reaches the
+                    # board. Tracked here rather than inside the transport
+                    # because it is the DRIVE loop that has to act on it.
+                    if got:
+                        last_ack_at = time.monotonic()
+
                     with self._lock:
                         self._state["left"] = left
                         self._state["right"] = right
@@ -488,23 +661,61 @@ class MotorLink(threading.Thread):
                         self._state["sent"] = self._link.sent
                         self._state["acked"] = self._link.acked
                         self._state["loss_pct"] = self._link.loss_pct
+                        # Which wire this is. Ethernet and USB fail in
+                        # different ways and the top bar cannot tell them
+                        # apart from "ok" alone.
+                        self._state["target"] = self._link.target
                         self._state["ok"] = alive
                         self._state["error"] = (
                             None if alive else "no ACK from the Uno")
+
+                    # SILENTLY DEAD HANDLE. See LINK_DEAD_S: a vanished USB port
+                    # does not have to raise, so a link that has not ACKed for
+                    # LINK_DEAD_S is closed and reopened on the next pass even
+                    # though nothing threw. This is what actually recovers the
+                    # rig when the Uno re-enumerates.
+                    if time.monotonic() - last_ack_at > LINK_DEAD_S:
+                        with self._lock:
+                            self._state["ok"] = False
+                            self._state["error"] = (
+                                f"no ACK for {LINK_DEAD_S:.0f}s - reopening")
+                        try:
+                            self._link.close()
+                        except Exception:
+                            pass
+                        self._link = None
+                        self._recent = []
+                        continue
                 except Exception as exc:
+                    # Drop it and let the top of the loop reopen. A send that
+                    # raises means the device is gone (a re-enumerated USB port
+                    # raises OSError/BrokenPipe on every write from here on), and
+                    # retrying the same dead handle forever is exactly the bug
+                    # LINK_RETRY_S documents.
                     with self._lock:
                         self._state["ok"] = False
                         self._state["error"] = f"send failed: {exc}"
+                    try:
+                        self._link.close()
+                    except Exception:
+                        pass
+                    self._link = None
+                    self._recent = []
+                    last_ack_at = time.monotonic()
                 self._stop.wait(max(0.0, period - (time.monotonic() - started)))
         finally:
             # Last word is always neutral, and it is worth a blocking ACK wait
             # because nothing follows it to cover a loss.
+            # self._link may be None - the loop drops it whenever the device
+            # goes away, and stop() can land in exactly that window.
             try:
-                self._link.send("STOP")
+                if self._link is not None:
+                    self._link.send("STOP")
             except Exception:
                 pass
             try:
-                self._link.close()
+                if self._link is not None:
+                    self._link.close()
             except Exception:
                 pass
 
