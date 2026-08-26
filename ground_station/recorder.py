@@ -292,6 +292,10 @@ class CameraRecorder(threading.Thread):
         self._clip_frames = 0
         self._error = None
         self._rolling = False
+        # True while this camera has gone quiet and the writer is holding
+        # off. NOT an error: the clip is open, the file is fine, and the
+        # moment frames come back it carries on into the same file.
+        self._stalled = False
         # Monotonic instant this clip's FIRST frame was written, or None if it
         # has not written one yet. The full view is built from the finished
         # files (see FullViewBuilder) and those files do not all start at the
@@ -337,6 +341,7 @@ class CameraRecorder(threading.Thread):
                 "error": self._error,
                 "bytes": self._bytes(self._path),
                 "clip_first_write": self._clip_first_write,
+                "stalled": self._stalled,
             }
 
     def stop(self):
@@ -417,6 +422,8 @@ class CameraRecorder(threading.Thread):
         next_tick = time.monotonic()
         last_frame = None
         checked_disk = 0.0
+        last_seq = None            # stream.latest() bumps this per decode
+        last_fresh = None          # when a NEW frame last arrived
 
         try:
             while not self._stopping.is_set():
@@ -453,21 +460,40 @@ class CameraRecorder(threading.Thread):
                     continue
                 path = self._next_path
 
-                frame, _seq = self.stream.latest()
+                frame, seq = self.stream.latest()
+                fresh = seq != last_seq
+                if fresh:
+                    last_seq, last_fresh = seq, now
                 if frame is not None:
                     # Before last_frame is remembered, so a dropout holds the
                     # cropped frame and the clip never changes size mid-file.
                     frame = self._square(frame)
                 if frame is None:
-                    # Hold the last good frame so the timeline stays real-time
-                    # across a camera dropout. Before the FIRST frame there is
-                    # nothing to hold, so the file simply starts when video does.
+                    # Hold the last good frame so a hiccup shorter than the
+                    # grace period below does not chop the video. Before the
+                    # FIRST frame there is nothing to hold, so the file simply
+                    # starts when video does.
                     frame = last_frame
                 if frame is None:
                     with self._lock:
                         self._error = "waiting for video"
                     continue
                 last_frame = frame
+
+                # THE CAMERA IS GONE: hold off rather than record a still.
+                # The writer is deliberately left OPEN - closing it would end
+                # the clip, and the operator asked for the recording to carry
+                # on in the SAME file when the picture comes back. See
+                # config.RECORD_STALL_PAUSE_S for the trade this makes.
+                grace = config.RECORD_STALL_PAUSE_S
+                if (grace > 0 and last_fresh is not None
+                        and now - last_fresh > grace):
+                    with self._lock:
+                        self._stalled = True
+                    continue
+                if self._stalled:
+                    with self._lock:
+                        self._stalled = False
 
                 if self._writer is None:
                     writer, size = self._open_writer(path, frame)
@@ -726,21 +752,24 @@ class FullViewBuilder(threading.Thread):
         tmp = os.path.join(head, "." + tail + ".norm")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-nostdin",
                "-i", path,
-               "-c:v", "libx264", "-preset", config.RECORD_NORM_PRESET,
-               # See config.RECORD_NORM_PROFILE: this is the half of the fix
-               # that makes the per-camera files shareable off the stick, the
-               # other half being that they stop being mpeg4 at all.
-               "-profile:v", config.RECORD_NORM_PROFILE,
-               "-level", config.RECORD_NORM_LEVEL,
+               "-c:v", config.RECORD_NORM_VCODEC,
                "-b:v", rate, "-minrate", rate, "-maxrate", rate, "-bufsize", rate,
-               # nal-hrd=cbr is the part that actually pins the size. Without it
-               # x264 reads the rate as a ceiling and undershoots on whichever
-               # camera is looking at the emptier scene - which is exactly the
-               # difference being complained about. force-cfr keeps one frame per
-               # tick, so -frames:v means the same thing on both cameras.
-               "-x264-params", "nal-hrd=cbr:force-cfr=1",
                "-r", "%g" % config.RECORD_FPS,
                "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+        if config.RECORD_NORM_VCODEC == "libx264":
+            # x264 SPELLINGS ONLY. The v4l2m2m wrapper rejects every one of
+            # these and the whole encode fails, so they are not passed to it.
+            #
+            # nal-hrd=cbr is what actually pins the size - without it x264 reads
+            # the bitrate as a ceiling and undershoots on whichever camera is
+            # looking at the emptier scene, which is the file-size difference
+            # this normalising exists to remove. force-cfr keeps one frame per
+            # tick so -frames:v means the same thing on both cameras. The
+            # hardware encoder is CBR by nature and needs neither.
+            cmd += ["-preset", config.RECORD_NORM_PRESET,
+                    "-profile:v", config.RECORD_NORM_PROFILE,
+                    "-level", config.RECORD_NORM_LEVEL,
+                    "-x264-params", "nal-hrd=cbr:force-cfr=1"]
         if frames > 0:
             cmd += ["-frames:v", str(frames)]
         # -f mp4 explicitly: the muxer is normally picked from the extension and
@@ -843,6 +872,12 @@ class FullViewBuilder(threading.Thread):
                     "-profile:v", config.COMBINED_PROFILE,
                     "-level", config.COMBINED_LEVEL,
                     # Anything that opens an mp4 can open this one.
+                    "-movflags", "+faststart"]
+        else:
+            # NOT libx264: -crf is an x264 idea and this encoder ignores it,
+            # falling back to ffmpeg's 200 kbps default - which looks exactly
+            # like a broken camera. An explicit bitrate is not optional here.
+            cmd += ["-b:v", config.COMBINED_BITRATE,
                     "-movflags", "+faststart"]
         # -f mp4 explicitly: the muxer is normally picked from the extension
         # and the extension here is .part.
@@ -951,11 +986,33 @@ class FullViewBuilder(threading.Thread):
             return "list: %s" % exc
 
         part_out = out + ".part"
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        # -nostdin AND stdin=DEVNULL, BOTH, AND THIS IS NOT BELT AND BRACES.
+        #
+        # THE FREEZE THIS FIXES, 2026-08-26: the first real session to reach the
+        # join stage stopped the ENTIRE ground station dead - viewer, supervisor,
+        # unclutter and backdrop, all in state T, resuming on SIGCONT and being
+        # stopped again within the second.
+        #
+        # ffmpeg reads stdin for its interactive keys. This one inherited the
+        # terminal, because .xinitrc's children live in their own process group
+        # (pgid 971 against the tty's foreground 857) - and a BACKGROUND process
+        # group that reads its controlling terminal is sent SIGTTIN, which stops
+        # the whole group. Nothing had written a line of error anywhere: the
+        # process table was the only place it showed.
+        #
+        # Every other ffmpeg in this file already passes -nostdin. This one did
+        # not, and it is the only one added on the day it broke.
+        #
+        # -nostdin tells ffmpeg not to read; stdin=DEVNULL means it has nothing
+        # to read even if a future flag change forgets. Either alone would fix
+        # today's bug; both together mean the failure cannot come back as a
+        # single dropped argument.
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-nostdin",
                "-f", "concat", "-safe", "0", "-i", lst,
                "-c", "copy", "-movflags", "+faststart", "-f", "mp4", part_out]
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL,
                                     stderr=subprocess.PIPE, text=True)
         except OSError as exc:
             return "ffmpeg: %s" % exc

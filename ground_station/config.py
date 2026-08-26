@@ -331,6 +331,30 @@ RECORD_SQUARE_PX = int(os.environ.get("RECORD_SQUARE_PX", "720"))
 # way COMBINED_AFTER_SAVE already fixes the full view.
 RECORD_NORMALIZE = os.environ.get("RECORD_NORMALIZE", "1") == "1"
 
+# A CAMERA THAT DROPS OUT PAUSES ITS RECORDING instead of being papered over,
+# operator 2026-08-26: "if its camera off to auto paused in saved and when
+# recieved to its continue".
+#
+# What it used to do: hold the last good frame and keep writing it at
+# RECORD_FPS, so the file stayed real-time and a 20s dropout became 20s of a
+# frozen picture. That is honest about the CLOCK and dishonest about the
+# PICTURE, and it spends bitrate on a still.
+#
+# What it does now: after this many seconds with no new decoded frame, the
+# writer stops taking frames. The file stays OPEN and the clip does not roll,
+# so when video comes back it continues into the same file - no new clip, no
+# gap in the numbering, nothing extra for the merge to join.
+#
+# THE TRADE, stated plainly: the recording is now shorter than wall-clock by
+# whatever the camera missed, and if only ONE camera drops, front.mp4 and
+# back.mp4 come out different lengths and no longer line up in time. That is
+# the unavoidable cost of not recording the dropout. Set this to 0 to go back
+# to frame-holding, which keeps the two files the same length.
+#
+# The grace period matters: a single late frame is normal on RTSP and must not
+# chop the video. One second is several frames' worth of patience.
+RECORD_STALL_PAUSE_S = float(os.environ.get("RECORD_STALL_PAUSE_S", "1.0"))
+
 # CONSTANT bitrate, deliberately not CRF. CRF gives both cameras identical
 # QUALITY and lets the busier scene produce the bigger file - measured 1.56 MB
 # against 1.29 MB for the same clip, which is the behaviour being complained
@@ -343,6 +367,32 @@ RECORD_NORMALIZE = os.environ.get("RECORD_NORMALIZE", "1") == "1"
 # x264 pass at visually-equivalent quality wanted ~1.1 Mbit/s.
 RECORD_NORM_BITRATE = os.environ.get("RECORD_NORM_BITRATE", "1200k")
 RECORD_NORM_PRESET = os.environ.get("RECORD_NORM_PRESET", "veryfast")
+
+# WHICH ENCODER DOES THE WORK. h264_v4l2m2m is the Pi 4's HARDWARE H.264
+# encoder; libx264 is the software one that was here until 2026-08-26.
+#
+# MEASURED ON THIS PI, one 15 s 720p clip:
+#
+#     libx264 -preset veryfast    16.2 s     <- what normalising used to cost
+#     libx264 -preset ultrafast    8.8 s
+#     h264_v4l2m2m                 6.4 s     <- 2.5x faster than veryfast
+#
+# Normalising runs on EVERY clip of EVERY camera, so it is the dominant cost of
+# a save and the reason the operator reported the merge as too slow. Moving it
+# onto the VideoCore leaves the CPU free for the decode side as well, which the
+# stopwatch above does not even capture.
+#
+# THE x264-ONLY FLAGS ARE SKIPPED when this is not libx264 - preset, profile,
+# level and -x264-params are x264 spellings and the v4l2m2m wrapper rejects
+# them. The CBR bitrate below is what pins the size either way, and it is the
+# part that actually matters: it is why two cameras looking at very different
+# scenes still produce files of the same length.
+#
+# SET THIS BACK TO libx264 if the hardware encoder ever produces unplayable
+# files - it is a wrapper around a kernel driver and is fussier than x264 about
+# odd resolutions. Quality at a fixed bitrate is slightly worse; speed is the
+# trade being made.
+RECORD_NORM_VCODEC = os.environ.get("RECORD_NORM_VCODEC", "h264_v4l2m2m")
 
 # H.264 profile and level for the normalised masters.
 #
@@ -463,7 +513,22 @@ RECORD_MIN_RUN_S = float(os.environ.get("RECORD_MIN_RUN_S", "3.0"))
 # effort on runs the operator actually kept. The tradeoff is that full_nnn.mp4
 # appears a beat after the save rather than growing live - the strip reports the
 # build so the operator knows it is happening.
-COMBINED_AFTER_SAVE = os.environ.get("COMBINED_AFTER_SAVE", "1") == "1"
+# OFF since 2026-08-26, operator's instruction: "not save merge video, remove,
+# only save front and back". A session now leaves TWO files, one per camera.
+#
+# WHAT TURNING THIS OFF ACTUALLY SKIPS. The per-clip hstack encode - the single
+# most expensive stage of a save, because it decodes two streams, scales both
+# and encodes a third. Normalising still runs (RECORD_NORMALIZE), so the
+# per-camera files are still real h264 that anything can play, and the join
+# still reduces them to one file per camera.
+#
+# So this is not only a file the operator did not want: it is most of the wait
+# after a save. Expect the processing to finish in a fraction of the time it
+# took while the side-by-side was being built.
+#
+# Set back to 1 to get full.mp4 again. Nothing else has to change - the join
+# already looks for the per-clip full_nnn files and simply finds none.
+COMBINED_AFTER_SAVE = os.environ.get("COMBINED_AFTER_SAVE", "0") == "1"
 
 # 0 = each camera at its native size, which is the point of building offline:
 # the half-width is the widest camera and the canvas height the tallest, so
@@ -480,7 +545,16 @@ COMBINED_MAX_HALF = int(os.environ.get("COMBINED_MAX_HALF", "0"))
 # superfast/crf28 is ~0.43x for ~40% smaller files. libx264 rather than the
 # mp4v the live recorders use - the full view travels to other machines, and
 # H.264 plays everywhere MPEG-4 Part 2 does not.
-COMBINED_VCODEC = os.environ.get("COMBINED_VCODEC", "libx264")
+# h264_v4l2m2m since 2026-08-26 - the Pi's hardware encoder. See
+# RECORD_NORM_VCODEC for the measurements. The side-by-side decodes two streams
+# and encodes one, so handing the encode to the VideoCore also gives the two
+# decoders a core each.
+COMBINED_VCODEC = os.environ.get("COMBINED_VCODEC", "h264_v4l2m2m")
+
+# Bitrate for any encoder that is NOT libx264. CRF is an x264 idea; the v4l2m2m
+# wrapper ignores it and falls back to ffmpeg's 200 kbps default, which looks
+# exactly like a broken camera. This is the number that stops that happening.
+COMBINED_BITRATE = os.environ.get("COMBINED_BITRATE", "4M")
 COMBINED_PRESET = os.environ.get("COMBINED_PRESET", "ultrafast")
 COMBINED_CRF = os.environ.get("COMBINED_CRF", "28")
 
