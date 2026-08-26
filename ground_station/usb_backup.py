@@ -70,7 +70,36 @@ CHUNK = 4 * 1024 * 1024
 # Delete the Pi's copy after a verified transfer. On by default per the spec;
 # the off switch exists for bring-up, when losing a test recording to a flaky
 # stick would cost a rig visit.
-DELETE_AFTER = os.environ.get("USB_BACKUP_DELETE", "1") == "1"
+# OFF, operator 2026-08-26: "i not want to auto delete after save".
+#
+# Saving to a stick and clearing the Pi are now two separate decisions, made
+# with two separate buttons in the chooser. Nothing this daemon does removes
+# footage any more - only DELETE and DELETE ALL in the viewer do, and both ask
+# first.
+#
+# Only reachable at all with USB_AUTO_COPY=1; the manual path never calls the
+# code this guards. It is left wired so the two settings still describe the old
+# behaviour honestly if anyone turns mirroring back on.
+DELETE_AFTER = os.environ.get("USB_BACKUP_DELETE", "0") == "1"
+
+# AUTOMATIC COPYING IS OFF, operator's instruction 2026-08-26: a stick now opens
+# a chooser in the viewer and nothing moves until SAVE or DELETE is pressed.
+#
+# WHY THE DAEMON STAYS RUNNING ANYWAY. It is what finds the partition, mounts
+# it, and publishes where it landed - the viewer has no business poking at
+# block devices, and it would need root for the mount. So the daemon keeps
+# doing the part that needs privilege and stops doing the part that is now the
+# operator's decision. It publishes state="mounted" with the mount path and
+# waits.
+#
+# THIS TURNS OFF AN AUTOMATIC BACKUP. With it on, plugging a stick in copied
+# everything and - with USB_BACKUP_DELETE=1 - deleted it from the Pi. Footage
+# now stays on the Pi until somebody chooses. That is what was asked for, and
+# it means an operator who forgets to press SAVE keeps the footage rather than
+# losing it, which is the safer half of the trade.
+#
+# USB_AUTO_COPY=1 restores the old behaviour exactly.
+AUTO_COPY = os.environ.get("USB_AUTO_COPY", "0") == "1"
 
 # How many times the transfer will re-COPY files that appeared while it was
 # running before it gives up on reaching a clean sweep. See the settle loop in
@@ -371,6 +400,42 @@ def clear_source(all_files, grace=None):
     return deleted, kept
 
 
+def mount_stick(dev, fstype, premounted):
+    """Mount the stick if it is not already. Returns (mountpoint, mounted_here).
+
+    Lifted out of backup_to() 2026-08-26 so the manual chooser can reuse it:
+    both the automatic mirror and the operator-driven one need a mounted stick,
+    and mounting needs root, which the viewer does not have. Returns
+    (None, False) on failure, having already published the reason.
+    """
+    mounted_here = False
+    if premounted:
+        mnt = premounted
+        log(f"{dev}: already mounted at {mnt} (automounter) - using it")
+        return mnt, mounted_here
+
+    mnt = os.path.join(MOUNT_BASE, "usb_backup-" + os.path.basename(dev))
+    os.makedirs(mnt, exist_ok=True)
+    # uid/gid on the FAT-family mounts so the files are readable as arnobot
+    # while mounted; the native-Linux filesystems keep their own ownership and
+    # refuse those options. time_offset is what makes the copied files carry the
+    # right Date Modified on a Windows laptop - see fat_time_offset().
+    if fstype in ("vfat", "exfat"):
+        opts = ["-o", "uid=1000,gid=1000,time_offset=%d" % fat_time_offset()]
+    else:
+        opts = []
+    res = subprocess.run(["mount", *opts, dev, mnt],
+                         capture_output=True, text=True, timeout=30)
+    if res.returncode != 0:
+        log(f"{dev}: mount failed: {res.stderr.strip()}")
+        publish(state="error", device=dev, detail="mount failed")
+        return None, False
+    log(f"{dev}: mounted at {mnt} ({fstype})"
+        + (f" tz offset {fat_time_offset():+d} min"
+           if fstype in ("vfat", "exfat") else ""))
+    return mnt, True
+
+
 def backup_to(dev, fstype, premounted):
     """Mount (if needed), mirror /recordings, clear, sync, unmount."""
     if fstype not in SUPPORTED_FS:
@@ -380,32 +445,9 @@ def backup_to(dev, fstype, premounted):
         return
 
     publish(state="mounting", device=dev)
-    mounted_here = False
-    if premounted:
-        mnt = premounted
-        log(f"{dev}: already mounted at {mnt} (automounter) - using it")
-    else:
-        mnt = os.path.join(MOUNT_BASE, "usb_backup-" + os.path.basename(dev))
-        os.makedirs(mnt, exist_ok=True)
-        # uid/gid on the FAT-family mounts so the files are readable as
-        # arnobot while mounted; the native-Linux filesystems keep their own
-        # ownership and refuse those options. time_offset is what makes the
-        # copied files carry the right Date Modified on a Windows laptop - see
-        # fat_time_offset() for why the default cannot be trusted here.
-        if fstype in ("vfat", "exfat"):
-            opts = ["-o", "uid=1000,gid=1000,time_offset=%d" % fat_time_offset()]
-        else:
-            opts = []
-        res = subprocess.run(["mount", *opts, dev, mnt],
-                             capture_output=True, text=True, timeout=30)
-        if res.returncode != 0:
-            log(f"{dev}: mount failed: {res.stderr.strip()}")
-            publish(state="error", device=dev, detail="mount failed")
-            return
-        mounted_here = True
-        log(f"{dev}: mounted at {mnt} ({fstype})"
-            + (f" tz offset {fat_time_offset():+d} min"
-               if fstype in ("vfat", "exfat") else ""))
+    mnt, mounted_here = mount_stick(dev, fstype, premounted)
+    if mnt is None:
+        return
 
     try:
         if not os.path.isdir(RECORD_DIR):
@@ -592,8 +634,17 @@ def backup_to(dev, fstype, premounted):
 
 def main():
     once = "--once" in sys.argv
-    log(f"usb_backup up - watching for USB drives, mirroring {RECORD_DIR}"
-        f"{' (delete-after-transfer ON)' if DELETE_AFTER else ''}")
+    # SAYS WHICH MODE IT IS IN. The old line announced "delete-after-transfer
+    # ON" unconditionally, which since AUTO_COPY went to 0 describes something
+    # that never happens - and a log that claims it is about to delete footage
+    # when it is not is worse than no log at all.
+    if AUTO_COPY:
+        log(f"usb_backup up - AUTO-COPY: mirroring {RECORD_DIR} on insert"
+            f"{' (delete-after-transfer ON)' if DELETE_AFTER else ''}")
+    else:
+        log(f"usb_backup up - MANUAL: a stick is mounted and left alone; "
+            f"the viewer's chooser saves or deletes. Nothing is copied or "
+            f"removed automatically. USB_AUTO_COPY=1 restores mirroring.")
     publish(state="idle")
     handled = set()
     while True:
@@ -618,7 +669,24 @@ def main():
             # the exact moment the operator most wants to know it was seen.
             publish(state="detected", device=dev)
             try:
-                backup_to(dev, fstype, mountpoint)
+                if AUTO_COPY:
+                    backup_to(dev, fstype, mountpoint)
+                else:
+                    # Mount it and stop. The viewer takes it from here - see
+                    # AUTO_COPY. mount_ro=False because the whole point is that
+                    # the operator may choose to write to it.
+                    if fstype not in SUPPORTED_FS:
+                        log(f"{dev}: filesystem '{fstype}' not supported")
+                        publish(state="error", device=dev,
+                                detail=f"unsupported filesystem {fstype}")
+                        continue
+                    mnt, _here = mount_stick(dev, fstype, mountpoint)
+                    if not mnt:
+                        publish(state="error", device=dev,
+                                detail="mount failed")
+                    else:
+                        log(f"{dev}: mounted at {mnt} - waiting for the operator")
+                        publish(state="mounted", device=dev, mount=mnt)
             except Exception as exc:
                 log(f"{dev}: backup crashed: {exc}")
                 publish(state="error", device=dev, detail=str(exc)[:80])

@@ -607,7 +607,18 @@ class TopBar(QWidget):
         them to the narrower no-stick row would make the bar shed the title the
         moment a stick went in.
         """
-        self._usb_pill.setVisible(self._usb_present and self.width() >= 1166)
+        # ALWAYS HIDDEN since 2026-08-26, on the operator's instruction. The
+        # chooser popup now opens the moment a stick is mounted and covers the
+        # middle of the screen with the same information in more detail - a chip
+        # on the bar behind it was saying the same thing twice, and the popup is
+        # the thing being looked at.
+        #
+        # The pill and _usb_chip() are LEFT IN PLACE rather than deleted: they
+        # are the only compact rendering of the daemon's phases, and the day
+        # someone wants the bar to narrate a transfer again this is one line.
+        # Drop the "False and" to bring it back.
+        self._usb_pill.setVisible(False and self._usb_present
+                                  and self.width() >= 1166)
 
     def minimumSizeHint(self):
         # Without this the bar is a floor on the whole window's width: the chips

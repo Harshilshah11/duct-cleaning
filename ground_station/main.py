@@ -709,7 +709,10 @@ class GroundStationWindow(QWidget):
         # The drive path pulls its own inputs, on MotorLink's thread, at
         # SEND_HZ. Wired BEFORE start() so the very first pass already has a
         # source and there is no window where the wheels wait on a UI frame.
-        self.motors.set_source(self.inputs.latest)
+        # THROUGH THE GATE, not straight off the reader - see _drive_source().
+        # While the USB chooser is open the panel is driving the POPUP, and the
+        # same stick must not also be driving the wheels.
+        self.motors.set_source(self._drive_source)
         self.motors.start()
 
         # --- recording -------------------------------------------------------
@@ -731,6 +734,10 @@ class GroundStationWindow(QWidget):
         # separate root process and the viewer must not care whether it is up.
         self._usb = {}
         self._usb_read_at = 0.0
+        # The USB chooser, while it is open. usb_backup.py now mounts a stick
+        # and stops; this is what actually moves anything - see usb_chooser.
+        self._usb_dialog = None
+        self._usb_dev_shown = None
 
         # --- video row ------------------------------------------------------
         video_row = QHBoxLayout()
@@ -853,6 +860,76 @@ class GroundStationWindow(QWidget):
             self._usb = usb
         return self._usb
 
+    def _drive_source(self):
+        """The snapshot the motor link is allowed to act on.
+
+        NEUTRAL WHILE THE CHOOSER IS OPEN, operator 2026-08-26: "when popup on
+        to not operate any switch, means if on to not on in bot". The popup is
+        driven with the joystick and the SAVE button - the very controls that
+        otherwise drive the wheels, the rod and the brush - so leaving the drive
+        path connected would have every menu movement also move the robot.
+
+        The stick is zeroed rather than the reader being stopped: MotorLink
+        judges a missing sample as a dead link and trips its failsafe, which is
+        a fault state on the strip. A live snapshot reading centre is the honest
+        description of what the operator is asking the WHEELS to do while they
+        are looking at a file list - which is nothing.
+
+        Everything else in the snapshot is passed through untouched, so the ADC
+        health, the pot and the camera panels keep updating behind the popup.
+        """
+        snap = self.inputs.latest()
+        if self._usb_dialog is None:
+            return snap
+        gated = dict(snap or {})
+        joy = dict(gated.get("joy") or {})
+        joy["x"] = 0.0
+        joy["y"] = 0.0
+        gated["joy"] = joy
+        # The rod and the brush are switch-driven; a switch left thrown must not
+        # act while the operator is in a menu either.
+        gated["actuator"] = None
+        gated["brush"] = None
+        return gated
+
+    def _sync_usb_dialog(self, usb):
+        """Open the chooser when a stick is mounted, close it when it is gone.
+
+        DRIVEN BY THE DAEMON'S STATE, not by a device node this process watched
+        for itself: usb_backup.py is the thing with root, and it publishes
+        `mounted` with the path once the stick is ready to be written to. Acting
+        any earlier would offer SAVE against a mountpoint that does not exist.
+
+        _usb_dev_shown stops a dialog reopening every frame for the same stick
+        after the operator closes it - the state stays "mounted" for as long as
+        the stick is in, so the device is the thing to remember, not the state.
+        """
+        state = (usb or {}).get("state")
+        dev = (usb or {}).get("device")
+        mount = (usb or {}).get("mount")
+
+        if state == "mounted" and mount and dev != self._usb_dev_shown:
+            if self._usb_dialog is None:
+                try:
+                    from usb_chooser import UsbChooser
+                    self._usb_dev_shown = dev
+                    self._usb_dialog = UsbChooser(config.RECORD_DIR, mount, self)
+                    self._usb_dialog.finished.connect(self._usb_dialog_closed)
+                    self._usb_dialog.show()
+                except Exception as exc:      # never take the viewer down
+                    print("usb chooser failed: %s" % exc, flush=True)
+                    self._usb_dialog = None
+
+        # The stick went away. Close it rather than leaving buttons pointed at
+        # a mountpoint that is no longer there.
+        if state in (None, "idle") and self._usb_dialog is not None:
+            self._usb_dialog.reject()
+            self._usb_dialog = None
+            self._usb_dev_shown = None
+
+    def _usb_dialog_closed(self, _result):
+        self._usb_dialog = None
+
     def _session_state(self, snapshot):
         """Switch state if the panel is readable, otherwise the keyboard latch.
 
@@ -958,11 +1035,20 @@ class GroundStationWindow(QWidget):
         # switch state and the save-button edge count, so the status the strip
         # renders this frame is the one the recorder is already acting on rather
         # than one frame stale.
-        self.session.set_state(self._session_state(snapshot))
-        self.session.on_save_button(snapshot.get("save_presses"))
+        if self._usb_dialog is not None:
+            # THE POPUP OWNS THE PANEL. Recording must not start, stop or bank a
+            # clip because the operator moved the stick to reach DELETE ALL -
+            # and the SAVE button means "tick this row" in here, not "save the
+            # session". Both are held off until the popup closes, at which point
+            # set_state() sees the real switch again and carries on.
+            self._usb_dialog.on_inputs(snapshot)
+        else:
+            self.session.set_state(self._session_state(snapshot))
+            self.session.on_save_button(snapshot.get("save_presses"))
         # The hold level as well as the press edges: holding SAVE for 3s after
         # a stop is what finalizes the recording into /recordings.
-        self.session.on_save_hold(snapshot.get("save_held_s"))
+        if self._usb_dialog is None:
+            self.session.on_save_hold(snapshot.get("save_held_s"))
         # Expires the post-stop confirm window, which can delete the recording.
         # After the save button and the hold, so a press or a completed hold
         # landing on the last frame of the window is honoured rather than raced.
@@ -972,6 +1058,7 @@ class GroundStationWindow(QWidget):
         # "data is transferring" appears exactly where the operator already
         # looks for recording state.
         status["usb"] = self._usb_status()
+        self._sync_usb_dialog(status["usb"])
         # Drawing the strip must never be able to strand the motors. Everything
         # below this block is the demand the Uno keeps transmitting at 50Hz, so
         # an exception raised in here used to skip the rest of tick() and leave
