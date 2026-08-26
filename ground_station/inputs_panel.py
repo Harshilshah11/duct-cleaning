@@ -1895,7 +1895,20 @@ class InputsPanel(QFrame):
         held = self._joy_disp["y"]
         if y is None and held is not None and now - held[1] < JOY_DISPLAY_HOLD_S:
             y = held[0]
-        self.joy.set_pos(x, y)
+        # DISPLAY-ONLY AXIS SWAP, operator 2026-08-26: "in my backend my x and y
+        # is swaped ... only frontend, backend side no any change because its
+        # correct".
+        #
+        # The wheels are right and must not be touched, so this cannot go in
+        # inputs.py - SWAP_XY there feeds the mixer as well and would undo a
+        # calibration that is already correct on the rig. This is the last point
+        # before the picture, and nothing downstream of it reaches a motor.
+        #
+        # KEEP IT HERE IF THE PANEL EVER LOOKS WRONG AGAIN. The rule for this
+        # file is the same one the dot's ox/oy signs already follow: it is not an
+        # opinion about orientation, it is whatever makes the PICTURE match the
+        # hand, given whatever inputs.py is sending. Change one, check the other.
+        self.joy.set_pos(y, x)
         # ONE number for the whole stick, 2026-08-24 on the operator's ask:
         # "remove turn and add all in throttle". Not |y|, which would read 0%
         # while spinning on the spot at full power - THE PEAK WHEEL DEMAND, so

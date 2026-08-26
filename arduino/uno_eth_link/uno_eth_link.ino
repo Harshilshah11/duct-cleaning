@@ -140,6 +140,10 @@
 #include <SPI.h>
 #include <Ethernet.h>
 #include <EthernetUdp.h>
+// Reaches the W5100 registers directly. Needed because the library gives no
+// public way to RESET the chip after init() has run once - see the re-init
+// block in loop().
+#include <utility/w5100.h>
 
 // --- Network (address plan from ground_station/config.py) --------------------
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0x20};
@@ -1115,6 +1119,28 @@ void loop() {
     unsigned long nowE = millis();
     if (nowE - lastUdpMs > ETH_REINIT_MS && nowE - lastEthTryMs > ETH_REINIT_MS) {
       lastEthTryMs = nowE;
+
+      // RESET THE CHIP ITSELF, not just its configuration.
+      //
+      // THE FAULT THIS FIXES, reported 2026-08-26: after everything is
+      // restarted the Uno does not come back, but unplugging its power ONCE and
+      // plugging it in again fixes it every time. That difference is the whole
+      // clue - a power CYCLE takes the 5 V rail to zero and gives the W5100a
+      // true power-on reset, while a dip or a warm restart leaves the AVR
+      // running and the shield in an undefined state with nothing able to clear
+      // it. The settle delay in setup() only helps a CLEAN cold start.
+      //
+      // The library cannot do this: W5100::init() returns early once
+      // `initialized` is set, so Ethernet.begin() reprograms the MAC and IP into
+      // a chip that was never reset. Writing MR.RST (bit 7 of the Mode Register)
+      // over SPI is the same reset the chip performs at power-on, and it is
+      // reachable directly.
+      //
+      // ORDER MATTERS: reset the silicon, let it come up, THEN reprogram it, and
+      // only then take a socket. Doing begin() first would push the config into
+      // a chip that is about to be wiped.
+      W5100.writeMR(0x80);              // MR.RST - W5100 software reset
+      delay(50UL * MILLIS_SCALE);       // datasheet needs only microseconds
 
       // RELEASE THE SOCKET BEFORE REOPENING IT. This one line is the whole fix
       // for "the Uno answers ping but the ground station never reconnects".
