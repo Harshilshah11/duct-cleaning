@@ -46,7 +46,7 @@ import math
 import re
 import time
 
-from PySide6.QtCore import Qt, QPointF, QRectF, QSize, QTimer
+from PySide6.QtCore import Qt, QEvent, QPointF, QRectF, QSize, QTimer
 from PySide6.QtGui import (
     QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen,
     QPolygonF,
@@ -141,7 +141,12 @@ def font(px, weight=theme.W_SEMIBOLD, numeric=False):
 #
 # Every pixel still comes off the camera panels - see the module docstring. 15px
 # is the price of the whole strip being on one ramp with the rest of the app.
-STRIP_HEIGHT = 24 * theme.SPACE_2
+# 24 -> 25 units, 2026-08-27. The dial grew 0.5cm on the operator's call and
+# CONTENT_H could not hold it: it measured y=33..132 inside a 128px card and the
+# bottom of the arc was being cut. One more 8px unit clears it and keeps both
+# numbers on the grid. It costs the camera panels 8px of 830, which is under 1%
+# and invisible; cropping a control the operator watches is not.
+STRIP_HEIGHT = 28 * theme.SPACE_2
 
 # EVERY BLOCK'S CONTENT IS THIS TALL, whatever is in it.
 #
@@ -172,7 +177,14 @@ STRIP_HEIGHT = 24 * theme.SPACE_2
 #
 # Raising any control past 128 means raising this AND STRIP_HEIGHT with it,
 # which costs camera height - so measure before changing either.
-CONTENT_H = 16 * theme.SPACE_2
+CONTENT_H = 20 * theme.SPACE_2   # raised with STRIP_HEIGHT - see above
+# 17 -> 20 units, 2026-08-27. The dial was asked to sit 0.2cm above the pills,
+# and the lift is carried as padding under a centred widget - which needs the
+# padding to actually FIT. At 17 units the row had 103px for a 122px wrapper, so
+# the margin was squeezed to nothing and the dial did not move a pixel; it is
+# the same squeeze that cropped the dial two changes ago, showing up as a lift
+# that silently did nothing instead. Measured, not guessed: 3 more units is what
+# the wrapper needs to keep its margin.
 
 # --- palette -----------------------------------------------------------------
 # The top bar's colours, so the two light surfaces are the same light. Keep them
@@ -588,9 +600,37 @@ class Pill(QLabel):
     would make the one control you must never misread the one that blends in.
     """
 
+    # A LEADING GLYPH PER CONTROL. From the operator's reference 2026-08-27,
+    # where every button carries its symbol as well as its name. The symbol is
+    # what survives being read at arm's length in a duct; the word is what makes
+    # it unambiguous the first time. Unicode rather than an icon font, because
+    # the rig has no icon font installed and a missing glyph would leave a box
+    # where the control used to be.
+    # THE LIVE SHEEN - see paintEvent(). A soft highlight travelling across the
+    # pill while its control is ON.
+    #
+    # Movement is the only channel left. Every control on this strip is already
+    # a coloured rounded rectangle, so colour and shape are both spoken for;
+    # motion is what the eye catches from across a duct without having to read.
+    #
+    # Slow and faint on purpose. This sits under an operator's eye for a whole
+    # run, and anything brighter or quicker stops being information and becomes
+    # something to look away from.
+    SHEEN_S = 2.6              # seconds per sweep
+    SHEEN_W = 46.0             # width of the band, px
+    SHEEN_ALPHA = 46           # peak alpha out of 255
+
+    GLYPHS = {
+        "START / STOP": "\u25b6",       # BLACK RIGHT-POINTING TRIANGLE
+        "PAUSE / RESUME": "\u2758\u2758",  # two light vertical bars
+        "SAVE": "\u25cf",               # BLACK CIRCLE
+        "BRUSH": "\u2726",              # BLACK FOUR POINTED STAR
+    }
+
     def __init__(self, name, tone="on", alternates=(), px=PT_PILL,
                  primary=False):
-        super().__init__(name)
+        glyph = self.GLYPHS.get(name)
+        super().__init__("%s  %s" % (glyph, name) if glyph else name)
         self._name = name
         self._tone = tone
         self._pt = px
@@ -604,6 +644,12 @@ class Pill(QLabel):
         # because the pill cannot paint outside its own rectangle and the halo
         # has to bloom past its edge.
         self._halo = 0.0
+        # Sheen clock. Started only while the pill is ON - see set_value() - so a
+        # resting strip costs nothing. 40ms is 25fps, the same rate as the dial;
+        # this is a Pi already running two decoders and an encoder.
+        self._anim = 0.0
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._anim_step)
         self._pad = 12
         self.setAlignment(Qt.AlignCenter)
         self.setFont(font(px))
@@ -617,11 +663,55 @@ class Pill(QLabel):
         # not reliable before the widget is polished. The generous slack covers
         # the border and Qt's internal margin, which differ per platform - the
         # same floor was 1px clear on Windows and clipped on the Pi.
-        widest = max([name, *self._alternates], key=len)
+        # MEASURE WHAT IS ACTUALLY DRAWN, glyph included. The floor used to be
+        # taken from `name`, which is the bare word - once a leading glyph was
+        # prepended that under-measured by its width plus the gap, and this is
+        # the exact widget whose comment above records losing "PA" and "SE" to a
+        # floor that was a few pixels short.
+        _g = self.GLYPHS.get(name)
+        _lead = ("%s  " % _g) if _g else ""
+        widest = _lead + max([name, *self._alternates], key=len)
         self.setMinimumWidth(
             QFontMetrics(self.font()).horizontalAdvance(widest)
             + 2 * self._pad + 12)
         self.set_value(None)
+
+    def _anim_step(self):
+        self._anim += 0.04
+        self.update()
+
+    def paintEvent(self, event):
+        """The label as usual, then a moving highlight while the control is ON.
+
+        A SECOND PASS, not a replacement. The fill, the text, the border and the
+        corner radius all come from the stylesheet and QLabel draws them itself;
+        this lets it do that and then lays one gradient over the top. Trying to
+        own the whole paint would mean re-implementing every state in TONES.
+
+        Clipped to the same rounded rectangle so the band cannot spill past the
+        corners, and skipped entirely when the pill is off or unknown - nothing
+        animates at rest, so the strip is still when the robot is.
+        """
+        super().paintEvent(event)
+        if not self._value:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect())
+        clip = QPainterPath()
+        clip.addRoundedRect(r, theme.RADIUS_SM, theme.RADIUS_SM)
+        p.setClipPath(clip)
+        # Travel the band from just off the left edge to just off the right, so
+        # it enters and leaves cleanly instead of appearing mid-pill.
+        span = r.width() + self.SHEEN_W * 2.0
+        pos = (self._anim % self.SHEEN_S) / self.SHEEN_S * span - self.SHEEN_W
+        g = QLinearGradient(pos, 0.0, pos + self.SHEEN_W, 0.0)
+        edge = QColor(255, 255, 255, 0)
+        mid = QColor(255, 255, 255, self.SHEEN_ALPHA)
+        g.setColorAt(0.0, edge)
+        g.setColorAt(0.5, mid)
+        g.setColorAt(1.0, edge)
+        p.fillRect(r, g)
 
     def set_text(self, text):
         """Change the word without resizing - the floor already covers it."""
@@ -629,7 +719,16 @@ class Pill(QLabel):
             self.setText(text)
 
     def set_value(self, on):
+        was = self._value
         self._value = on
+        if bool(on) != bool(was):
+            # Only a live control animates - see paintEvent().
+            if on:
+                self._anim = 0.0
+                self._anim_timer.start(40)
+            else:
+                self._anim_timer.stop()
+                self.update()
         if on is None:
             fg, bg, border = TONES["none"][0], TONES["none"][1], LINE
         elif on:
@@ -646,8 +745,22 @@ class Pill(QLabel):
         #
         # `on` True is left alone deliberately: an active control takes its own
         # tone from TONES, and overriding that would hide which one is running.
+        # PROMINENT FILL FOR THE PRIMARY ACTION, on the reference the operator
+        # gave 2026-08-27: the one button you are meant to press next is solid
+        # and carries its label in white, the rest are quiet. That is the iOS
+        # split between a borderedProminent button and a bordered one, and it
+        # does the job a colour alone cannot - across a lit duct the filled
+        # shape reads before any text does.
+        #
+        # SOLID, NOT TINTED. The tint version put a pale wash behind dark text,
+        # which at a glance was hard to separate from the outlined buttons
+        # beside it. A filled control has no such ambiguity.
+        #
+        # BORDERLESS while filled: a border around a solid fill is a second edge
+        # saying the same thing, and it makes the control look heavier than the
+        # one live state that genuinely matters.
         if self._primary and not on:
-            fg, bg, border = TONES["info"][0], TONES["info"][1], TONES["info"][0]
+            fg, bg, border = "#ffffff", TONES["info"][0], TONES["info"][0]
         # RADIUS 6, NOT A FULL PILL. The card captions are fully-rounded
         # tinted chips (see caption()), and while these were too the operator
         # could not tell a label from a control - "heading and content all are
@@ -1403,6 +1516,37 @@ def qcol(spec, alpha=None):
     return c
 
 
+# The three stages every clip goes through, in order. Their names are the
+# `state` strings recorder.py publishes.
+_BUILD_STAGES = ("normalising", "building", "joining")
+
+
+def _build_fraction(fv):
+    """full_view status -> ONE monotonic 0..1 across the whole job.
+
+    WHY THIS EXISTS: the dial used to be handed full_view["frac"] directly, and
+    that is PER STAGE. Every clip runs three stages and each resets frac to
+    zero, so a three-clip save swept the dial from zero nine times over. The
+    operator saw it "repeat 0-44, finish, again 0-44" and read it, correctly,
+    as a broken gauge.
+
+    So the stage counter and the clip counter are folded back in:
+
+        overall = (clips_done + (stage_index + frac)/3) / clips_total
+
+    `built` is deliberately NOT used for clips_done - it counts STAGE
+    completions, not clips, so it would run to 3x the clip count. `clip` is
+    1-based, hence the -1.
+    """
+    total = max(1, int(fv.get("clips_total") or 1))
+    clip = max(0, int(fv.get("clip") or 1) - 1)
+    state = fv.get("state")
+    stage = _BUILD_STAGES.index(state) if state in _BUILD_STAGES else 0
+    frac = max(0.0, min(1.0, float(fv.get("frac") or 0.0)))
+    overall = (clip + (stage + frac) / float(len(_BUILD_STAGES))) / float(total)
+    return max(0.0, min(1.0, overall))
+
+
 class RoundSaveButton(QWidget):
     """SAVE, as a round control that doubles as the transfer dial.
 
@@ -1444,8 +1588,13 @@ class RoundSaveButton(QWidget):
     # size over EDID - 344x195mm across 1920x1080 = 5.56 px/mm - which is the
     # same constant SparkleRing sizes itself with. The operator asks for
     # centimetres because that is what a control on a panel actually is.
-    OUTER = 89                 # was 61: +0.5cm, as asked
-    FACE = 46                  # the solid centre disc
+    # 89 -> 68, 2026-08-27. The dial moved INTO the button row so all three
+    # controls sit on one line, and at 89 it did not fit: SessionView has
+    # CONTENT_H = 128 for a state line, the row, and the gaps around them, which
+    # leaves about 80 for the row itself. 68 + 2*PAD = 72 clears that with room
+    # rather than cropping, which is what the operator was seeing.
+    OUTER = 96                 # 68 + 0.5cm (28px at 5.56 px/mm), as asked
+    FACE = 50                  # the solid centre disc, scaled with OUTER
     PAD = 2                    # bloom room. There is no more than this - see
     #                            the class docstring on what the card gives.
     WIDTH = OUTER + 2 * PAD
@@ -1461,6 +1610,7 @@ class RoundSaveButton(QWidget):
     def __init__(self):
         super().__init__()
         self._mode = "idle"        # idle | busy | done | error
+        self._label = None         # text drawn instead of the percentage
         self._target = 0.0
         self._frac = 0.0
         self._press = 0.0
@@ -1473,7 +1623,16 @@ class RoundSaveButton(QWidget):
         self._timer.start(self.FPS_MS)
 
     # ---- state in ------------------------------------------------------
-    def set_status(self, mode, frac=0.0):
+    def set_status(self, mode, frac=0.0, label=None):
+        """mode, progress, and an optional TEXT to draw instead of a percentage.
+
+        The label exists for the run itself. A recording has no known length, so
+        a percentage there is a number with nothing behind it - it sat at 0% for
+        the whole run and read as a dial that had failed to start. The elapsed
+        clock is the honest live figure: it moves every second and it is the one
+        an operator actually wants while a run is going.
+        """
+        self._label = label
         if mode == "done" and self._mode != "done":
             self._check = 0.0
         self._mode = mode
@@ -1667,10 +1826,14 @@ class RoundSaveButton(QWidget):
         if self._mode == "busy":
             # THE READOUT, in the middle of its own dial. Tabular digits so the
             # number does not jitter sideways as it counts.
-            f.setPixelSize(17)
+            # A label wins over the percentage - see set_status(). Sized down a
+            # little because "12:04" is four glyphs wider than "42%" and the
+            # face is only FACE px across.
+            txt = self._label if self._label else "%d%%" % round(self._frac * 100)
+            f.setPixelSize(15 if self._label else 17)
             f.setWeight(QFont.Bold)
             p.setFont(f)
-            p.drawText(box, Qt.AlignCenter, "%d%%" % round(self._frac * 100))
+            p.drawText(box, Qt.AlignCenter, txt)
         else:
             f.setPixelSize(12)
             f.setWeight(QFont.Bold)
@@ -1731,7 +1894,7 @@ class SessionView(QWidget):
     # The save button is momentary - measured ~0.18s per press, which is a
     # handful of UI frames and easy to miss. Hold its pill lit long enough to
     # register as feedback that the press was seen.
-    SAVE_INSET = 7              # trims the move to a round 3cm
+
     SAVE_FLASH_S = 0.9
 
     def __init__(self):
@@ -1803,7 +1966,24 @@ class SessionView(QWidget):
         head_row.addStretch(1)
 
         pill_row = QHBoxLayout()
-        pill_row.setContentsMargins(0, 0, 0, 0)
+        # A margin on each end so the outer two controls do not sit hard against
+        # the card's border. AlignLeft/AlignRight put them flush by definition,
+        # and with the dial 72px wide and round, touching the edge read as a
+        # crop - its arc met the border with no gap for the eye to land in.
+        # Symmetrical, so the thirds stay even.
+        # START/STOP moved 1cm right, operator 2026-08-27. 56px at this panel's
+        # EDID-reported 5.56 px/mm.
+        #
+        # Applied as a SYMMETRIC margin rather than as padding on the one
+        # control. AlignLeft puts START/STOP hard against whatever the left
+        # margin is, so widening that margin moves it - but widening only the
+        # left would drag the three equal thirds rightward with it and take
+        # PAUSE/RESUME off the card's centre, which is the thing the thirds were
+        # introduced to fix. Equal on both ends keeps the centre where it is and
+        # brings the dial in off the right border by the same amount, which it
+        # needed anyway.
+        _row_pad = theme.SPACE_2 + 56
+        pill_row.setContentsMargins(_row_pad, 0, _row_pad, 0)
         pill_row.setSpacing(9)
         # NATURAL widths - each pill is its own text plus the same padding, and
         # the leftover card width goes into the stretches either side. The row
@@ -1817,19 +1997,43 @@ class SessionView(QWidget):
         # width goes on the left, which leaves START / STOP and PAUSE /
         # RESUME centred in the card exactly where they were. 5.56 px/mm:
         # the dial's centre travels 761 - 7 - 47 = 707 from 539, or 30.2mm.
-        slot = RoundSaveButton.WIDTH + self.SAVE_INSET
-        save_slot = QWidget()
-        save_slot.setFixedWidth(slot)
-        slot_l = QHBoxLayout(save_slot)
-        slot_l.setContentsMargins(0, 0, self.SAVE_INSET, 0)
-        slot_l.setSpacing(0)
-        slot_l.addWidget(self.save_btn, 0, Qt.AlignVCenter)
-        pill_row.addSpacing(slot)
-        pill_row.addStretch(1)
-        pill_row.addWidget(self.rec_pill)
-        pill_row.addWidget(self.pause_pill)
-        pill_row.addStretch(1)
-        pill_row.addWidget(save_slot)
+        # ONE ROW, THREE CONTROLS: START/STOP left, PAUSE/RESUME centre, SAVE
+        # right. Operator 2026-08-27. The dial used to be placed by hand off to
+        # the side, which left the row looking like two controls and an ornament
+        # rather than the three things you press.
+        #
+        # Stretches BETWEEN them rather than around them, so the row spans the
+        # card and each control lands on its third. Equal stretch either side of
+        # the middle pill is what keeps PAUSE/RESUME optically centred whatever
+        # the two outer widths turn out to be.
+        # EQUAL THIRDS, not equal gaps. Stretches between the controls looked
+        # right until the widths were measured: START/STOP is 160px and the dial
+        # 72, so equal gaps pushed PAUSE/RESUME 44px right of the card's centre.
+        # Giving each control a third of the row and aligning it inside its own
+        # third puts the middle one on the true centre whatever the outer two
+        # happen to measure - which matters, because both of those change width
+        # with their label.
+        pill_row.addWidget(self.rec_pill, 1, Qt.AlignLeft | Qt.AlignVCenter)
+        pill_row.addWidget(self.pause_pill, 1, Qt.AlignHCenter | Qt.AlignVCenter)
+        # CENTRED in its third rather than pinned right, operator 2026-08-27
+        # ("some left save button 1 cm"). Centring moves it in off the border by
+        # half the slack in its own third, which is the same order as the 1cm
+        # asked for - and unlike widening the right margin it leaves the thirds
+        # alone, so PAUSE/RESUME stays on the card's centre.
+        # 0.2cm up, operator 2026-08-27 - 11px at 5.56 px/mm.
+        #
+        # Carried as a bottom margin on a wrapper rather than by changing the
+        # alignment. AlignVCenter is what keeps the dial level with the two
+        # pills, and swapping it for AlignTop would tie the dial's position to
+        # the row's height, which changes with the pill font. Padding under a
+        # centred widget lifts it by HALF the padding, so 22 gives the 11 asked
+        # for and the dial stays centred on whatever it is centred in.
+        _dial_wrap = QWidget()
+        _dial_l = QVBoxLayout(_dial_wrap)
+        _dial_l.setContentsMargins(0, 0, 0, 22)
+        _dial_l.setSpacing(0)
+        _dial_l.addWidget(self.save_btn, 0, Qt.AlignHCenter)
+        pill_row.addWidget(_dial_wrap, 1, Qt.AlignHCenter | Qt.AlignVCenter)
 
         # Order: heading, then the three buttons centred in the block, then the
         # detail line pinned to the bottom. A stretch either side of the pill row
@@ -2107,13 +2311,24 @@ class SessionView(QWidget):
         fv = status.get("full_view") or {}
         fv_state = fv.get("state")
         if fv_state in ("queued", "normalising", "joining", "building"):
-            self.save_btn.set_status("busy", fv.get("frac") or 0.0)
+            self.save_btn.set_status("busy", _build_fraction(fv))
         elif fv_state == "error":
             self.save_btn.set_status("error", 1.0)
         elif fv.get("ready"):
             self.save_btn.set_status("done", 1.0)
+        elif state in ("RECORDING", "PAUSED"):
+            # THE DIAL STARTS TURNING WHEN THE RUN DOES, operator 2026-08-27:
+            # "when start recording to also start in save button start
+            # progress". It shows ACTIVITY, not a percentage - a recording has
+            # no known length to be a fraction of, so the dial sits at zero and
+            # spins rather than inventing a number that would only ever be
+            # wrong. The percentage arrives when the build does, and by then it
+            # means something.
+            self.save_btn.set_status(
+                "busy", 0.0, label=hms(status.get("elapsed") or 0))
         else:
             self.save_btn.set_status("idle", 0.0)
+
 
         switches = snapshot.get("switches") or {}
         self.rec_pill.set_value(switches.get("START / STOP"))
@@ -2220,6 +2435,10 @@ class InputsPanel(QFrame):
         self.session = SessionView()
         recording = Card(REC_TONE)
         recording.add(column("RECORDING", self.session, fill=True), 1)
+        # The dial is an ordinary member of the button row now - see the row
+        # built in SessionView. It used to be reparented onto the card and
+        # positioned by hand, which was the only way to centre it while it sat
+        # outside the layout; in the row the layout does that for free.
 
         # Stretch factors, not natural widths: the strip spans whatever the
         # screen is, and three cards huddled at the left with dead space to the

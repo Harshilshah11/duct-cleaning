@@ -4,7 +4,12 @@
 # CAM 1 — camera at 192.168.1.103 (MAC 00:c2:33:71:13:6d), reached over eth0.
 #   /stream   h264  1280x720 @25   (main)
 #   /stream1  h265   720x576 @25   (sub)
-#   No authentication.
+#   Does NOT require authentication, but ACCEPTS it - verified 2026-08-27 by
+#   decoding frames from both forms, with and without admin:123456. The URL
+#   below carries the credentials anyway so both cameras read the same way; a
+#   camera that ignores them costs nothing, and one line that differs from its
+#   neighbour for no visible reason is the kind of thing that gets "fixed" later
+#   by someone who does not know which of the two was deliberate.
 #
 # CAM 2 — camera at 192.168.1.102 (MAC 00:ca:4f:d1:23:df), reached over eth0.
 #   Confirmed on the wire 2026-08-17; it is NOT at 192.168.1.101 (that address
@@ -19,5 +24,5 @@
 # Both cameras hang off eth0 and each needs its own /32 host route:
 #     ./setup_camera_link.sh 192.168.1.103 192.168.1.102
 
-rtsp://192.168.1.103:554/stream
+rtsp://admin:123456@192.168.1.103:554/stream
 rtsp://admin:123456@192.168.1.102:554/stream

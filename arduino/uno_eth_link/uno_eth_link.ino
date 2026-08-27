@@ -151,7 +151,12 @@ IPAddress ip(192, 168, 50, 20);
 const uint16_t LISTEN_PORT = 5005;
 
 // --- Motor driver pins (see the pin-map note above before changing) ----------
-const uint8_t DIR1 = 9;    // channel 1 direction (LEFT)
+// MOVED D9 -> A1, 2026-08-27, to free Timer1 for the brush. A direction line is
+// a static level and wastes a timer on doing nothing; A1 serves as a plain
+// digital output here exactly as A0 has for the lamp's direction since
+// 2026-08-14.
+// REWIRE BEFORE FLASHING: the left channel's DIR wire moves from D9 to A1.
+const uint8_t DIR1 = A1;   // channel 1 direction (LEFT) - was D9
 const uint8_t PWM1 = 3;    // channel 1 speed, Timer2  (~490 Hz)
 const uint8_t DIR2 = 8;    // channel 2 direction (RIGHT)
 const uint8_t PWM2 = 6;    // channel 2 speed, Timer0  (~980 Hz, see pin note)
@@ -316,7 +321,12 @@ const uint8_t LIGHT_PWM = 5;   // Timer0 (~980 Hz) — same 0-duty caveat as D6
 // from D7 having been taken — the wire really is on D2, and the sketch was the
 // thing that was wrong.
 const uint8_t BRUSH_DIR = 2;
-const uint8_t BRUSH_PWM = A1;
+// MOVED A1 -> D9, 2026-08-27, and this is the whole point of the swap. A1 has
+// no timer, so the brush was chopped in software from loop() at 250 Hz. D9 is
+// Timer1, so the duty becomes real hardware PWM at 62.5 kHz - the same figure
+// both wheels already run at.
+// REWIRE BEFORE FLASHING: the brush's PWM wire moves from A1 to D9.
+const uint8_t BRUSH_PWM = 9;    // Timer1 - was A1 (soft-PWM)
 
 // The brush spins one way only, so its direction is a constant rather than a
 // demand. Flip this if the brush runs backwards.
@@ -550,10 +560,17 @@ void applyBrush(int duty) {
   brushDuty = duty;
   // The static endpoints are written HERE as well as in serviceBrushPwm(), so
   // a stop takes effect on this very line rather than on the next loop() pass.
+  // HARDWARE PWM on D9 now. The two ENDPOINTS still use digitalWrite rather
+  // than analogWrite(0)/analogWrite(255): on a timer pin a zero duty can still
+  // emit a narrow pulse every period, which is a creeping motor - the same
+  // caveat this file already records for D6 and D5. A hard level is the only
+  // certain stop, and the only certain full-on.
   if (duty <= 0) {
     digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
   } else if (duty >= MAX_PWM) {
     digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? HIGH : LOW);
+  } else {
+    analogWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? duty : (MAX_PWM - duty));
   }
 }
 
@@ -564,18 +581,12 @@ void applyBrush(int duty) {
  * brush, never a runaway one. Shares ACT_PWM_PERIOD_US; both mechanisms are
  * far too slow mechanically to care about 250 Hz ripple. */
 void serviceBrushPwm() {
-  if (brushDuty <= 0) {
-    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
-    return;
-  }
-  if (brushDuty >= MAX_PWM) {
-    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? HIGH : LOW);
-    return;
-  }
-  unsigned long phase = micros() % ACT_PWM_PERIOD_US;
-  unsigned long onFor = (ACT_PWM_PERIOD_US * (unsigned long)brushDuty) / MAX_PWM;
-  bool on = phase < onFor;
-  digitalWrite(BRUSH_PWM, (on == BRUSH_ACTIVE_HIGH) ? HIGH : LOW);
+  // NOTHING TO DO ANY MORE. The brush moved to D9 (Timer1) on 2026-08-27 and
+  // its duty is applied in hardware by applyBrush(). Kept as an empty call so
+  // the two loop() sites and the failsafe path need no unpicking - and so this
+  // note sits exactly where the software chopper used to be. If the brush is
+  // ever moved back to a timer-less pin the old body is in git history, and
+  // ACT_PWM_PERIOD_US is still here because the rod still needs it.
 }
 
 /* Linear actuator: D7 picks the direction, D4 gates it, zero holds position.
@@ -736,7 +747,98 @@ void mixJoystick(int x, int y, int *left, int *right) {
   *right = (int)(r * MAX_PWM / peak);
 }
 
+// Print a pin the way a human reads it: "D9", or "A1" for the analog block.
+// The banner used to spell the map out in literal strings, which is exactly the
+// failure the banner exists to catch - on 2026-08-27 the constants moved and the
+// text did not, so a correctly-flashed board reported the OLD pins and looked
+// stale when it was not. Derived from the constants now, so it cannot lie.
+// TRUE CHIP RESET FOR A WEDGED SHIELD - added 2026-08-27.
+//
+// The note further down says the only cures are hardware. That was wrong, and
+// this is the missing option it did not find.
+//
+// The problem it describes is real: W5100::init() opens with
+// `if (initialized) return 1`, so the chip gets ONE hardware reset per boot and
+// every later Ethernet.begin() is a no-op. A shield that came up wedged stayed
+// wedged for the whole boot - board powered, sketch running, USB fine, no
+// packets - which is exactly "always power on but only not send data".
+//
+// But the W5100 has its own RESET BIT in the Mode Register, and this library
+// exposes writeMR/readMR PUBLICLY (w5100.h, the public block at line 192).
+// Writing 0x80 there resets the chip itself over SPI, which the `initialized`
+// flag knows nothing about. The library's own private softReset() does exactly
+// this; it is simply not reachable from a sketch.
+//
+// After the reset the chip is blank, so the settings init() would have written
+// are re-applied by hand: MAC, IP, subnet, gateway. Socket memory (RMSR/TMSR)
+// comes back at the 2KB-per-socket default, which is what this library uses.
+//
+// NOTE THE delay() SCALING. Timer0 runs at prescaler 1 for the 62.5 kHz PWM, so
+// delay() is 64x short - MILLIS_SCALE compensates every duration this sketch
+// measures, and it has to be applied here too or the poll gives up in ~300us.
+static const uint8_t SHIELD_SUBNET[4] = {255, 255, 255, 0};
+static const uint8_t SHIELD_GATEWAY[4] = {192, 168, 50, 1};
+static const uint8_t SHIELD_IP[4] = {192, 168, 50, 20};
+
+bool resetShield() {
+  W5100.writeMR(0x80);                       // RST - the chip resets itself
+  for (uint8_t i = 0; i < 50; i++) {         // datasheet clears in well under 10ms
+    if (W5100.readMR() == 0) break;
+    delay(1UL * MILLIS_SCALE);
+  }
+  if (W5100.readMR() != 0) return false;     // never came out of reset
+  W5100.setMACAddress(mac);
+  W5100.writeSIPR(SHIELD_IP);
+  W5100.writeSUBR(SHIELD_SUBNET);
+  W5100.writeGAR(SHIELD_GATEWAY);
+  return true;
+}
+
+void printPin(uint8_t pin) {
+  if (pin >= A0) {
+    Serial.print('A');
+    Serial.print(pin - A0);
+  } else {
+    Serial.print('D');
+    Serial.print(pin);
+  }
+}
+
 void setup() {
+
+  // THE BRUSH IS SILENCED FIRST, BEFORE ANYTHING ELSE IN THIS FUNCTION.
+  //
+  // Operator, 2026-08-27: "when bot on and off to brush motor is rotate without
+  // on switch". It did, and the old ordering could not have stopped it.
+  //
+  // The block below writes every output to its stopped level BEFORE calling
+  // pinMode, on the reasoning that a pin cannot glitch in the gap. That is true
+  // for an ACTIVE-LOW load: digitalWrite(pin, HIGH) on a pin that is still an
+  // input switches the internal pull-up on, which does weakly hold the line
+  // high. It is NOT true for this one. BRUSH_ACTIVE_HIGH is true, so the off
+  // level is LOW - and digitalWrite(pin, LOW) on an input merely turns the
+  // pull-up OFF and leaves the pin floating at high impedance. Nothing holds it
+  // anywhere. If the driver's enable input drifts high, the brush runs.
+  //
+  // Driving it as a real output is the only thing that holds it, so that
+  // happens here, ahead of Serial.begin() and everything after it. pinMode
+  // first is safe in this direction precisely BECAUSE the load is active-high:
+  // PORTA1 powers up as 0, so the pin drives LOW the instant it becomes an
+  // output. The order that is wrong for an active-low load is the right one
+  // here, which is why it is stated rather than copied.
+  //
+  // WHAT THIS CANNOT FIX, and it matters: from the moment power arrives until
+  // this line executes, the AVR is in its bootloader and EVERY pin is an input.
+  // That is one to two seconds on a Uno and no sketch can shorten it. If the
+  // brush still twitches at power-on, the fix is a PULL-DOWN RESISTOR (10k is
+  // ample) from the driver's enable input to ground - a part that holds the
+  // line while no chip is driving it. Firmware can only close the window after
+  // the bootloader, not the bootloader itself.
+  pinMode(BRUSH_PWM, OUTPUT);
+  digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
+  pinMode(BRUSH_DIR, OUTPUT);
+  digitalWrite(BRUSH_DIR, BRUSH_DIR_LEVEL);
+
   // 250000 on the operator's order 2026-08-26, up from 9600 - match the serial
   // monitor to this or the log reads as garbage. ONE RATE ACROSS THE PROJECT
   // was the instruction, and this line is what makes that true: the Pi, the USB
@@ -829,6 +931,20 @@ void setup() {
   // short. There are no delay() calls in this sketch today, and the link runs
   // on a static IP so nothing here waits on a DHCP timeout.
   TCCR0B = (TCCR0B & 0b11111000) | 0b001;
+
+  // Timer1: D9, the brush - added 2026-08-27 with the A1 -> D9 move.
+  //
+  // The core leaves Timer1 in 8-bit PHASE-CORRECT with prescaler 64, which is
+  // 490 Hz. Fast PWM 8-bit (WGM13:0 = 0101) with prescaler 1 gives
+  //
+  //     16e6 / (256 * 1) = 62500 Hz
+  //
+  // the same number as D3 and D6, for the reason the note above already gives:
+  // channels on different frequencies answer the same demand differently and
+  // read as a mechanical fault. Timer1 drives no timing in this sketch -
+  // millis() and micros() are Timer0 - so nothing else moves with it.
+  TCCR1A = (TCCR1A & 0b11111100) | _BV(WGM10);
+  TCCR1B = (TCCR1B & 0b11100000) | _BV(WGM12) | 0b001;
 
   // NOTE: STATUS_LED is LED_BUILTIN = D13, which is also the SPI clock the
   // shield uses. With the shield fitted this lamp tracks Ethernet traffic
@@ -943,7 +1059,11 @@ void setup() {
   Serial.print(Ethernet.localIP());
   Serial.print(F(":"));
   Serial.println(LISTEN_PORT);
-  Serial.println(F("DIR1=D9 PWM1=D3 (left)  DIR2=D8 PWM2=D6 (right)"));
+  Serial.print(F("DIR1="));  printPin(DIR1);
+  Serial.print(F(" PWM1=")); printPin(PWM1);
+  Serial.print(F(" (left)  DIR2=")); printPin(DIR2);
+  Serial.print(F(" PWM2=")); printPin(PWM2);
+  Serial.println(F(" (right)"));
   // Printed because a silently stale board is the expensive failure here: the
   // link ACKs and the pins look right whatever build is loaded, so every value
   // that changes behaviour belongs in the banner where a reset reveals it.
@@ -971,7 +1091,9 @@ void setup() {
   // build is otherwise indistinguishable over the LAN (see the banner note
   // above), and "held 255" vs "soft-PWM" is exactly the difference that
   // decides whether the knob does anything.
-  Serial.print(F("BRUSH_DIR=D2 BRUSH_PWM=A1 soft-PWM duty 0-"));
+  Serial.print(F("BRUSH_DIR=")); printPin(BRUSH_DIR);
+  Serial.print(F(" BRUSH_PWM=")); printPin(BRUSH_PWM);
+  Serial.print(F(" hw-PWM 62.5kHz duty 0-"));
   Serial.print(MAX_PWM);
   Serial.print(F(" floor "));
   Serial.print(BRUSH_MIN_DUTY);
@@ -1185,8 +1307,16 @@ void loop() {
       udp.stop();
 
       // Then the config, in case that was what was lost.
-      Ethernet.begin(mac, ip);
-      udp.begin(LISTEN_PORT);
+        // A REAL RESET FIRST - see resetShield(). Ethernet.begin() alone is a
+        // no-op on an already-initialised chip, so this path used to run and
+        // recover nothing: the board sat powered and deaf until someone cycled
+        // it by hand. Resetting the chip over SPI is what actually clears a
+        // wedge, and it costs nothing when the shield was fine.
+        bool wasReset = resetShield();
+        Ethernet.begin(mac, ip);
+        udp.begin(LISTEN_PORT);
+        Serial.print(F("LINK SILENT - shield reset "));
+        Serial.println(wasReset ? F("OK, socket reopened") : F("FAILED"));
 
       // NO WATCHDOG RESET HERE, AND IT MUST NOT COME BACK IN THIS FORM.
       //

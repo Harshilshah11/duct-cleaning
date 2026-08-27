@@ -473,6 +473,39 @@ RECORD_MIN_FREE_MB = int(os.environ.get("RECORD_MIN_FREE_MB", "512"))
 # behaviour: a window of that many seconds after STOP in which footage is
 # DISCARDED unless claimed by a hold. That was in force earlier the same day;
 # it is off now because the operator asked for it, not because it was wrong.
+# THE SAVE BUTTON NO LONGER BANKS CLIPS. Operator 2026-08-27: "remove totally
+# save button logic in the recording, it make auto save after stop recording".
+#
+# The gesture was: a tap while rolling closes the current clip and opens the
+# next, so an operator could mark something worth keeping without stopping. It
+# worked exactly as designed - which was the problem. GPIO25 chatters at about
+# four edges a second, and the recorder banked a clip for every one of them:
+# session12 collected 565 clips in 676 seconds, session06 168. Each clip then
+# needs three ffmpeg stages, so those sessions could never finish processing,
+# sat on PROCESSING for ever, and the load they generated is what stopped
+# systemd petting the 60-second hardware watchdog and hard-reset the Pi.
+#
+# So the tap does nothing now. A run is one clip per camera, start to stop, and
+# stopping keeps it automatically (RECORD_CONFIRM_S = 0). Set
+# RECORD_SAVE_BUTTON=1 to bring the gesture back once the switch is repaired.
+RECORD_SAVE_BUTTON = os.environ.get("RECORD_SAVE_BUTTON", "0") == "1"
+
+# ARMING DELAY. Operator 2026-08-27: "when start recording to its start after 3
+# second not instant and before 3 second not start the recording".
+#
+# Throwing the run lever no longer starts writing immediately - it arms, and
+# recording begins RECORD_START_DELAY_S later. Drop the lever inside that window
+# and NOTHING is recorded: no session directory, no clip, nothing to discard.
+#
+# It earns its place twice. It gives the operator a beat to get their hand off
+# the panel and out of shot, and it makes a knocked lever free - this rig has
+# already produced three dated empty folders in ten seconds from switch bounce
+# alone, and a start that costs nothing until it has been held is a start that
+# bounce cannot fake.
+#
+# 0 disables the delay and starts on the throw, as before.
+RECORD_START_DELAY_S = float(os.environ.get("RECORD_START_DELAY_S", "3.0"))
+
 RECORD_CONFIRM_S = float(os.environ.get("RECORD_CONFIRM_S", "0"))
 
 # How long a run must last before stopping it is worth asking about. Operator's

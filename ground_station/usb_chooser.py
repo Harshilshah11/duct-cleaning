@@ -64,6 +64,26 @@ ACCENT = theme.DARK["blue"]          # #0A84FF - selection, progress, folders
 WARN = theme.DARK["orange"]          # a session still being merged
 BAD = theme.DARK["red"]
 GOOD = theme.DARK["green"]
+
+# POPUP GROUNDS. Both dialogs used WIN - the same near-black as the window behind
+# them - so neither read as a raised surface and the two were indistinguishable
+# from each other. Operator 2026-08-27: "both popup color same ... make some
+# light color".
+#
+# LIGHT, deliberately, against a dark window. A pale sheet is the clearest way to
+# say "this is on top and it wants an answer", and it separates far better than
+# another shade of grey.
+#
+# Then TINTED APART BY WHAT THEY DO, not decorated:
+#   copying  - cool blue. Progress; nothing at stake, nothing to decide.
+#   deleting - warm red. Destructive and unrecoverable, and it must not look
+#              like the harmless one at a glance.
+POPUP_COPY_BG = "#EAF2FE"                      # light blue sheet - progress
+POPUP_COPY_EDGE = "rgba(0, 122, 255, 0.35)"
+POPUP_DEL_BG = "#FDEDEC"                       # light red sheet - destructive
+POPUP_DEL_EDGE = "rgba(255, 59, 48, 0.40)"
+POPUP_INK = theme.LIGHT["label"]               # dark ink, the sheets are light
+POPUP_INK2 = theme.LIGHT["label2"]
 TRACK = theme.DARK["gray4"]
 INK = TEXT
 
@@ -333,26 +353,31 @@ class ProgressPopup(QDialog):
         # Frameless for the same reason the chooser is: there is no window
         # manager to draw a frame, so the window draws its own or has none.
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        # The COPYING sheet - see POPUP_COPY_BG. A light blue surface so it
+        # reads as raised above the dark window, and so it cannot be mistaken
+        # for the red delete sheet. The track is a tint of its own chunk; the
+        # old white-on-dark track vanished once the ground stopped being black.
         self.setStyleSheet(
-            "QDialog { background: %s; }"
-            "QProgressBar { background: rgba(255,255,255,0.10); border: none;"
+            "QDialog { background: %s; border: 1px solid %s;"
+            "   border-radius: 14px; }"
+            "QProgressBar { background: rgba(0,122,255,0.14); border: none;"
             "   border-radius: 4px; height: 8px; text-align: center;"
             "   color: transparent; }"
             "QProgressBar::chunk { background: %s; border-radius: 4px; }"
-            % (WIN, ACCENT))
+            % (POPUP_COPY_BG, POPUP_COPY_EDGE, theme.LIGHT["blue"]))
 
         self.head = QLabel(title)
         self.head.setFont(theme.font_for(theme.HEADLINE, theme.W_SEMIBOLD))
-        self.head.setStyleSheet("color: %s;" % TEXT)
+        self.head.setStyleSheet("color: %s;" % POPUP_INK)
 
         self.count = QLabel("")
         self.count.setFont(theme.font_for(theme.FOOTNOTE, theme.W_MEDIUM))
-        self.count.setStyleSheet("color: %s;" % MUTED)
+        self.count.setStyleSheet("color: %s;" % POPUP_INK2)
         self.count.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.detail = QLabel("Starting\u2026")
         self.detail.setFont(theme.font_for(theme.FOOTNOTE, theme.W_REGULAR))
-        self.detail.setStyleSheet("color: %s;" % FAINT)
+        self.detail.setStyleSheet("color: %s;" % POPUP_INK2)
         self.detail.setWordWrap(False)
 
         self.bar = QProgressBar()
@@ -716,6 +741,12 @@ class UsbChooser(QDialog):
         self._v_next = None
         self._h_dir = 0
         self._saves_seen = None
+        # The confirm popup, while it is up - see _confirm() and on_inputs().
+        self._modal = None
+        self._modal_buttons = []
+        self._modal_index = 0
+        self._modal_h_dir = 0
+        self._modal_saves = None
         self.setWindowTitle("USB DRIVE")
         self.setModal(True)
         # BIGGER, operator 2026-08-26: "big some size in main popup". 760x460
@@ -1032,8 +1063,18 @@ class UsbChooser(QDialog):
     # the end of the list before the operator could let go.
 
     NAV_DEADBAND = 0.45         # of full stick travel
-    NAV_HOLD_S = 2.0            # hold this long before auto-repeat starts
-    NAV_REPEAT_S = 1.0          # then one step per this many seconds
+    # Both retuned on the operator's call 2026-08-27: the wait before a held
+    # stick starts repeating came down 2.0 -> 1.5, and the repeat itself sped up
+    # 1.0 -> 0.3 s per row. At one row a second a fifteen-session list took a
+    # quarter of a minute to cross, which is long enough that the stick feels
+    # broken; 0.3 s crosses it in under five and is still slow enough to stop on
+    # the row you meant.
+    #
+    # The 1.5 s wait is what keeps a single nudge to a single row. Shortening it
+    # much further would start auto-repeating on deliberate one-row moves, which
+    # is the failure the note above records.
+    NAV_HOLD_S = 1.5            # hold this long before auto-repeat starts
+    NAV_REPEAT_S = 0.3          # then one step per this many seconds
 
     def _buttons(self):
         return [self.btn_save, self.btn_delete, self.btn_all,
@@ -1064,6 +1105,18 @@ class UsbChooser(QDialog):
 
     def on_inputs(self, snap):
         """One inputs.py snapshot per UI frame. Safe to call at frame rate."""
+        # THE CONFIRM POPUP TAKES THE WHOLE STICK WHILE IT IS UP.
+        #
+        # QMessageBox.exec() runs a NESTED event loop, so main.py's UI timer
+        # keeps firing and keeps calling this method - the popup does not pause
+        # us the way a blocking call looks like it should. Without this branch
+        # the stick went on driving the cursor in the list BEHIND the popup and
+        # a SAVE press still reached _activate(), which is what the operator saw
+        # as "when move joystick its select and auto select without push select
+        # button". Nothing behind a modal should move.
+        if self._modal is not None:
+            self._modal_inputs(snap)
+            return
         joy = (snap or {}).get("joy") or {}
         # AXES SWAPPED, IN THIS WINDOW ONLY, operator 2026-08-26: "in
         # popup view x is y and y is x ... only change in popup view".
@@ -1155,13 +1208,91 @@ class UsbChooser(QDialog):
 
     # -- actions --------------------------------------------------------------
 
+    def reject(self):
+        """Close the window - and any confirm popup standing on top of it.
+
+        THE FREEZE. main.py calls reject() the moment the daemon reports the
+        stick gone, which can land while _confirm() is inside QMessageBox.exec()
+        - a NESTED event loop owned by the popup. Rejecting the parent then left
+        an orphaned modal with no parent to dismiss it: it kept the application
+        modal and kept its own loop spinning, so every click and every keypress
+        went nowhere. That is the "remove USB without clicking ok and the
+        frontend freezes" report.
+
+        Answering the popup first unwinds its loop, and NO is the right answer
+        to force - the operator never confirmed, and the stick has gone anyway.
+        """
+        if self._modal is not None:
+            try:
+                self._modal.done(QMessageBox.No)
+            except Exception:
+                pass
+            self._modal = None
+            self._modal_buttons = []
+        super().reject()
+
+    def _modal_inputs(self, snap):
+        """Drive the confirm popup from the stick. See _confirm().
+
+        Yes and No sit side by side, so this is the HORIZONTAL axis - and it
+        takes the same swapped axis the rest of this window uses, because the
+        reference is the physical stick under the hand, not the driving frame.
+
+        Edge-triggered on both axes: holding the stick over must not walk the
+        choice back and forth, and the SAVE count is compared with > so a
+        counter reset cannot fire a phantom press.
+        """
+        joy = (snap or {}).get("joy") or {}
+        h = joy.get("y")            # same swap as on_inputs()
+        if h is not None and abs(h) >= self.NAV_DEADBAND:
+            if self._modal_h_dir == 0:
+                self._modal_h_dir = 1 if h > 0 else -1
+                n = len(self._modal_buttons)
+                if n:
+                    self._modal_index = max(
+                        0, min(n - 1, self._modal_index + self._modal_h_dir))
+                    self._paint_modal()
+        else:
+            self._modal_h_dir = 0
+
+        presses = (snap or {}).get("save_presses")
+        if presses is not None and presses != self._modal_saves:
+            if (self._modal_saves is not None and presses > self._modal_saves
+                    and self._modal_buttons):
+                self._modal_buttons[self._modal_index].click()
+            self._modal_saves = presses
+
+    def _paint_modal(self):
+        """Show which button the stick is on.
+
+        setDefault() alone left both buttons looking the same - Qt does not
+        repaint the :default pseudo-state reliably when it moves. The navfocus
+        property with an explicit unpolish/polish does, and it is the same
+        mechanism the main window's nav buttons use.
+        """
+        for i, b in enumerate(self._modal_buttons):
+            on = (i == self._modal_index)
+            b.setDefault(on)
+            b.setProperty("navfocus", "true" if on else "false")
+            st = b.style()
+            st.unpolish(b)
+            st.polish(b)
+            b.update()
+            if on:
+                b.setFocus()
+
     def _confirm(self, title, text):
         box = QMessageBox(self)
         box.setWindowTitle(title)
         box.setText(title)
-        box.setInformativeText(text)
+        box.setInformativeText(
+            text + "\n\nJoystick left / right to choose   \u00b7   SAVE to confirm")
         box.setIcon(QMessageBox.Warning)
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        # "Yes"/"No" says nothing about what is about to happen. The operator is
+        # standing at a panel deciding whether footage gets deleted.
+        box.button(QMessageBox.Yes).setText("Delete")
+        box.button(QMessageBox.No).setText("Cancel")
         box.setDefaultButton(QMessageBox.No)     # never delete on a stray Enter
         box.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         # Qt draws QMessageBox from the app palette, which is light everywhere
@@ -1169,14 +1300,54 @@ class UsbChooser(QDialog):
         # white slab. Dressed by hand rather than by switching the whole app to
         # a dark palette, which would repaint every panel behind it.
         box.setStyleSheet(
-            "QMessageBox { background: %s; }"
+            "QMessageBox { background: %s; border: 1px solid %s;"
+            "   border-radius: 14px; }"
             "QLabel { color: %s; }"
-            "QPushButton { background: rgba(255,255,255,0.12); color: %s;"
+            "QPushButton { background: rgba(0,0,0,0.06); color: %s;"
             "   border: none; border-radius: 7px; padding: 8px 20px;"
             "   min-width: 84px; font-weight: 600; }"
             "QPushButton:default { background: %s; color: #ffffff; }"
-            % (WIN, TEXT, TEXT, BAD))
-        return box.exec() == QMessageBox.Yes
+            # NAVFOCUS IS THE ONE THE STICK IS ON. :default alone was not
+            # enough - Qt does not reliably repaint it when setDefault()
+            # moves, so both buttons looked identical and there was no way
+            # to tell which one SAVE would press. A dynamic property with
+            # an explicit unpolish/polish is what the nav buttons in the
+            # main window already use, so this matches them.
+            "QPushButton[navfocus=\"true\"] { background: %s; color: #ffffff;"
+            "   border: 2px solid #ffffff; }"
+            % (POPUP_DEL_BG, POPUP_DEL_EDGE, POPUP_INK, POPUP_INK,
+               theme.LIGHT["red"], theme.LIGHT["blue"]))
+        # Stick navigation, and NO is index 0 - the cursor starts on the safe
+        # answer for the same reason setDefaultButton does.
+        self._modal = box
+        self._modal_buttons = [b for b in (box.button(QMessageBox.No),
+                                           box.button(QMessageBox.Yes)) if b]
+        self._modal_index = 0
+        self._modal_h_dir = 0
+        # Primed to None so the FIRST snapshot only records the count. A save
+        # press that was already counted before the popup opened must not
+        # answer it.
+        self._modal_saves = None
+        self._paint_modal()
+        try:
+            return box.exec() == QMessageBox.Yes
+        finally:
+            # HAND THE PRESS COUNT BACK, or the press that answered this popup
+            # answers the window underneath it too.
+            #
+            # _modal_inputs counts presses in _modal_saves while the popup is
+            # up, and on_inputs' own _saves_seen is left at whatever it held
+            # when the popup opened. So the instant exec() returns, the next
+            # snapshot looks like a brand-new press to on_inputs, which fires
+            # _activate() - pressing the focused button again and re-opening
+            # the very popup that was just dismissed. CANCEL LOOKED LIKE IT DID
+            # NOTHING: it closed the dialog and the dialog came straight back.
+            # DELETE looked like it worked only because the delete had already
+            # run before the second popup appeared.
+            if self._modal_saves is not None:
+                self._saves_seen = self._modal_saves
+            self._modal = None
+            self._modal_buttons = []
 
     def _start(self, jobs, delete):
         if not jobs:
@@ -1199,7 +1370,28 @@ class UsbChooser(QDialog):
                           % (len(jobs), "" if len(jobs) == 1 else "s", _human(total)))
         self._start(jobs, delete=False)
 
+    # THE CONFIRM POPUPS OPEN OUTSIDE THE UI FRAME, NOT INSIDE IT.
+    #
+    # Both of these are reached from main.tick(): tick -> on_inputs -> _activate
+    # -> btn.click() -> here. Calling QMessageBox.exec() at that point parks a
+    # NESTED event loop inside the frame, and main.tick() is guarded against
+    # re-entry - so for as long as the dialog was up, every following frame
+    # returned immediately and the whole window stopped repainting. That is the
+    # "popup opens and everything freezes" report, and it was the guard doing
+    # it: without the guard the same nesting recursed at 30 frames a second and
+    # hard-reset the Pi through the watchdog instead. Freeze and crash were two
+    # faces of one bug.
+    #
+    # singleShot(0) lets the click handler return first, so tick() finishes and
+    # clears its guard, and the dialog then opens from the event loop with no
+    # frame on the stack beneath it. Frames keep arriving and the cameras keep
+    # running behind the popup, which is what an operator expects of a dialog.
+    #
+    # Nothing else is deferred: only the two paths that raise a modal need it.
     def _delete(self):
+        QTimer.singleShot(0, self._delete_now)
+
+    def _delete_now(self):
         jobs = self._selected()
         if not self._confirm("Delete from the Pi",
                              "Delete %d session%s from the Pi?\n\n"
@@ -1209,6 +1401,9 @@ class UsbChooser(QDialog):
         self._start(jobs, delete=True)
 
     def _delete_all(self):
+        QTimer.singleShot(0, self._delete_all_now)
+
+    def _delete_all_now(self):
         jobs = [r for r in self._rows if r[4] == "ready"]
         held = len(self._rows) - len(jobs)
         if not jobs:
@@ -1252,8 +1447,34 @@ class UsbChooser(QDialog):
     # -- lifecycle ------------------------------------------------------------
 
     def closeEvent(self, event):
-        # A copy in flight owns files on both sides. Let it finish rather than
-        # leaving half a session on the stick with nothing to say so.
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.wait(15000)
+        """Close without ever blocking the UI thread. See the note below.
+
+        THIS USED TO WAIT 15 SECONDS. The intent was sound - a copy in flight
+        owns files on both sides, and letting it finish beats leaving half a
+        session on the stick. But it waited without ever ASKING the worker to
+        stop, and the worker only checks its stop flag BETWEEN jobs, never
+        during a file copy.
+
+        So pulling the stick mid-copy left the worker blocked on I/O to a device
+        that no longer existed, while the UI thread sat inside wait() doing
+        nothing. The whole frontend stopped for fifteen seconds, and longer if
+        the I/O never returned at all - which is the "remove USB without exit
+        and the frontend freezes" report. A stick that has physically gone is
+        exactly the case where waiting for the copy cannot help: there is
+        nothing left to finish writing to.
+
+        So: ask it to stop, give it a short grace in case it is between files,
+        and if it is still stuck, abandon it with its signals cut so it cannot
+        call back into a window that is being destroyed.
+        """
+        w = self._worker
+        if w is not None and w.isRunning():
+            w.stop()
+            if not w.wait(1200):
+                for sig in (w.progressed, w.finished_ok, w.failed):
+                    try:
+                        sig.disconnect()
+                    except (RuntimeError, TypeError):
+                        pass
+                self._worker = None
         super().closeEvent(event)

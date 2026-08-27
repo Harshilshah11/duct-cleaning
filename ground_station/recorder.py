@@ -1265,7 +1265,8 @@ class SessionManager:
         self._clip_since = None
 
         self._toast = None          # (text, detail, monotonic_expiry)
-        self._last_saves = None     # last save_presses count acted on
+        self._last_saves = None
+        self._arm_at = None     # monotonic when the run lever was thrown     # last save_presses count acted on
         self._hold_s = 0.0          # how long SAVE is currently held (pushed in)
 
         # Every file this session has handed to a recorder, so a discard can
@@ -1676,9 +1677,28 @@ class SessionManager:
             pass
 
     def set_state(self, state):
-        """Push the decoded switch state. Safe to call at the UI frame rate."""
+        """Push the decoded switch state. Safe to call at the UI frame rate.
+
+        THE RUN ARMS BEFORE IT STARTS - see config.RECORD_START_DELAY_S. A throw
+        of the lever is held here, not acted on, until the delay has elapsed;
+        dropping it inside the window leaves no session behind at all, because
+        _start() was never called.
+        """
         if state not in (RECORDING, PAUSED, STOPPED):
             return
+
+        # --- arming ---------------------------------------------------------
+        delay = config.RECORD_START_DELAY_S
+        if delay > 0 and self.state == STOPPED and state in (RECORDING, PAUSED):
+            now = time.monotonic()
+            if self._arm_at is None:
+                self._arm_at = now
+                return                      # armed; nothing written yet
+            if now - self._arm_at < delay:
+                return                      # still counting; keep waiting
+            # held long enough - fall through and start for real
+        self._arm_at = None
+
         if state == self.state:
             # Still has to keep the clock honest across the frames *between*
             # transitions - _roll() is the idempotent part.
@@ -1753,7 +1773,10 @@ class SessionManager:
         if self._last_saves is None or presses > self._last_saves:
             fire = self._last_saves is not None
             self._last_saves = presses
-            if fire:
+            # DISABLED BY DEFAULT - see config.RECORD_SAVE_BUTTON. The counter is
+            # still tracked so re-enabling it cannot fire a backlog of presses
+            # that arrived while it was off.
+            if fire and config.RECORD_SAVE_BUTTON:
                 self.save_clip()
 
     def finalize(self):
@@ -1825,6 +1848,12 @@ class SessionManager:
             # PENDING outranks the switch state: the switch says STOPPED, but
             # what the operator has to act on is the unanswered question.
             "state": PENDING if left is not None else self.state,
+            # Seconds still to wait before a thrown lever starts writing, or
+            # None when nothing is arming. See RECORD_START_DELAY_S.
+            "arming_left": (
+                max(0.0, config.RECORD_START_DELAY_S
+                    - (time.monotonic() - self._arm_at))
+                if self._arm_at is not None else None),
             "pending_left": left,
             "pending_held": self._pending["held"] if self._pending else None,
             "pending_clips": self._pending["clips"] if self._pending else None,

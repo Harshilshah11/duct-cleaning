@@ -1033,6 +1033,54 @@ SESSION_LATCHING = os.environ.get("SESSION_LATCHING", "1") == "1"
 # ever come in pairs; every extra sample is 50 ms of lag on a real throw.
 DEBOUNCE_SAMPLES = int(os.environ.get("INPUTS_DEBOUNCE", "2"))
 
+# A LONGER DEBOUNCE FOR THE SAVE PIN ALONE, and it is measured rather than
+# picked. GPIO25 shares a wire with the dead GPIO9 and the line will not settle:
+# 427 level changes in 15 seconds with nobody near the panel. But chatter cannot
+# HOLD a level - measured over that window:
+#
+#     shortest run   4 ms
+#     median        16 ms
+#     p90           89 ms
+#     longest      264 ms   <-- the number this has to beat
+#
+#     debounce 100 ms (the old floor) ->  30 of 427 runs survive  = phantom saves
+#     debounce 300 ms                 ->   0 of 427 survive
+#
+# 500 ms is 300 with the margin doubled, because 264 ms was the worst run seen
+# in one sample window and the next one may be worse.
+#
+# THIS COSTS NOTHING ON A LATCHING SWITCH. A latch that has been thrown holds
+# its level indefinitely, so it clears any floor; only a glitch has to be short,
+# and every one of them is. The pin it protects is the one that ticks rows in
+# the USB chooser, where a phantom press selects footage nobody chose.
+#
+# It is a MITIGATION, not a repair: the shared GPIO9 wire is still the fault and
+# pulling it is still the right fix. Set INPUTS_SAVE_DEBOUNCE_MS=0 to fall back
+# to the common floor once it has been removed.
+# DEFAULT 0 - THE LONG DEBOUNCE IS OFF, because it did not work and the reason
+# is worth keeping.
+#
+# The idea was sound on paper: chatter cannot hold a level (worst run measured
+# 264 ms) while a thrown latch holds for ever, so a 500 ms floor should pass one
+# and reject the other. It did reject the chatter - the app saw zero phantom
+# presses. It also rejected every REAL press, because a floor of 500 ms needs
+# ten CONSECUTIVE agreeing samples and a line changing every ~36 ms never gives
+# ten of anything. The button went from firing by itself to not firing at all,
+# which is not an improvement.
+#
+# The fault is not filterable, and the measurement says exactly why. Toggling
+# GPIO9 s bias alone, with nothing else changed:
+#
+#     GPIO9 pull-up   -> GPIO25 chatters   189 and 205 edges per 6 s
+#     GPIO9 pull-down -> GPIO25 dead still   0 edges
+#
+# GPIO9 is shorted to ground and shares a wire with GPIO25, so GPIO25 sits
+# between GPIO9 s pull-up and that short and oscillates. Pulling GPIO9 down
+# stops the noise but parks the line at "pressed" for ever, so neither bias
+# leaves a working button. THE WIRE TO GPIO9 (header pin 21) HAS TO COME OFF -
+# no debounce can help, and this one made it worse.
+SAVE_DEBOUNCE_MS = float(os.environ.get("INPUTS_SAVE_DEBOUNCE_MS", "0"))
+
 # STUCK_CLOSED_S IS GONE, and deliberately not replaced. It timed how long a
 # line could read closed before being called a short. That test was removed the
 # same day it was added - see _fault_filter - because a latching switch left
@@ -1043,8 +1091,23 @@ DEBOUNCE_SAMPLES = int(os.environ.get("INPUTS_DEBOUNCE", "2"))
 # the save button's real ~170 ms press - so duration cannot separate them, but
 # rate can. 30 edges in 5 s is 3 full presses a second sustained for five
 # seconds, which no hand produces and which the measured noise clears sixfold.
-CHATTER_WINDOW_S = float(os.environ.get("INPUTS_CHATTER_WINDOW_S", "5.0"))
-CHATTER_EDGES = int(os.environ.get("INPUTS_CHATTER_EDGES", "30"))
+CHATTER_WINDOW_S = float(os.environ.get("INPUTS_CHATTER_WINDOW_S", "10.0"))
+# RE-SIZED 2026-08-27 after the SAVE switch on GPIO25 started chattering too.
+#
+# The first threshold was set from GPIO9, which ran ~11 debounced edges/second;
+# 30-in-5s caught that easily. GPIO25 chatters SLOWER - measured 551 raw edges
+# in 20 s with nobody near the panel, arriving at the app as roughly 4 debounced
+# edges/second, or about 20 in a 5 s window. It slipped under the old bar, and
+# every phantom edge became a SAVE press: in the USB chooser each one calls
+# _activate(), which ticks or unticks whatever row the cursor is on. The
+# operator saw rows selecting and deselecting themselves and read it, sensibly,
+# as the joystick doing it.
+#
+# A LONGER window rather than just a lower count, because that is what separates
+# the two cases. Chatter is SUSTAINED; a hand presses in bursts. 24 edges in 10 s
+# is 1.2 presses/second held for ten seconds straight, which no operator does,
+# while the measured chatter turns in 40.
+CHATTER_EDGES = int(os.environ.get("INPUTS_CHATTER_EDGES", "24"))
 
 # Â±6.144 V PGA over a 16-bit signed range. 3.3 V rail => ~17600 counts full scale.
 COUNTS_PER_VOLT = 32768 / 6.144
@@ -1090,7 +1153,21 @@ FULL_SCALE = 3.3 * COUNTS_PER_VOLT
 #   switch    GPIO11 ... START / STOP     (UNCONFIRMED - never seen to move)
 SWITCHES = [
     ("BRUSH", 27),
-    ("SAVE", 25),
+    # SAVE MOVED 25 -> 5, 2026-08-27, operator rewired it. Measured before and
+    # after, hands off the panel:
+    #
+    #     GPIO25   341 edges in 12 s   chattering, unusable
+    #     GPIO5      0 edges in 12 s   steady high
+    #
+    # And with the button worked: 13 presses of 190-460 ms each, clean release
+    # between every one, not a single bounce. It reads as a MOMENTARY button,
+    # which is what the edge-counting in _read_switches was written for in the
+    # first place - see SAVE_PIN.
+    #
+    # GPIO25 was never faulty itself. It was tied to GPIO9, which is shorted to
+    # ground, so it sat between its own pull-up and that short and oscillated.
+    # Neither pin is read any more, so the short no longer reaches anything.
+    ("SAVE", 5),
     ("START / STOP", 11),
     ("PAUSE / RESUME", 17),
 ]
@@ -1174,7 +1251,15 @@ ALL_PINS = [p for _, p in SWITCHES] + [ACT_EXTEND_PIN, ACT_RETRACT_PIN]
 # GPIO9 wire is physically off the panel.
 #
 # GPIO22 was checked the same way and does NOT affect GPIO17, so it stays out.
-PARKED_PINS = [9]
+# EMPTY AGAIN. GPIO9 was held here with a pull-up for one reason: it is wired to
+# GPIO25 and, released, its default pull-DOWN dragged that line low. SAVE has
+# since moved to GPIO5, so GPIO25 is no longer read by anything and GPIO9 has
+# nothing left to poison. Both are now unclaimed and harmless where they sit.
+#
+# Put a pin back in here if a dead line is ever found sharing a wire with a live
+# one again - the note above is the whole argument for why that is not the same
+# as "release what you do not read".
+PARKED_PINS = []
 
 
 # SHORTED PINS: GPIO9 AND GPIO22 ARE DEAD, MEASURED 2026-08-25.
@@ -1216,7 +1301,7 @@ PARKED_PINS = [9]
 # reads identically to a short, which is the trap this panel set twice before.
 # What settled it was measuring with the switches OFF the rig.
 
-SAVE_PIN = 25           # moved off shorted GPIO9 2026-08-25 - see SHORTED PINS
+SAVE_PIN = 5            # moved off the GPIO9-poisoned GPIO25, 2026-08-27
 def _blank():
     """Snapshot shape, used before the first read and whenever hardware is absent."""
     return {
@@ -2062,7 +2147,14 @@ class InputReader(threading.Thread):
         if not self._stable:
             self._stable = dict(raw)
             return dict(raw)
+        # Samples needed per pin. Everything keeps the common floor; SAVE gets
+        # its own because its line does not settle - see SAVE_DEBOUNCE_MS.
+        save_runs = DEBOUNCE_SAMPLES
+        if SAVE_DEBOUNCE_MS > 0:
+            save_runs = max(DEBOUNCE_SAMPLES,
+                            int(round(SAVE_DEBOUNCE_MS / 1000.0 * POLL_HZ)))
         for pin, value in raw.items():
+            need = save_runs if pin == SAVE_PIN else DEBOUNCE_SAMPLES
             if value == self._stable[pin]:
                 # Back to the believed level before it was ever accepted - the
                 # blip is over, so forget it rather than counting it toward the
@@ -2071,7 +2163,7 @@ class InputReader(threading.Thread):
                 continue
             prev, runs = self._candidate.get(pin, (value, 0))
             runs = runs + 1 if prev == value else 1
-            if runs >= DEBOUNCE_SAMPLES:
+            if runs >= need:
                 self._stable[pin] = value
                 self._candidate.pop(pin, None)
             else:

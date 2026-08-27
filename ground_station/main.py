@@ -772,6 +772,7 @@ class GroundStationWindow(QWidget):
         for stream in self.streams:
             stream.start()
 
+        self._in_tick = False       # see tick()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(max(1, int(1000 / config.UI_FPS)))
@@ -972,6 +973,33 @@ class GroundStationWindow(QWidget):
     # -- main loop -----------------------------------------------------------
 
     def tick(self):
+        """The UI frame. NON-REENTRANT, and that is the whole point.
+
+        WHY THIS GUARD EXISTS. Any modal opened from inside a frame - the USB
+        chooser's delete confirmation is the one that caught us - runs its own
+        NESTED event loop via exec(). That loop keeps servicing timers, so this
+        QTimer went on firing at UI_FPS and re-entered tick() while the previous
+        call was still parked inside the modal. Thirty new frames a second, each
+        one refreshing both camera panels, stacked up behind a dialog waiting
+        for a human.
+
+        The result was not a slow UI, it was a dead machine: the Pi ran out of
+        headroom, SSH stopped answering, and it needed a power cycle. That is
+        the "popup opens and after all freeze pi ssh and all" report.
+
+        Returning early is correct rather than merely safe - a frame that
+        arrives while the last one is still running has nothing new to draw, and
+        the modal is what the operator is looking at anyway.
+        """
+        if self._in_tick:
+            return
+        self._in_tick = True
+        try:
+            self._tick_body()
+        finally:
+            self._in_tick = False
+
+    def _tick_body(self):
         for index, panel in enumerate(self.panels):
             panel.refresh()
             stream = panel.stream
