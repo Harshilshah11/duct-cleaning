@@ -13,27 +13,41 @@
  * without a reflash, and it keeps the code that runs next to the motors small
  * enough to audit in one sitting.
  *
- * PIN MAP (from Harshil, 2026-08-14):
+ * PIN MAP — the rig's wiring, confirmed by the operator 2026-08-27:
  *
- *   channel 1 / LEFT    DIR1 = D9    PWM1 = D10
- *   channel 2 / RIGHT   DIR2 = D8    PWM2 = D11
+ *   channel 1 / LEFT    DIR1 = A1    PWM1 = D3   (Timer2)
+ *   channel 2 / RIGHT   DIR2 = D8    PWM2 = D6   (Timer0)
  *
- * DO NOT run this sketch with the W5100/W5500 Ethernet shield fitted. That
- * shield owns D10-D13 for SPI (D10 is its chip select) and D4 for the SD slot,
- * so D10 and D11 as motor PWM collide with it directly. This pin map is only
- * available BECAUSE the link moved from the shield to the USB tether. If the
- * shield ever goes back on, the motor pins must move — not the other way round.
+ * BROUGHT INTO LINE 2026-08-27. This sketch used to carry the original
+ * 2026-08-14 map, DIR1=D9 / PWM1=D10 / PWM2=D11, from back when it was the only
+ * sketch and the shield was off. The rig has since been rewired and the other
+ * two sketches moved with it; this one had not. A robot has ONE wiring loom, so
+ * a sketch holding a different map is not a variant, it is a trap: flash it and
+ * the left wheel drives from a pin that is now the brush's gate.
  *
- * D10 and D11 are both PWM-capable (D9/D10 = Timer1, D11 = Timer2), which is
- * why the DIR lines got D9 and D8: a direction pin only needs digitalWrite, so
- * it must never occupy one of the six PWM pins that a second motor might want.
+ * THE OLD MAP'S SHIELD WARNING IS GONE WITH IT, and that is an improvement
+ * rather than a loss. D10 and D11 collided with the W5100/W5500 directly (D10 is
+ * its chip select, D11 its MOSI), so the old map could only be used with the
+ * shield off. D3 and D6 clear the shield entirely, so this sketch no longer
+ * cares whether the shield is fitted. D4 still belongs to the shield's microSD
+ * slot; nothing here touches it.
  *
- * PWM runs at the stock ~490 Hz. That is inside the audible band and some
- * drivers whine at it. Timer1 can be pushed to ~31 kHz with
- * `TCCR1B = (TCCR1B & 0xF8) | 0x01;` but that only moves D9/D10 — D11 is on
- * Timer2 and would still sit at 490 Hz, giving the two motors different PWM
- * frequencies. Change both or neither; mismatched channels behave differently
- * at the same demand, which reads as a mechanical fault.
+ * DIR1 SPENDS NO PWM PIN. A direction line only needs digitalWrite, so it sits
+ * on A1 - an analog-capable pin used as plain digital I/O - and leaves every
+ * timer pin for something that actually needs to be dimmed. That is the same
+ * reasoning the old map used to justify D9, applied to the current wiring.
+ *
+ * PWM runs at the stock rate on both channels: D3 is Timer2 (~490 Hz) and D6 is
+ * Timer0 (~980 Hz). THE TWO ARE NOT EQUAL, and that matters more than the
+ * absolute numbers - channels on different frequencies answer the same demand
+ * differently and read as a pull to one side on a straight run. uno_eth_link
+ * solves this by putting both on fast timers; this sketch is the minimal
+ * wheels-only build and leaves the stock rates alone. If a straight-line pull
+ * appears here and not there, suspect this before suspecting the motors.
+ *
+ * THIS SKETCH DRIVES WHEELS ONLY - no brush, no actuator, no light. It predates
+ * all three. uno_usb_link is the current USB-tether build and drives everything;
+ * prefer it unless you specifically want something this small to audit.
  *
  * FAILSAFE — the reason this is more than a parse loop. If no valid command
  * arrives for FAILSAFE_MS, safeState() stops both motors. A tethered robot that
@@ -45,10 +59,10 @@
  */
 
 // --- Motor driver pins -------------------------------------------------------
-const uint8_t DIR1 = 9;    // channel 1 direction  (LEFT)
-const uint8_t PWM1 = 10;   // channel 1 speed
+const uint8_t DIR1 = A1;   // channel 1 direction  (LEFT)  - was D9 until 2026-08-27
+const uint8_t PWM1 = 3;    // channel 1 speed, Timer2       - was D10
 const uint8_t DIR2 = 8;    // channel 2 direction  (RIGHT)
-const uint8_t PWM2 = 11;   // channel 2 speed
+const uint8_t PWM2 = 6;    // channel 2 speed, Timer0       - was D11
 
 const uint8_t STATUS_LED = LED_BUILTIN;
 

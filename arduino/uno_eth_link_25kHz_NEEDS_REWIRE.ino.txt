@@ -1,3 +1,25 @@
+/* ===========================================================================
+ * DO NOT FLASH THIS AS-IS. ITS PIN MAP IS NOT THE RIG'S.
+ *
+ * Checked 2026-08-27 against the wiring the operator confirmed - DIR1 = A1 and
+ * BRUSH_PWM = D9 - and this file disagrees on both counts:
+ *
+ *     here                       the rig
+ *     DIR1      = A2             DIR1      = A1
+ *     BRUSH_PWM = A1             BRUSH_PWM = D9
+ *
+ * That is deliberate and it is the point of the file: this is the 25 kHz
+ * experiment, and the filename says NEEDS_REWIRE because reaching 25 kHz meant
+ * moving DIR1 off its pin to free a timer. It is kept as .txt, not .ino, so no
+ * IDE offers to build it by accident.
+ *
+ * The three live sketches - uno_eth_link, uno_usb_link, uno_serial_drive - all
+ * carry the rig's map. This one is a proposal that was never wired. If you ever
+ * adopt it, REWIRE FIRST and move the other three with it; a robot has one loom,
+ * and a sketch that disagrees with it fails as a mechanical fault, not as a
+ * compile error.
+ * =========================================================================== */
+
 /*
  * uno_eth_link — Arduino Uno + W5100/W5500 Ethernet shield, driving a dual
  * channel motor driver from ground station joystick data (guide Steps 8-9).
