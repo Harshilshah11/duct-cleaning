@@ -56,16 +56,20 @@ import time
 # 50 Hz: six frames inside the sketch's 300 ms failsafe, so five can be lost in
 # a row without the motors cutting out.
 SEND_HZ = float(os.environ.get("UNO_SEND_HZ", "50"))
-# 250000 on the operator's order 2026-08-26, up from 115200, for throughput.
+# 115200 on the operator's order 2026-08-27, back down from 250000 (which had
+# been raised from 115200 the day before, for throughput).
 #
 # THIS NUMBER IS ONE HALF OF A PAIR. The other half is SERIAL_BAUD in
 # uno_usb_link.ino and the two must be identical - a mismatch is not a slow
 # link, it is a dead one, and it looks exactly like a board flashed with the
 # wrong sketch (sent N / acked 0). Change one, reflash the other.
 #
-# It is also the EXACT rate for a 16 MHz AVR: UBRR=7 with U2X gives 250000.0
-# against 115200's 117647.1 (+2.12%). See the note in the sketch.
-BAUD = int(os.environ.get("UNO_BAUD", "250000"))
+# NOTE THE ACCURACY COST OF THIS RATE. On a 16 MHz AVR, UBRR=7 with U2X gives
+# 250000.0 exactly; 115200 needs UBRR=16 and actually runs at 117647.1, +2.12%.
+# That is inside the ~4% a UART tolerates, so it works - with less margin than
+# the rate it replaced. Framing garbage here is the symptom to expect if that
+# margin ever runs out. See the note in the sketch.
+BAUD = int(os.environ.get("UNO_BAUD", "115200"))
 
 # Opening the port resets the board; nothing sent before this elapses arrives.
 OPEN_SETTLE_S = float(os.environ.get("UNO_OPEN_SETTLE_S", "1.8"))

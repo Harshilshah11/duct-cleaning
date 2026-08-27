@@ -346,6 +346,12 @@ const bool BRUSH_ACTIVE_HIGH = true;
 // in sync for no benefit. A brush motor's inertia makes 250 Hz ripple
 // invisible, exactly as it does for the rod.
 int brushDuty = 0;
+// Where the brush is being ramped TO, and when the last ramp step landed. See
+// serviceBrushPwm(). 1500 ms is slow enough to blunt the locked-rotor inrush and
+// short enough that the operator still reads the brush as coming on at once.
+int brushTarget = 0;
+unsigned long brushRampLastMs = 0;
+// BRUSH_RAMP_MS is defined with the other scaled durations, below MILLIS_SCALE.
 
 // The smallest duty that actually TURNS the brush rather than buzzing it, the
 // same physics as MIN_DUTY on the wheels. Any non-zero demand is stretched
@@ -387,6 +393,23 @@ const bool INVERT_2 = true;
 //
 // If Timer0 is ever put back to its stock prescaler, set this to 1.
 const unsigned long MILLIS_SCALE = 64;
+
+// Serial is DIAGNOSTIC ONLY in this sketch - commands and telemetry ride
+// Ethernet - so this rate has to match only whatever reads the port: the Arduino
+// IDE monitor, `screen /dev/ttyACM0 115200`, and diag/uno_logger.py on the Pi.
+// A mismatch costs the log rather than the robot, but it costs all of it.
+//
+// 115200 on the operator's order 2026-08-27, back down from 250000 (itself
+// raised from 115200 on 2026-08-26). See the note at Serial.begin() for the
+// accuracy tradeoff that swap carries.
+const unsigned long SERIAL_BAUD = 115200;
+
+// How long the brush takes to reach full duty from a standstill - see
+// serviceBrushPwm(). Slow enough to blunt the locked-rotor inrush that was
+// resetting the board, short enough that the operator still reads the brush as
+// coming on at once. Lives here rather than beside brushTarget because it is
+// scaled, and MILLIS_SCALE is not in scope any earlier than this line.
+const unsigned long BRUSH_RAMP_MS = 1500UL * MILLIS_SCALE;
 
 // 300 ms REAL: long enough to ride out a handful of dropped datagrams at the
 // 50 Hz command rate, short enough that the robot stops within a third of a
@@ -543,6 +566,22 @@ void applyMotor(uint8_t dirPin, uint8_t pwmPin, int demand, bool invert) {
  * direction is a constant, but writing it here means a channel that browns out
  * and comes back gets its direction restored by the next frame rather than
  * running whichever way its input floated to. */
+/* The only place the brush pin is actually written.
+ *
+ * The two ENDPOINTS still use digitalWrite rather than analogWrite(0)/(255): on
+ * a timer pin a zero duty can still emit a narrow pulse every period, which is a
+ * creeping motor - the same caveat this file already records for D6 and D5. A
+ * hard level is the only certain stop, and the only certain full-on. */
+void writeBrushHardware(int duty) {
+  if (duty <= 0) {
+    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
+  } else if (duty >= MAX_PWM) {
+    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? HIGH : LOW);
+  } else {
+    analogWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? duty : (MAX_PWM - duty));
+  }
+}
+
 void applyBrush(int duty) {
   if (duty < 0) duty = 0;
   if (duty > MAX_PWM) duty = MAX_PWM;
@@ -557,20 +596,24 @@ void applyBrush(int duty) {
            + (int)(((long)(duty - 1) * (MAX_PWM - BRUSH_MIN_DUTY))
                    / (MAX_PWM - 1));
   }
-  brushDuty = duty;
-  // The static endpoints are written HERE as well as in serviceBrushPwm(), so
-  // a stop takes effect on this very line rather than on the next loop() pass.
-  // HARDWARE PWM on D9 now. The two ENDPOINTS still use digitalWrite rather
-  // than analogWrite(0)/analogWrite(255): on a timer pin a zero duty can still
-  // emit a narrow pulse every period, which is a creeping motor - the same
-  // caveat this file already records for D6 and D5. A hard level is the only
-  // certain stop, and the only certain full-on.
-  if (duty <= 0) {
-    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
-  } else if (duty >= MAX_PWM) {
-    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? HIGH : LOW);
-  } else {
-    analogWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? duty : (MAX_PWM - duty));
+  // RISING DEMAND IS RAMPED, FALLING DEMAND IS IMMEDIATE - see
+  // serviceBrushPwm(). Only the target is set here; the ramp does the writing.
+  // ANCHOR THE RAMP CLOCK WHEN A RISE BEGINS. Without this the ramp does
+  // nothing on the first switch-on: brushRampLastMs starts at 0, so the very
+  // first step measures the whole uptime as elapsed, computes hundreds of
+  // steps, and slams to full duty - exactly the inrush the ramp exists to
+  // prevent. Only a SECOND switch-on shortly after would have ramped, which is
+  // the kind of bug that tests clean and fails in the field.
+  if (duty > brushDuty && brushDuty >= brushTarget) {
+    brushRampLastMs = millis();
+  }
+  brushTarget = duty;
+  if (duty <= brushDuty) {
+    // A stop, or any reduction, takes effect on THIS line. Never make stopping
+    // wait for a ramp: the failsafe stop and the operator's off switch both
+    // come through here and both must be instant.
+    brushDuty = duty;
+    writeBrushHardware(brushDuty);
   }
 }
 
@@ -580,13 +623,42 @@ void applyBrush(int duty) {
  * only the middle range is chopped — where a stalled loop costs a slower
  * brush, never a runaway one. Shares ACT_PWM_PERIOD_US; both mechanisms are
  * far too slow mechanically to care about 250 Hz ripple. */
+/* BRUSH SOFT-START. Added 2026-08-27; this stub used to be the software
+ * chopper, and it is now the ramp.
+ *
+ * WHY. applyBrush(255) drove the pin high in one step, which is a 0-to-100%
+ * slam into a motor that is not yet turning. A stalled DC motor draws its
+ * locked-rotor current - several times its running current - until it spins up,
+ * and on a rail shared with the Uno that is exactly the sag that resets the
+ * board or wedges the shield. The operator sees it as the robot disconnecting
+ * and reconnecting for as long as the brush is on.
+ *
+ * Ramping the duty spreads that inrush over BRUSH_RAMP_MS instead of drawing it
+ * all at once, and by the time full duty arrives the motor is already turning
+ * and its back-EMF has brought the current down on its own.
+ *
+ * RISING ONLY. Falling demand is applied immediately in applyBrush() - a stop
+ * must never wait for a ramp.
+ *
+ * Called every pass of loop() and from the failsafe path, the same contract the
+ * chopper had, so no call site needed unpicking. */
 void serviceBrushPwm() {
-  // NOTHING TO DO ANY MORE. The brush moved to D9 (Timer1) on 2026-08-27 and
-  // its duty is applied in hardware by applyBrush(). Kept as an empty call so
-  // the two loop() sites and the failsafe path need no unpicking - and so this
-  // note sits exactly where the software chopper used to be. If the brush is
-  // ever moved back to a timer-less pin the old body is in git history, and
-  // ACT_PWM_PERIOD_US is still here because the rod still needs it.
+  if (brushDuty >= brushTarget) return;          // falling is handled instantly
+
+  const unsigned long now = millis();
+  // Scaled, like every other duration here: Timer0 runs at prescaler 1 for the
+  // 62.5 kHz brush PWM, so millis() counts MILLIS_SCALE times too fast.
+  unsigned long stepEvery = BRUSH_RAMP_MS / (unsigned long)MAX_PWM;
+  if (stepEvery == 0) stepEvery = 1;
+
+  if (now - brushRampLastMs < stepEvery) return;
+  unsigned long steps = (now - brushRampLastMs) / stepEvery;
+  brushRampLastMs += steps * stepEvery;
+
+  long next = (long)brushDuty + (long)steps;
+  if (next > brushTarget) next = brushTarget;
+  brushDuty = (int)next;
+  writeBrushHardware(brushDuty);
 }
 
 /* Linear actuator: D7 picks the direction, D4 gates it, zero holds position.
@@ -823,7 +895,65 @@ void printPin(uint8_t pin) {
   }
 }
 
+/* WHY DID THE BOARD RESTART? Added 2026-08-27.
+ *
+ * Operator: "when i turn on brush to robo disconnect connect disconnect connect
+ * continuosly". The ping log agrees - seventeen down/up flaps in four minutes,
+ * only while the brush was running. That is either the AVR resetting or the
+ * shield wedging, and the two want completely different fixes, so the board now
+ * says which.
+ *
+ * MCUSR holds the reset source, but it must be read before the C runtime and
+ * before anything else clobbers it - hence .init3, which runs ahead of the .bss
+ * clear in .init4. BORF there is a BROWN-OUT: the 5V rail sagged below the
+ * detector threshold and the chip reset itself. That is the signature a motor
+ * inrush leaves. Optiboot may clear MCUSR before we ever see it, which is what
+ * the .noinit counter below is for.
+ *
+ * .noinit survives a RESET but not a POWER LOSS - RAM holds its contents down to
+ * roughly 1.5V while the brown-out detector trips at about 2.7V. So a magic word
+ * that is still intact means the board reset with power broadly maintained (a
+ * brown-out or an external reset); a garbage magic means the rail actually
+ * collapsed. That distinction is the whole question here, and it does not depend
+ * on the bootloader leaving MCUSR alone. */
+uint8_t  resetFlags  __attribute__((section(".noinit")));
+uint16_t bootCount   __attribute__((section(".noinit")));
+uint16_t bootMagic   __attribute__((section(".noinit")));
+bool     ramSurvived = false;
+static const uint16_t BOOT_MAGIC = 0xB07F;
+
+void captureResetCause(void) __attribute__((naked, used, section(".init3")));
+void captureResetCause(void) {
+  resetFlags = MCUSR;
+  MCUSR = 0;
+}
+
+void reportResetCause() {
+  Serial.print(F("RESET: flags=0x"));
+  Serial.print(resetFlags, HEX);
+  if (resetFlags & _BV(PORF))  Serial.print(F(" POWER-ON"));
+  if (resetFlags & _BV(EXTRF)) Serial.print(F(" EXTERNAL"));
+  if (resetFlags & _BV(BORF))  Serial.print(F(" BROWN-OUT"));
+  if (resetFlags & _BV(WDRF))  Serial.print(F(" WATCHDOG"));
+  Serial.print(ramSurvived ? F("  ram=KEPT (reset, rail held)")
+                           : F("  ram=LOST (true power loss)"));
+  Serial.print(F("  boot#"));
+  Serial.println(bootCount);
+}
+
 void setup() {
+
+  // Boot bookkeeping before anything can use RAM for other purposes. See the
+  // .noinit note above: intact magic means we reset without losing the rail.
+  if (bootMagic != BOOT_MAGIC) {
+    bootMagic = BOOT_MAGIC;
+    bootCount = 0;
+    ramSurvived = false;
+  } else {
+    bootCount++;
+    ramSurvived = true;
+  }
+
 
   // THE BRUSH IS SILENCED FIRST, BEFORE ANYTHING ELSE IN THIS FUNCTION.
   //
@@ -879,13 +1009,23 @@ void setup() {
   //
   // It buys headroom rather than speed: the telemetry block at the bottom of
   // loop() prints on every change, rate-limited to 200 ms, and at 9600 a long
-  // line took ~90 ms of that budget. At 250000 it takes under 4 ms, so the
-  // print can no longer sit in the way of a command being serviced.
+  // line took ~90 ms of that budget. At 115200 it takes under 9 ms, so the print
+  // still cannot sit in the way of a command being serviced.
   //
-  // YOUR SERIAL MONITOR MUST SUPPORT 250000 or the banner reads as garbage -
-  // the Arduino IDE offers it, `screen /dev/ttyACM0 250000` takes it, and some
-  // older terminal programs stop at 115200.
-  Serial.begin(250000);
+  // 115200 ON THE OPERATOR'S ORDER 2026-08-27, back down from 250000, and the
+  // tradeoff is recorded here so nobody has to rediscover it. On a 16 MHz AVR:
+  //
+  //     250000 -> UBRR=7   actual 250000.0   error  0.00%
+  //     115200 -> UBRR=16  actual 117647.1   error +2.12%
+  //
+  // 2.12% is inside the ~4% a UART tolerates, so it works - but with less margin
+  // for a long cable or a warm clock than the rate it replaces.
+  //
+  // If the banner ever comes back as garbage, that missing margin is the first
+  // thing to suspect. Every ordinary terminal handles 115200, which 250000 could
+  // not always claim.
+  Serial.begin(SERIAL_BAUD);
+  reportResetCause();
 
   // Outputs are driven to a stopped state BEFORE they become outputs, so the
   // pins cannot glitch high in the gap between pinMode and the first write.

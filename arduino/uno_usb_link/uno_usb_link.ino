@@ -40,8 +40,8 @@
  * for one evening the pot set the speed here, and it was reverted on the
  * operator's call ("keep 255": one knob feeding both the lamp and the brush
  * meant dimming one slowed the other) without needing a reflash, precisely
- * because only the Pi's brush_demand() had to change. A1 has no timer, so a
- * mid-range duty would be synthesised in software — see serviceBrushPwm(), the
+ * because only the Pi's brush_demand() had to change. A mid-range duty is
+ * synthesised in software — see serviceBrushPwm(), the
  * same mechanism the rod uses on D4; at 0 and 255 it resolves to a static
  * level and costs nothing.
  *
@@ -66,18 +66,19 @@
  * MOTOR PIN MAP — chosen around the shield, NOT freely
  * ---------------------------------------------------------------------------
  *
- *   channel 1 / LEFT    DIR1 = D9        PWM1 = D3    (Timer2)
+ *   channel 1 / LEFT    DIR1 = A1        PWM1 = D3    (Timer2)
  *   channel 2 / RIGHT   DIR2 = D8        PWM2 = D6    (Timer0)
  *   linear actuator     ACT_DIR = D7     ACT_PWM = D4  (LOW extends! see below)
- *   brush motor         BRUSH_DIR = D2   BRUSH_PWM = A1 (held 255, on/off)
+ *   brush motor         BRUSH_DIR = D2   BRUSH_PWM = D9 (soft-PWM, 0..255)
  *   light               LIGHT_DIR = A0   LIGHT_PWM = D5 (Timer0)
  *
  * EVERY PIN IS NOW SPOKEN FOR. D0/D1 are the USB serial this telemetry goes out
  * on, D10-D13 belong to the shield, and all four of the Uno's usable PWM pins
- * (D3, D5, D6, D9) are allocated — D9 to a direction line, which is the one
- * place a PWM pin is still spendable if something else ever needs dimming.
- * A1 is the brush's speed line, a static HIGH that needs no timer; A2-A5 are
- * spare plain digital I/O since the rod's enable moved off A2 to D4.
+ * (D3, D5, D6, D9) are allocated — D9 to the brush's speed line since the
+ * 2026-08-27 swap noted below. A1 is now the LEFT direction line: a direction
+ * line only needs digitalWrite, so spending an analog-capable pin on it costs
+ * nothing, and it frees D9's timer for the brush. A2-A5 are spare plain digital
+ * I/O since the rod's enable moved off A2 to D4.
  *
  * D4 IS THE SHIELD'S microSD CHIP SELECT AND THE ROD NOW OWNS IT — see the
  * ACT_DIR/ACT_PWM block below. RUN THIS BOARD WITH THE microSD SLOT EMPTY.
@@ -86,6 +87,14 @@
  * is gone. DIR1 took over D9 (a direction line only needs digitalWrite, so
  * spending a PWM-capable pin on it is fine), PWM1 moved to D3, and PWM2 moved
  * to the newly used D6.
+ *
+ * SWAPPED 2026-08-27, on the operator's word that the rig is wired BRUSH_PWM=D9
+ * and DIR1=A1. This sketch still held the reverse - DIR1=D9, BRUSH_PWM=A1 - so
+ * flashing it would have crossed the brush with the left wheel's direction: the
+ * brush would not run and the left wheel would steer wrong, which reads as two
+ * separate mechanical faults rather than one wrong constant. uno_eth_link made
+ * this move on 2026-08-27 and this file had not followed. The two sketches share
+ * a rig; a pin map that differs between them is a trap, not a variant.
  *
  * The obvious map (PWM on D10/D11) is IMPOSSIBLE with this shield fitted: the
  * W5100/W5500 owns D10 (chip select), D11 (MOSI), D12 (MISO) and D13 (SCK) for
@@ -145,31 +154,32 @@
 // clean. Everything below the transport is BYTE-IDENTICAL to uno_eth_link.ino by
 // construction; if you fix a driver bug there, port it here and vice versa.
 //
-// BAUD IS 250000, AND IT MUST EQUAL uno_serial.py's UNO_BAUD ON THE PI. This
+// BAUD IS 115200, AND IT MUST EQUAL uno_serial.py's UNO_BAUD ON THE PI. This
 // port carries commands AND ACKs, so the two ends are one link: mismatch them
 // and every byte arrives as framing garbage, which presents as "sent 50 /
 // acked 0" - indistinguishable from a board running the wrong sketch.
 //
-// 250000 RATHER THAN A ROUNDER-LOOKING 115200, and the reason is the AVR's baud
-// generator, not fashion. At 16 MHz with U2X the divisor is exact:
+// 115200 ON THE OPERATOR'S ORDER 2026-08-27. It had been 250000 since
+// 2026-08-26, and the accuracy note that motivated that rate is kept here
+// because it is still true and still the thing to check if this link misbehaves.
+// At 16 MHz with U2X:
 //
 //     250000 -> UBRR=7   actual 250000.0   error  0.00%
 //     115200 -> UBRR=16  actual 117647.1   error +2.12%
 //
 // 2.12% is inside the ~4% a UART tolerates, so 115200 works - but it works with
-// no margin to spare, and margin is what absorbs a long cable and a warm clock.
-// 250000 is both FASTER and EXACT, which is the rare case where the quicker
-// option is also the safer one.
+// less margin than 250000 did, and margin is what absorbs a long cable and a
+// warm clock. Framing garbage on this port ("sent 50 / acked 0") is the symptom
+// that spent margin produces, so suspect the rate before suspecting the sketch.
 //
-// Raising it further is not free: 500000 is also exact (UBRR=3), but the Uno's
-// 64-byte RX buffer then fills in 1.3 ms and this sketch pauses 5 ms per loop.
-// 250000 fills it in 2.6 ms against the same pause and still has headroom
-// because the Pi only sends ~30 bytes every 20 ms. Do not go up without
-// shortening the pause in loop() to match.
-const unsigned long SERIAL_BAUD = 250000;
+// Going the other way is not free either: 500000 is also exact (UBRR=3), but the
+// Uno's 64-byte RX buffer then fills in 1.3 ms against this sketch's 5 ms loop
+// pause. 250000 filled it in 2.6 ms; 115200 takes 5.6 ms and so has the most
+// headroom of the three. Do not raise it without shortening that pause to match.
+const unsigned long SERIAL_BAUD = 115200;
 
 // --- Motor driver pins (see the pin-map note above before changing) ----------
-const uint8_t DIR1 = 9;    // channel 1 direction (LEFT)
+const uint8_t DIR1 = A1;   // channel 1 direction (LEFT) - was D9, see the 2026-08-27 swap
 const uint8_t PWM1 = 3;    // channel 1 speed, Timer2 OC2B - 62.5 kHz, see PWM_FAST
 const uint8_t DIR2 = 8;    // channel 2 direction (RIGHT)
 const uint8_t PWM2 = 6;    // channel 2 speed, Timer0 OC0A - BACK ON D6 2026-08-26, operator's instruction
@@ -185,7 +195,16 @@ const uint8_t PWM2 = 6;    // channel 2 speed, Timer0 OC0A - BACK ON D6 2026-08-
 //
 // D11 IS NOT A TIMER0 PIN. If a comment, a note or a wiring diagram says it is,
 // that is stale: Timer0's PWM pins are D5 and D6 only, and nothing here uses
-// Timer0 for PWM any more - which is exactly why MILLIS_SCALE is back to 1.
+// Timer0 for PWM any more.
+//
+// THE CLAUSE THAT USED TO END THAT SENTENCE - "which is exactly why MILLIS_SCALE
+// is back to 1" - WAS ITSELF STALE, and corrected 2026-08-27. setup() still
+// writes TCCR0B to prescaler 1 (search for it), so Timer0 still runs 64x fast
+// and MILLIS_SCALE is still 64. Not using Timer0 for PWM did not undo its
+// prescaler. This matters more than a tidy comment: the note at MILLIS_SCALE
+// records that believing 1 makes the 300 ms failsafe fire at 4.7 ms, and
+// believing 64 when it is 1 leaves a robot driving for 19 seconds after the
+// link dies. A wrong comment here is a wrong failsafe.
 //
 // D6 -> D11, on the operator's instruction, after D6 was eliminated as a
 // software fault. What was ruled out first, so nobody re-checks it:
@@ -398,8 +417,8 @@ const uint8_t LIGHT_PWM = 5;   // Timer0 OC0B - hardware PWM, 62.5 kHz
 // the sketch really was driving the one pin it knew about.
 //
 // SPEED CONTROL ARRIVED 2026-08-17: the pot (freed from the rod, then shared
-// with the light) now sets the brush duty, 0..255 in the <brush> field. A1 has
-// no timer behind it, so the duty is SOFT-PWM — serviceBrushPwm() below chops
+// with the light) now sets the brush duty, 0..255 in the <brush> field. The
+// duty is SOFT-PWM — serviceBrushPwm() below chops
 // the pin from loop() exactly the way serviceActuatorPwm() runs the rod's D4.
 // The 0 and 255 endpoints still resolve to static levels, so OFF cannot be
 // caught mid-cycle and full speed cannot be chopped by a stalled loop; only
@@ -415,11 +434,12 @@ const uint8_t LIGHT_PWM = 5;   // Timer0 OC0B - hardware PWM, 62.5 kHz
 // explanation for a rod that only ever drove one way and never stopped.
 //
 // D2 IS CONFIRMED AGAINST THE RIG (Harshil, 2026-08-15): brush is Dir -> D2,
-// Pwm -> A1, driven from the panel TOGGLE on Pi GPIO13. This is not an inference
+// Pwm -> D9 (A1 until the 2026-08-27 swap), driven from the panel TOGGLE on Pi
+// GPIO13. This is not an inference
 // from D7 having been taken — the wire really is on D2, and the sketch was the
 // thing that was wrong.
 const uint8_t BRUSH_DIR = 2;
-const uint8_t BRUSH_PWM = A1;
+const uint8_t BRUSH_PWM = 9;    // was A1 - swapped with DIR1 2026-08-27 to match the rig
 
 // The brush spins one way only, so its direction is a constant rather than a
 // demand. Flip this if the brush runs backwards.
@@ -432,13 +452,18 @@ const bool BRUSH_DIR_LEVEL = HIGH;
 // serviceBrushPwm() inverts through this same constant.
 const bool BRUSH_ACTIVE_HIGH = true;
 
-// The duty currently demanded on A1, 0..255. Written by applyBrush(), acted on
+// The duty currently demanded on BRUSH_PWM, 0..255. Written by applyBrush(), acted on
 // by serviceBrushPwm() every pass of loop() — the same pairing as
 // actDuty / serviceActuatorPwm(), and it shares ACT_PWM_PERIOD_US (250 Hz)
 // because two independent soft-PWM periods would just be two numbers to keep
 // in sync for no benefit. A brush motor's inertia makes 250 Hz ripple
 // invisible, exactly as it does for the rod.
 int brushDuty = 0;
+// Where the brush is being ramped TO, and when the last ramp step landed. See
+// serviceBrushPwm(). BRUSH_RAMP_MS is defined with the other scaled durations,
+// below MILLIS_SCALE.
+int brushTarget = 0;
+unsigned long brushRampLastMs = 0;
 
 
 // The smallest duty that actually TURNS the brush rather than buzzing it, the
@@ -524,6 +549,12 @@ const bool PWM_FAST = true;
 // ONE SETTING IN THREE PLACES: this, ACT_PWM_PERIOD_US, and the TCCR0B line in
 // setup(). Change one, change all three.
 const unsigned long MILLIS_SCALE = 64UL;
+
+// How long the brush takes to reach full duty from a standstill - see
+// serviceBrushPwm(). Ported from uno_eth_link 2026-08-27. Slow enough to blunt
+// the locked-rotor inrush that resets the board, short enough that the operator
+// still reads the brush as coming on at once. Scaled, like every duration here.
+const unsigned long BRUSH_RAMP_MS = 1500UL * MILLIS_SCALE;
 
 // 300 ms REAL: long enough to ride out a handful of dropped datagrams at the
 // 50 Hz command rate, short enough that the robot stops within a third of a
@@ -677,23 +708,77 @@ void applyBrush(int duty) {
            + (int)(((long)(duty - 1) * (MAX_PWM - BRUSH_MIN_DUTY))
                    / (MAX_PWM - 1));
   }
-  brushDuty = duty;
-  // The static endpoints are written HERE as well as in serviceBrushPwm(), so
-  // a stop takes effect on this very line rather than on the next loop() pass.
-  if (duty <= 0) {
-    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
-  } else if (duty >= MAX_PWM) {
-    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? HIGH : LOW);
+  // RISING DEMAND IS RAMPED, FALLING DEMAND IS IMMEDIATE - see
+  // serviceBrushPwm(). Only the target is set here on a rise; the ramp walks
+  // brushDuty up and the chopper below acts on whatever it finds.
+  // ANCHOR THE RAMP CLOCK WHEN A RISE BEGINS. Without this the ramp does
+  // nothing on the first switch-on: brushRampLastMs starts at 0, so the very
+  // first step measures the whole uptime as elapsed, computes hundreds of
+  // steps, and slams to full duty - exactly the inrush the ramp exists to
+  // prevent. Only a SECOND switch-on shortly after would have ramped, which is
+  // the kind of bug that tests clean and fails in the field.
+  if (duty > brushDuty && brushDuty >= brushTarget) {
+    brushRampLastMs = millis();
+  }
+  brushTarget = duty;
+  if (duty <= brushDuty) {
+    // A stop, or any reduction, takes effect on THIS line. Never make stopping
+    // wait for a ramp: the failsafe stop and the operator's off switch both
+    // come through here and both must be instant. The static endpoints are
+    // written here as well as in serviceBrushPwm(), so a stop lands now rather
+    // than on the next loop() pass.
+    brushDuty = duty;
+    if (duty <= 0) {
+      digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
+    } else if (duty >= MAX_PWM) {
+      digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? HIGH : LOW);
+    }
   }
 }
 
-/* Software PWM for the brush, because A1 has no timer. Same contract as
+/* Software PWM for the brush. D9 DOES have a timer (Timer1, already configured
+ * for 8-bit fast PWM below), so this could be handed to hardware the way
+ * uno_eth_link does it - deliberately not done in the 2026-08-27 pin swap, which
+ * was kept to the pin map alone. Chopping D9 from loop() works because
+ * digitalWrite() clears the timer's compare-output bits on the way past. Same
+ * contract as
  * serviceActuatorPwm(): called every pass of loop(), static levels for the 0
  * and 255 endpoints so neither OFF nor full speed can be caught mid-cycle, and
  * only the middle range is chopped — where a stalled loop costs a slower
  * brush, never a runaway one. Shares ACT_PWM_PERIOD_US; both mechanisms are
  * far too slow mechanically to care about 250 Hz ripple. */
+/* BRUSH SOFT-START, ported from uno_eth_link 2026-08-27.
+ *
+ * WHY. applyBrush(255) used to drive the pin high in one step, which is a
+ * 0-to-100% slam into a motor that is not yet turning. A stalled DC motor draws
+ * its locked-rotor current - several times its running current - until it spins
+ * up, and on a rail shared with the Uno that is the sag that resets the board or
+ * wedges the link. The operator sees it as the robot disconnecting and
+ * reconnecting for as long as the brush is on.
+ *
+ * ADAPTED, NOT COPIED. uno_eth_link drives the brush from D9 in HARDWARE, so
+ * there the ramp writes the pin itself. This sketch is on the same D9 since the
+ * 2026-08-27 swap but still chops in SOFTWARE, so the ramp's only job here is to
+ * walk brushDuty upward and let the existing chopper act on it. Falling
+ * demand is applied immediately in applyBrush(); a stop never waits for a ramp. */
+void serviceBrushRamp() {
+  if (brushDuty >= brushTarget) return;          // falls are handled instantly
+
+  const unsigned long now = millis();
+  unsigned long stepEvery = BRUSH_RAMP_MS / (unsigned long)MAX_PWM;
+  if (stepEvery == 0) stepEvery = 1;
+
+  if (now - brushRampLastMs < stepEvery) return;
+  unsigned long steps = (now - brushRampLastMs) / stepEvery;
+  brushRampLastMs += steps * stepEvery;
+
+  long next = (long)brushDuty + (long)steps;
+  if (next > brushTarget) next = brushTarget;
+  brushDuty = (int)next;
+}
+
 void serviceBrushPwm() {
+  serviceBrushRamp();      // advance the ramp first, then chop at the new duty
   if (brushDuty <= 0) {
     digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
     return;
@@ -876,11 +961,79 @@ void mixJoystick(int x, int y, int *left, int *right) {
   *right = (int)(r * MAX_PWM / peak);
 }
 
+/* WHY DID THE BOARD RESTART? Ported from uno_eth_link 2026-08-27.
+ *
+ * A disconnect can be the AVR resetting or the link wedging, and the two want
+ * completely different fixes, so the board says which.
+ *
+ * MCUSR holds the reset source but must be read before the C runtime clobbers
+ * it - hence .init3, which runs ahead of the .bss clear in .init4. BORF is a
+ * BROWN-OUT: the 5V rail sagged below the detector threshold. That is the
+ * signature a motor inrush leaves. Optiboot may clear MCUSR before we ever see
+ * it - measured on this rig, it does - which is what the .noinit counter is for.
+ *
+ * .noinit survives a RESET but not a POWER LOSS: RAM holds its contents down to
+ * roughly 1.5V while the brown-out detector trips at about 2.7V. Intact magic
+ * therefore means the board reset with power broadly maintained; garbage magic
+ * means the rail actually collapsed. That distinction does not depend on the
+ * bootloader leaving MCUSR alone. */
+uint8_t  resetFlags  __attribute__((section(".noinit")));
+uint16_t bootCount   __attribute__((section(".noinit")));
+uint16_t bootMagic   __attribute__((section(".noinit")));
+bool     ramSurvived = false;
+static const uint16_t BOOT_MAGIC = 0xB07F;
+
+void captureResetCause(void) __attribute__((naked, used, section(".init3")));
+void captureResetCause(void) {
+  resetFlags = MCUSR;
+  MCUSR = 0;
+}
+
+/* Print a pin number the way the schematic names it. Ported from uno_eth_link
+ * 2026-08-27 together with the pin swap, because the two banner lines below used
+ * to be hand-typed literals - and a banner exists precisely to catch a stale
+ * board. A hand-typed one restates the bug it was meant to reveal. */
+void printPin(uint8_t pin) {
+  if (pin >= A0) {
+    Serial.print('A');
+    Serial.print(pin - A0);
+  } else {
+    Serial.print('D');
+    Serial.print(pin);
+  }
+}
+
+void reportResetCause() {
+  Serial.print(F("RESET: flags=0x"));
+  Serial.print(resetFlags, HEX);
+  if (resetFlags & _BV(PORF))  Serial.print(F(" POWER-ON"));
+  if (resetFlags & _BV(EXTRF)) Serial.print(F(" EXTERNAL"));
+  if (resetFlags & _BV(BORF))  Serial.print(F(" BROWN-OUT"));
+  if (resetFlags & _BV(WDRF))  Serial.print(F(" WATCHDOG"));
+  Serial.print(ramSurvived ? F("  ram=KEPT (reset, rail held)")
+                           : F("  ram=LOST (true power loss)"));
+  Serial.print(F("  boot#"));
+  Serial.println(bootCount);
+}
+
 void setup() {
+
+  // Boot bookkeeping before anything can use RAM for other purposes. See the
+  // .noinit note above: intact magic means we reset without losing the rail.
+  if (bootMagic != BOOT_MAGIC) {
+    bootMagic = BOOT_MAGIC;
+    bootCount = 0;
+    ramSurvived = false;
+  } else {
+    bootCount++;
+    ramSurvived = true;
+  }
+
   // 250000, NOT the Ethernet sketch's console rate: this port is the command
   // and ACK channel and must match uno_serial.py's UNO_BAUD on the Pi exactly.
   // See SERIAL_BAUD above for why 250000 and not 115200.
   Serial.begin(SERIAL_BAUD);
+  reportResetCause();
 
   // Outputs are driven to a stopped state BEFORE they become outputs, so the
   // pins cannot glitch high in the gap between pinMode and the first write.
@@ -889,7 +1042,7 @@ void setup() {
   digitalWrite(PWM1, LOW);
   digitalWrite(PWM2, LOW);
   // BOTH rod lines must be at their stopped level before they become outputs —
-  // the same reasoning as the brush's A1 below. This is also what replaced the
+  // the same reasoning as the brush's gate below. This is also what replaced the
   // old "park pin 4 HIGH to deselect the SD card" line: HIGH on D4 is the rod's
   // RETRACT drive, and that park is why the rod ran from reset forever.
   digitalWrite(ACT_DIR, ACT_LEVEL_EXTEND);
@@ -947,8 +1100,11 @@ void setup() {
     // The core leaves Timer1 in 8-bit PHASE-CORRECT at prescaler 64, which is
     // 490 Hz - fine for a servo, useless as a fair comparison against D11.
     //   16 MHz / 256 counts / 1 = 62500 Hz
-    // Timer1 drives nothing else here: D9 is a direction line, so no other
-    // channel notices this.
+    // Since 2026-08-27 D9 IS the brush's gate - but serviceBrushPwm() drives it
+    // with digitalWrite(), which clears Timer1's compare-output bits, so the
+    // timer's configuration here never reaches the pin and the brush does not
+    // notice this block. Hand the brush to analogWrite() and that stops being
+    // true: the two would then share Timer1, which is fine, but say so here.
     TCCR1A = _BV(WGM10);                    // 8-bit fast PWM, low bits
     TCCR1B = _BV(WGM12) | _BV(CS10);        // ... high bit, prescaler 1
   }
@@ -1002,7 +1158,11 @@ void setup() {
   // it exists for whoever opens a serial monitor, exactly like the old one.
   Serial.print(F("uno_usb_link on USB serial @"));
   Serial.println(SERIAL_BAUD);
-  Serial.println(F("DIR1=D9 PWM1=D3 (left)  DIR2=D8 PWM2=D6 (right)"));
+  Serial.print(F("DIR1="));           printPin(DIR1);
+  Serial.print(F(" PWM1="));          printPin(PWM1);
+  Serial.print(F(" (left)  DIR2="));  printPin(DIR2);
+  Serial.print(F(" PWM2="));          printPin(PWM2);
+  Serial.println(F(" (right)"));
   // Printed because a silently stale board is the expensive failure here: the
   // link ACKs and the pins look right whatever build is loaded, so every value
   // that changes behaviour belongs in the banner where a reset reveals it.
@@ -1030,7 +1190,9 @@ void setup() {
   // build is otherwise indistinguishable over the LAN (see the banner note
   // above), and "held 255" vs "soft-PWM" is exactly the difference that
   // decides whether the knob does anything.
-  Serial.print(F("BRUSH_DIR=D2 BRUSH_PWM=A1 soft-PWM duty 0-"));
+  Serial.print(F("BRUSH_DIR="));   printPin(BRUSH_DIR);
+  Serial.print(F(" BRUSH_PWM="));  printPin(BRUSH_PWM);
+  Serial.print(F(" soft-PWM duty 0-"));
   Serial.print(MAX_PWM);
   Serial.print(F(" floor "));
   Serial.print(BRUSH_MIN_DUTY);
