@@ -780,6 +780,25 @@ static const uint8_t SHIELD_SUBNET[4] = {255, 255, 255, 0};
 static const uint8_t SHIELD_GATEWAY[4] = {192, 168, 50, 1};
 static const uint8_t SHIELD_IP[4] = {192, 168, 50, 20};
 
+// DID THE CHIP ACTUALLY TAKE ITS CONFIGURATION? Added 2026-08-27.
+//
+// hardwareStatus() only reads a VERSION register. A W5100 that is powered but
+// came up wrong still answers it, so the boot retry loop below - which was
+// conditioned on `hardwareStatus() == EthernetNoHardware` - never ran even
+// once. The board reported "W5100 ok" and sat deaf on the network: chip answers
+// is not the same as chip works, and that gap is what "every time I power on it
+// does not connect" was.
+//
+// Reading SIPR back is a real check. It is the address Ethernet.begin() should
+// have written into the chip; if it does not read back, the configuration never
+// landed and the shield needs a genuine reset rather than another no-op.
+bool shieldConfigured() {
+  uint8_t got[4];
+  W5100.readSIPR(got);
+  return got[0] == SHIELD_IP[0] && got[1] == SHIELD_IP[1]
+      && got[2] == SHIELD_IP[2] && got[3] == SHIELD_IP[3];
+}
+
 bool resetShield() {
   W5100.writeMR(0x80);                       // RST - the chip resets itself
   for (uint8_t i = 0; i < 50; i++) {         // datasheet clears in well under 10ms
@@ -1035,21 +1054,76 @@ void setup() {
   EthernetLinkStatus ls = Ethernet.linkStatus();
   Serial.println(ls == LinkON ? F("UP") : (ls == LinkOFF ? F("DOWN") : F("unknown")));
 
-  // RETRY THE INIT while the chip reports absent. Each pass is a fresh
-  // Ethernet.begin(), which is a no-op on an already-initialised chip but the
-  // only thing worth trying if init() never got a working chip in the first
-  // place - and the delay between passes is more rail-settling time.
-  for (uint8_t tries = 0; tries < 5 &&
-       Ethernet.hardwareStatus() == EthernetNoHardware; tries++) {
-    delay(300UL * MILLIS_SCALE);
+  // RETRY UNTIL THE CHIP HAS ACTUALLY TAKEN ITS CONFIG - see
+  // shieldConfigured(). Rewritten 2026-08-27; both halves of the old loop were
+  // wrong and they hid each other.
+  //
+  // The CONDITION was hardwareStatus() == EthernetNoHardware, which a
+  // powered-but-wrong chip never satisfies, so the loop was skipped. And the
+  // BODY was another Ethernet.begin(), a documented no-op once `initialized`
+  // is set - so even when it did run it could not fix anything.
+  //
+  // Now: the test is whether the IP reads back out of the chip, and the cure is
+  // a real SPI reset that the library's guard cannot block. Six passes with
+  // rail-settling time between them; on a cold 12V rail the early ones fail and
+  // a later one takes, which is the "1-2 power cycles" done in firmware.
+  for (uint8_t tries = 0; tries < 6 && !shieldConfigured(); tries++) {
+    delay(400UL * MILLIS_SCALE);
+    bool ok = resetShield();
     Ethernet.begin(mac, ip);
     Serial.print(F("W5100 retry "));
     Serial.print(tries + 1);
-    Serial.println(Ethernet.hardwareStatus() == EthernetNoHardware
-                   ? F(": still absent") : F(": DETECTED"));
+    Serial.print(ok ? F(": chip reset") : F(": RESET FAILED"));
+    Serial.println(shieldConfigured() ? F(", configured") : F(", still not configured"));
   }
+  Serial.print(F("W5100 config: "));
+  Serial.println(shieldConfigured() ? F("VERIFIED (IP reads back)")
+                                    : F("NOT VERIFIED - link will not work"));
 
   udp.begin(LISTEN_PORT);
+
+  // PROVE THE LINK WITH A REAL PACKET BEFORE LEAVING setup(). Added 2026-08-27,
+  // and it exists because every cheaper check lies.
+  //
+  // A cold power-on can leave the chip in a state where the version register
+  // answers (hardwareStatus says "W5100 ok"), the IP reads back (config says
+  // VERIFIED) - and the chip still never answers a frame off the wire. Measured
+  // on this rig within the hour: banner perfect, ARP INCOMPLETE, no packets,
+  // indefinitely. A warm AVR reset fixed it every time, which is why "power
+  // cycle it once or twice" worked and why probing the serial port (whose DTR
+  // pulse IS a warm reset) kept accidentally curing the patient mid-diagnosis.
+  //
+  // So the boot check is the only signal that cannot lie: the Pi transmits at
+  // ~50 packets/second whenever the ground station is up, so a healthy shield
+  // hears one inside tens of milliseconds. Three seconds of silence at boot is
+  // not quiet traffic - it is a deaf chip, and the cure is a real MR-register
+  // chip reset (resetShield), not another Ethernet.begin() no-op.
+  //
+  // If the ground station itself is down, the six attempts cost ~18 s of boot
+  // and then give up to loop(), where the ETH_REINIT_MS path keeps trying
+  // forever - so a dark Pi does not brick the Uno, it just delays it.
+  for (uint8_t attempt = 1; attempt <= 6; attempt++) {
+    unsigned long probeT0 = millis();
+    bool heard = false;
+    while (millis() - probeT0 < 3000UL * MILLIS_SCALE) {
+      if (udp.parsePacket() > 0) {
+        while (udp.available()) udp.read();   // drained: loop() parses its own
+        heard = true;
+        break;
+      }
+    }
+    if (heard) {
+      Serial.print(F("BOOT LINK: packet heard, attempt "));
+      Serial.println(attempt);
+      break;
+    }
+    Serial.print(F("BOOT LINK: silent 3s, chip reset "));
+    Serial.println(resetShield() ? F("ok - retrying") : F("FAILED - retrying"));
+    Ethernet.begin(mac, ip);
+    udp.stop();
+    udp.begin(LISTEN_PORT);
+  }
+
   // Seeded so the watchdog measures from BOOT, not from zero - otherwise it
   // fires on the first pass, before the Pi has had a chance to send anything.
   lastUdpMs = millis();
