@@ -1,0 +1,18 @@
+[Unit]
+# Serial + ping recorder for the Uno. Opens the port with DTR held low so that
+# WATCHING the board does not warm-reset it - a reset cures the deaf-shield
+# fault, so an ordinary serial probe destroys the evidence it was opened to
+# collect. Runs as a service because the interesting failures have twice landed
+# either side of a Pi reboot, which killed the nohup version.
+Description=Non-resetting Uno serial + ping watcher
+After=network-online.target
+
+[Service]
+Type=simple
+User=arnobot
+ExecStart=/usr/bin/python3 /home/arnobot/diag/uno_logger.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+[Unit]
+# PIN THE UNO MAC SO THE PI CAN TRANSMIT WITHOUT AN ARP REPLY.
+#
+# Added 2026-08-27 to break a deadlock found while chasing "it never connects":
+# a wedged W5100 does not answer ARP, so the Pi cannot resolve 192.168.50.20,
+# so every control packet sits on an unresolved-neighbour queue and NOTHING
+# leaves the Pi. The Uno then hears silence - which is exactly the condition its
+# own recovery is waiting to break - so both ends sit waiting for the other.
+# Measured: tcpdump showed the Pi ARPing once a second forever and not one UDP
+# frame going out.
+#
+# The Uno address is static and its MAC is compiled into the firmware, so ARP
+# buys nothing here anyway. A permanent entry makes the Pi transmit
+# unconditionally, which is what the firmware BOOT LINK probe and its 5-second
+# recovery both need in order to hear anything at all.
+Description=Pin the static ARP entry for the Uno (breaks the deaf-shield deadlock)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/ip neigh replace 192.168.50.20 lladdr de:ad:be:ef:fe:20 dev eth0 nud permanent
+ExecStop=/sbin/ip neigh del 192.168.50.20 dev eth0
+
+[Install]
+WantedBy=multi-user.target

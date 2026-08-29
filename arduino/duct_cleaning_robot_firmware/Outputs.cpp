@@ -3,6 +3,13 @@
 
 static int actDuty = 0;
 
+// Brush soft-start state. brushTarget/brushCurrent are POST-stretch duties, so
+// the ramp starts at 0 rather than jumping straight to BRUSH_MIN_DUTY.
+static int           brushTarget = 0;
+static int           brushCurrent = 0;
+static unsigned long brushRampStart = 0;
+static void brushService();
+
 void motorApply(uint8_t dirPin, uint8_t pwmPin, int demand, bool invert) {
     if (invert) demand = -demand;
     if (demand >  MAX_PWM) demand =  MAX_PWM;
@@ -35,6 +42,7 @@ void actuatorApply(int demand, bool invert) {
 /* Endpoints resolve to a static level - a stalled loop then costs a slower rod,
  * never a runaway one. Only the mid range is chopped. */
 void outputsService() {
+    brushService();
     if (actDuty <= ACT_DUTY_STOP) { digitalWrite(PIN_ACT_PWM, LOW);  return; }
     if (actDuty >= MAX_PWM)       { digitalWrite(PIN_ACT_PWM, HIGH); return; }
     unsigned long phase = micros() % ACT_PWM_PERIOD_US;
@@ -51,19 +59,55 @@ static void writeBrushHardware(int duty) {
 void brushApply(int duty) {
     if (duty < 0) duty = 0;
     if (duty > MAX_PWM) duty = MAX_PWM;
-    // A stop drops BOTH lines: on a two-input driver, DIR high with the gate
-    // low is FORWARD AT FULL SCALE, which is what made the brush always-on.
+
+    // A stop drops BOTH lines, immediately and without ramping: on a two-input
+    // driver, DIR high with the gate low is FORWARD AT FULL SCALE, and the
+    // failsafe must be able to kill the brush in one call.
     if (duty <= 0) {
+        brushTarget = brushCurrent = 0;
         writeBrushHardware(0);
         digitalWrite(PIN_BRUSH_DIR, LOW);
         return;
     }
+
+    // Stretch 1..MAX_PWM onto BRUSH_MIN_DUTY..BRUSH_MAX_DUTY, so the smallest
+    // demand already turns the brush and full demand stops at the ceiling.
+    // long: (254 * 130) is 33020 and overflows a 16-bit int.
+    int want = BRUSH_MIN_DUTY
+             + (int)(((long)(duty - 1) * (BRUSH_MAX_DUTY - BRUSH_MIN_DUTY))
+                     / (MAX_PWM - 1));
+    if (want > BRUSH_MAX_DUTY) want = BRUSH_MAX_DUTY;
+    // Clock starts when the brush leaves a standstill; a target that changes
+    // mid-climb just re-aims the same ramp.
+    if (brushCurrent <= 0) brushRampStart = millis();
+    brushTarget = want;
+
+    // Direction is written every call: a channel that browns out and recovers
+    // gets it restored on the next frame instead of running whichever way its
+    // input floated to.
     digitalWrite(PIN_BRUSH_DIR, BRUSH_DIR_LEVEL);
-    if (BRUSH_MIN_DUTY > 0) {
-        duty = BRUSH_MIN_DUTY
-             + (int)(((long)(duty - 1) * (MAX_PWM - BRUSH_MIN_DUTY)) / (MAX_PWM - 1));
+
+    // Only the climb is ramped. Any reduction lands at once.
+    if (brushCurrent >= brushTarget) {
+        brushCurrent = brushTarget;
+        writeBrushHardware(brushCurrent);
     }
-    writeBrushHardware(duty);
+}
+
+/* Walk the brush up to its target. Time-gated, so calling it every loop pass
+ * and all through the busy-wait costs nothing. */
+static void brushService() {
+    if (brushCurrent >= brushTarget) return;
+    // Duty from ELAPSED TIME, not one step per tick: the climb then takes
+    // BRUSH_RAMP_MS whether this runs every pass or misses most of them. The
+    // step-per-tick version drifted to ~6 s against a 2 s design.
+    unsigned long elapsed = millis() - brushRampStart;
+    int want = (elapsed >= BRUSH_RAMP_MS)
+             ? brushTarget
+             : (int)(((long)brushTarget * elapsed) / BRUSH_RAMP_MS);
+    if (want <= brushCurrent) return;
+    brushCurrent = want;
+    writeBrushHardware(brushCurrent);
 }
 
 void lightApply(int level) {

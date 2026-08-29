@@ -17,13 +17,11 @@
 #include "Link.h"
 #include "Telemetry.h"
 
-// DIAGNOSTIC BUILD: the lamp reports shield state instead of following the pot.
-// fast=verified  slow=detected-not-configured  double=chip 0  DARK=setup() never finished
-#define DIAG_LAMP 1
 
 static char packet[RX_BUFFER];
 
 void setup() {
+
     resetCauseBeginBoot();
     outputsBegin();
     Serial.begin(SERIAL_BAUD);
@@ -73,21 +71,6 @@ void loop() {
     resetCauseStash(linkVerdict, (uint16_t)packetsReceived, linkServiceCount,
                     linkChipId(), linkUp ? 1 : 0);
 
-#if DIAG_LAMP
-    // Non-blocking blink so the loop still runs at full speed.
-    {
-        static unsigned long t0 = 0;
-        static uint8_t phase = 0;
-        unsigned long per = (linkVerdict == 2) ? REAL_MS(100) : REAL_MS(1000);
-        if (linkVerdict == 0) per = (phase & 1) ? REAL_MS(120) : REAL_MS(400);
-        if (millis() - t0 >= per) {
-            t0 = millis();
-            phase++;
-            digitalWrite(PIN_LIGHT_DIR, LOW);
-            digitalWrite(PIN_LIGHT_PWM, (phase & 1) ? HIGH : LOW);
-        }
-    }
-#endif
 
     // Busy-wait, not delay(): delay() would stop outputsService() too, and
     // servicing a 4 ms waveform once per pause aliases it into visible flicker.

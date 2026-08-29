@@ -13,26 +13,12 @@ const unsigned long MILLIS_SCALE = 64;
 #define REAL_MS(x) ((unsigned long)(x) * MILLIS_SCALE)
 #define REAL_US(x) ((unsigned long)(x) * MILLIS_SCALE)
 
-// 115200: UBRR=16 gives 117647, +2.12% - inside the ~4% a UART tolerates.
-// NOT the exact rates (250000/500000, 0.00%): macOS refuses both outright
-// (tcsetattr: Invalid argument) and silently falls back to 9600, which makes
-// the console unreadable from the dev Mac. 230400 is worse on both counts
-// (-3.55%, UBRR rounds to 8). Telemetry is off, so the print-cost argument for
-// a faster rate no longer applies.
-// 500000, and exact on a 16 MHz AVR: UBRR=3 with U2X gives 500000.0, error
-// 0.00% - better than 115200's +2.12%. Halves the telemetry print cost, which is
-// LOOP time because that line prints from loop().
-//
-// LAST SAFE STEP UP, and the limit is the RECEIVE side. The 64-byte serial RX
-// buffer fills in 1.3 ms at this rate. Harmless on the Ethernet build, where
-// nothing sends to this port and it is only drained - but the SERIAL build
-// carries commands there and would overrun inside one loop pass. If
-// LINK_TRANSPORT ever goes back to LINK_SERIAL, bring this down with it.
-//
-// ONE SETTING IN TWO FILES: this and UNO_BAUD in uno_serial.py (and the
-// out-of-repo diag/uno_logger.py). Neither compiles against the other, so a
-// split is silent until something reads the port - and a mismatch is a DEAD
-// link, not a slow one. Change one, change all three.
+// 500000: UBRR=3 with U2X, exactly 500000.0, 0.00% error on a 16 MHz AVR.
+// NOTE: macOS cannot open this rate (tcsetattr: Invalid argument) and falls
+// back to 9600, so the console is unreadable from a Mac - read it from the Pi,
+// which takes arbitrary rates. Use 115200 (+2.12%) if you need Mac-side serial.
+// SERIAL BUILD: the 64-byte RX buffer fills in 1.3 ms at this rate, so drop to
+// 250000 or 115200 if LINK_TRANSPORT ever becomes LINK_SERIAL.
 const unsigned long SERIAL_BAUD = 500000;
 
 // Not 192.168.1.20 - that is the Pi's own wlan0, so packets never reach the wire.
@@ -70,6 +56,22 @@ const uint8_t PIN_BRUSH_PWM = 3;    // Timer2 OC2B
 const uint8_t BRUSH_DIR_LEVEL = HIGH;
 const bool BRUSH_ACTIVE_HIGH = true;
 const int BRUSH_MIN_DUTY = 90;
+
+// Ceiling on the brush, separate from MAX_PWM: full demand maps here, not to
+// 255. Full scale is what the driver and the motor spend the most current on,
+// and this rail is already the reason the W5100's PHY struggles.
+const int BRUSH_MAX_DUTY = 220;
+
+// Soft-start. A stalled DC motor draws locked-rotor current - several times its
+// running current - until it spins up, and on this rail that surge is what the
+// W5100's PHY cannot survive. Ramps UP only: a stop is always immediate, so the
+// failsafe still kills the brush in one call.
+// HOW LONG the climb takes, end to end. Time-proportional, not step-per-tick:
+// the duty is computed from elapsed time, so the total is this value whether
+// the service runs every pass or misses most of them. The step-based version
+// this replaces drifted to ~6 s against a 2 s design, because a missed tick
+// stretched the ramp instead of being caught up.
+const unsigned long BRUSH_RAMP_MS = REAL_MS(2000);
 
 // Two-leg bridge: PIN_LIGHT_DIR stays LOW always, or the knob runs backwards.
 const uint8_t PIN_LIGHT_DIR = 8;
