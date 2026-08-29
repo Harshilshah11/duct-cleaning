@@ -19,7 +19,21 @@ const unsigned long MILLIS_SCALE = 64;
 // the console unreadable from the dev Mac. 230400 is worse on both counts
 // (-3.55%, UBRR rounds to 8). Telemetry is off, so the print-cost argument for
 // a faster rate no longer applies.
-const unsigned long SERIAL_BAUD = 115200;
+// 500000, and exact on a 16 MHz AVR: UBRR=3 with U2X gives 500000.0, error
+// 0.00% - better than 115200's +2.12%. Halves the telemetry print cost, which is
+// LOOP time because that line prints from loop().
+//
+// LAST SAFE STEP UP, and the limit is the RECEIVE side. The 64-byte serial RX
+// buffer fills in 1.3 ms at this rate. Harmless on the Ethernet build, where
+// nothing sends to this port and it is only drained - but the SERIAL build
+// carries commands there and would overrun inside one loop pass. If
+// LINK_TRANSPORT ever goes back to LINK_SERIAL, bring this down with it.
+//
+// ONE SETTING IN TWO FILES: this and UNO_BAUD in uno_serial.py (and the
+// out-of-repo diag/uno_logger.py). Neither compiles against the other, so a
+// split is silent until something reads the port - and a mismatch is a DEAD
+// link, not a slow one. Change one, change all three.
+const unsigned long SERIAL_BAUD = 500000;
 
 // Not 192.168.1.20 - that is the Pi's own wlan0, so packets never reach the wire.
 const uint16_t NET_LISTEN_PORT = 5005;

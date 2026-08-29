@@ -69,7 +69,7 @@ SEND_HZ = float(os.environ.get("UNO_SEND_HZ", "50"))
 # That is inside the ~4% a UART tolerates, so it works - with less margin than
 # the rate it replaced. Framing garbage here is the symptom to expect if that
 # margin ever runs out. See the note in the sketch.
-BAUD = int(os.environ.get("UNO_BAUD", "115200"))
+BAUD = int(os.environ.get("UNO_BAUD", "500000"))
 
 # Opening the port resets the board; nothing sent before this elapses arrives.
 OPEN_SETTLE_S = float(os.environ.get("UNO_OPEN_SETTLE_S", "1.8"))
