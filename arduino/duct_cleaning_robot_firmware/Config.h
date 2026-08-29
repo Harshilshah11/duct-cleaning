@@ -443,7 +443,32 @@ const unsigned long ETH_RETRY_GAP_MS = 400;
 // SAFE TO BLOCK IN: outputsBegin(), timersBegin() and safeState() have all run
 // before this, so every output is already at a stopped level and nothing can
 // command them while we are here. The rod's soft-PWM is serviced throughout.
-const bool LINK_WAIT_FOR_GROUND_STATION = true;
+//
+// ---------------------------------------------------------------------------
+// TURNED OFF 2026-08-29. Operator: "remove the wait in setup, directly start,
+// the bot will reconnect anyway if disconnected."
+//
+// The reasoning above is sound and the block is well built — it repairs only on
+// positive evidence, and it is genuinely safe to sit in. What makes it the wrong
+// default on THIS rig is LINK_WAIT_TIMEOUT_MS being 0: it waits forever. A board
+// that boots while the link happens to be down never reaches loop() at all, and
+// on this rig the link is down often — the Pi's eth0 dropped carrier nine times
+// in five minutes on the evening this was changed.
+//
+// SO IT TURNS AN INTERMITTENT LINK INTO AN INTERMITTENT ROBOT. Boot while the
+// cable is up and the board runs; boot during a drop and it sits in setup()
+// until someone notices. That is exactly the "switching on off the robot, robot
+// keep on disconnected for sometimes" the operator reports, and the wait can
+// only ever make it worse: loop() has the same recovery, plus the failsafe, plus
+// everHeard's patience before first contact.
+//
+// NOTHING IS LOST BY GOING STRAIGHT TO loop(). Every repair this wait performs
+// exists there too. What it added was a cleaner boot LOG on a healthy rig, and
+// that is not worth a board that may not start.
+//
+// If it is ever wanted back, give LINK_WAIT_TIMEOUT_MS a real value first. A
+// wait that cannot give up is not a wait, it is a dependency.
+const bool LINK_WAIT_FOR_GROUND_STATION = false;
 
 // 0 = wait forever, which is the default and what was asked for. Set a real
 // number of milliseconds to give up and run anyway — loop() handles a missing
