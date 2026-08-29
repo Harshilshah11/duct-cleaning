@@ -707,10 +707,37 @@ void applyMotor(uint8_t dirPin, uint8_t pwmPin, int demand, bool invert) {
 void applyBrush(int duty) {
   if (duty < 0) duty = 0;
   if (duty > MAX_PWM) duty = MAX_PWM;
+
+  // A STOP DRIVES BOTH LINES LOW, and that is the whole fix for "brush is always
+  // on" (operator, 2026-08-29).
+  //
+  // This function used to assert BRUSH_DIR unconditionally, on the reasoning
+  // that direction is a constant for a brush that spins one way. So a stopped
+  // brush sat at DIR = HIGH, PWM = LOW - and setup() left it there from reset.
+  //
+  // THAT IS ONLY "OFF" IF THE DRIVER TAKES DIR + ENABLE. Plenty of dual-channel
+  // boards instead take two logic inputs, IN1 and IN2, where HIGH/LOW is not
+  // "stopped pointing forwards" but FORWARD AT FULL SCALE. On such a channel the
+  // old code commanded the brush to run from the moment the Uno left reset, and
+  // no demand from the Pi could countermand it, because every applyBrush(0) wrote
+  // exactly the same pair of levels.
+  //
+  // Both lines LOW is a real stop under EITHER reading: IN1=IN2=LOW is coast on
+  // a two-input driver, and enable LOW is off on a DIR+enable one, where the
+  // direction line is then don't-care. That is why this is written as a stop of
+  // both pins rather than as a polarity constant - it does not require knowing
+  // which kind of board is on the other end of the wire.
+  if (duty <= 0) {
+    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
+    digitalWrite(BRUSH_DIR, LOW);
+    brushDuty = 0;
+    return;
+  }
+
   // Direction before speed, the same ordering rule applyMotor() follows: setting
   // the gate first would spend a moment driving the old direction at full duty.
   digitalWrite(BRUSH_DIR, BRUSH_DIR_LEVEL);
-  if (duty > 0 && BRUSH_MIN_DUTY > 0) {
+  if (BRUSH_MIN_DUTY > 0) {
     // Same stretch as applyMotor(): the smallest demand the knob can express
     // must be one the motor can act on. Long arithmetic for the same overflow
     // reason — 254 * 165 wraps a 16-bit int.
