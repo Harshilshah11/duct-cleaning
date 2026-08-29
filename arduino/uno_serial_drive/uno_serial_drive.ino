@@ -32,17 +32,13 @@
  * cares whether the shield is fitted. D4 still belongs to the shield's microSD
  * slot; nothing here touches it.
  *
- * DIR1 SPENDS NO PWM PIN. A direction line only needs digitalWrite, so it sits
- * on A1 - an analog-capable pin used as plain digital I/O - and leaves every
- * timer pin for something that actually needs to be dimmed. That is the same
- * reasoning the old map used to justify D9, applied to the current wiring.
+ * DIRECTION LINES SPEND NO PWM PIN. A direction line only needs digitalWrite,
+ * so neither of them occupies a timer pin.
  *
- * BOTH CHANNELS ARE ON TIMER0 SINCE THE 2026-08-29 REWIRE, and that fixes a
- * defect this sketch used to carry. PWM1 was D3 (Timer2, ~490 Hz) and PWM2 was
- * D6 (Timer0, ~980 Hz) - NOT EQUAL, and channels on different frequencies answer
- * the same demand differently, which reads as a pull to one side on a straight
- * run. D6 and D5 are OC0A and OC0B of the same timer, so they cannot disagree:
- * one prescaler governs both. This sketch still leaves Timer0 at the stock
+ * BOTH CHANNELS ARE ON TIMER0 - D6 and D5 are its OC0A and OC0B, so one
+ * prescaler governs the pair and they cannot disagree. That matters: channels on
+ * different frequencies answer the same demand differently, which reads as a
+ * pull to one side on a straight run. This sketch leaves Timer0 at the stock
  * prescaler, so both run at about 980 Hz - equal, which is what mattered.
  *
  * THIS SKETCH DRIVES WHEELS ONLY - no brush, no actuator, no light. It predates
@@ -59,13 +55,13 @@
  */
 
 // --- Motor driver pins -------------------------------------------------------
-const uint8_t DIR1 = 7;    // channel 1 direction  (LEFT)  - was A1, rewired 2026-08-29
-const uint8_t PWM1 = 6;    // channel 1 speed, Timer0 OC0A  - was D3
+const uint8_t DIR1 = 7;    // channel 1 direction  (LEFT)
+const uint8_t PWM1 = 6;    // channel 1 speed, Timer0 OC0A
 // D4 IS THE SHIELD'S microSD CHIP SELECT, and it goes LOW when the right wheel
 // runs in the negative direction. Harmless with the slot EMPTY, which is how
 // this board must be run. See the note in uno_eth_link for the full story.
-const uint8_t DIR2 = 4;    // channel 2 direction  (RIGHT) - was D8; SD CS
-const uint8_t PWM2 = 5;    // channel 2 speed, Timer0 OC0B  - was D6, SAME timer as PWM1
+const uint8_t DIR2 = 4;    // channel 2 direction  (RIGHT) - SD CS
+const uint8_t PWM2 = 5;    // channel 2 speed, Timer0 OC0B  - SAME timer as PWM1
 
 const uint8_t STATUS_LED = LED_BUILTIN;
 

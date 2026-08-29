@@ -24,7 +24,7 @@
  *
  * <act> is signed by the Pi: positive extends, negative retracts, and 0 STOPS.
  * Only the sign is used — this channel has no speed demand, having lost the pot
- * to the light on 2026-08-14 — but it does have an enable again on D4, so zero
+ * to the light — but it does have an enable again on A2, so zero
  * cuts power rather than picking the other direction. The 3-position switch
  * truth table (GPIO16/19, active-LOW) is decoded in ground_station/inputs.py,
  * NOT here:
@@ -40,10 +40,8 @@
  * for one evening the pot set the speed here, and it was reverted on the
  * operator's call ("keep 255": one knob feeding both the lamp and the brush
  * meant dimming one slowed the other) without needing a reflash, precisely
- * because only the Pi's brush_demand() had to change. A1 has no timer, so a
- * mid-range duty would be synthesised in software — see serviceBrushPwm(), the
- * same mechanism the rod uses on D4; at 0 and 255 it resolves to a static
- * level and costs nothing.
+ * because only the Pi's brush_demand() had to change. D3 is Timer2 OC2B, so any
+ * duty is real hardware PWM at 62.5 kHz and costs the loop nothing.
  *
  * <light> is the panel potentiometer (ADS1115 A2), scaled to 0..255 on the Pi
  * in uno_motors.py. It is unsigned — a lamp has no reverse. The pot could take
@@ -90,38 +88,14 @@
  * D4 IS THE SHIELD'S microSD CHIP SELECT AND THE RIGHT WHEEL'S DIRECTION LINE
  * NOW OWNS IT - see the DIR2 block below. RUN THIS BOARD WITH THE SLOT EMPTY.
  *
- * REWIRED 2026-08-29 to the map above, on the operator's word. Everything moved
- * except BRUSH_DIR (D2). Recorded because the previous two maps are still all
- * over this file's older notes and in git history:
- *
- *       was (2026-08-27)          now (2026-08-29)
- *       DIR1      = A1            DIR1      = D7
- *       PWM1      = D3            PWM1      = D6
- *       DIR2      = D8            DIR2      = D4
- *       PWM2      = D6            PWM2      = D5
- *       ACT_DIR   = D7            ACT_DIR   = A3
- *       ACT_PWM   = D4            ACT_PWM   = A2
- *       BRUSH_PWM = D9            BRUSH_PWM = D3
- *       LIGHT_DIR = A0            LIGHT_DIR = D8
- *       LIGHT_PWM = D5            LIGHT_PWM = D9
- *
- * THREE LABELS IN THE OPERATOR'S NOTE WERE CORRECTED HERE, because the wiring is
- * theirs but the silicon is not up for negotiation. On an ATmega328P: D6 is
- * Timer0 OC0A (the note said Timer2 OC2B), D5 is Timer0 OC0B (the note said
- * OC0A), and D9 is Timer1 OC1A (the note said OC1B). The PINS are exactly as
- * given - only the timer names are corrected, so nothing about the loom changes.
- * The note also labelled the left motor's speed line PWM2 and the right's PWM1,
- * which crosses the numbering used everywhere else here; read as LEFT = DIR1 +
- * PWM1 and RIGHT = DIR2 + PWM2, which is what the pin numbers plainly mean.
- *
- * REWIRED 2026-08-14, kept for history: D7 was freed and the old DIR1=D7 /
- * PWM1=D9 / PWM2=D3 map went. DIR1 took over D9, PWM1 moved to D3, PWM2 moved to
- * the newly used D6.
+ * TIMER NAMES, easy to misremember and worth having written down: on an
+ * ATmega328P D6 is Timer0 OC0A, D5 is Timer0 OC0B, D3 is Timer2 OC2B and D9 is
+ * Timer1 OC1A. LEFT is DIR1 + PWM1; RIGHT is DIR2 + PWM2.
  *
  * The obvious map (PWM on D10/D11) is IMPOSSIBLE with this shield fitted: the
  * W5100/W5500 owns D10 (chip select), D11 (MOSI), D12 (MISO) and D13 (SCK) for
  * SPI, plus D4 for the microSD slot. Driving motors from D10/D11 breaks the
- * Ethernet link and the motors together. D3/D6/D8/D9 clear all of those.
+ * Ethernet link and the motors together. D2-D9 and A2/A3 clear all of those.
  *
  * D6 IS ON TIMER0, AND THAT HAS ONE REAL CONSEQUENCE. Timer0 also generates
  * millis(), which the failsafe below is timed off. Calling analogWrite() on D5/D6
@@ -133,10 +107,10 @@
  * applyMotor() and safeState() below look asymmetric — it is deliberate, and
  * removing it reintroduces a robot that will not quite stop.
  *
- * The two channels run on different timers and therefore different default PWM
- * frequencies: D3 ~490 Hz (Timer2), D6 ~980 Hz (Timer0). Both drive the bridge
- * fine, but the channels are NOT interchangeable — if you ever raise one
- * timer's frequency, raise BOTH. Mismatched channels respond differently to the
+ * Both channels are OC0A and OC0B of Timer0, so one prescaler governs the pair
+ * and they run at the same 62.5 kHz by construction. Keep it that way: if a
+ * wheel is ever moved to another timer, match the frequency deliberately,
+ * because mismatched channels respond differently to the
  * same demand, which reads as a mechanical fault.
  *
  * ---------------------------------------------------------------------------
@@ -183,22 +157,17 @@ IPAddress ip(192, 168, 50, 20);
 const uint16_t LISTEN_PORT = 5005;
 
 // --- Motor driver pins (see the pin-map note above before changing) ----------
-// MOVED D9 -> A1, 2026-08-27, to free Timer1 for the brush. A direction line is
-// a static level and wastes a timer on doing nothing; A1 serves as a plain
-// digital output here exactly as A0 has for the lamp's direction since
-// 2026-08-14.
-// REWIRE BEFORE FLASHING: the left channel's DIR wire moves from D9 to A1.
-const uint8_t DIR1 = 7;    // channel 1 direction (LEFT)  - was A1
-const uint8_t PWM1 = 6;    // channel 1 speed, Timer0 OC0A - 62.5 kHz, was D3
+const uint8_t DIR1 = 7;    // channel 1 direction (LEFT)
+const uint8_t PWM1 = 6;    // channel 1 speed, Timer0 OC0A - 62.5 kHz
 // DIR2 IS THE SHIELD'S microSD CHIP SELECT (D4). It goes LOW whenever the right
 // wheel is driven in the negative direction, and LOW is what SELECTS a card in
 // that slot - which then drives MISO through the SPI reads this sketch makes to
 // the W5100, corrupting them. With the slot EMPTY, as it must be, D4 is an
 // ordinary output and none of this applies. setup() parks it HIGH (deselected).
-const uint8_t DIR2 = 4;    // channel 2 direction (RIGHT) - was D8; SD CS, see above
+const uint8_t DIR2 = 4;    // channel 2 direction (RIGHT) - SD CS, see above
 const uint8_t PWM2 = 5;    // channel 2 speed, Timer0 OC0B - 62.5 kHz, SAME timer as PWM1
 
-// --- Linear actuator: DIR + PWM, DIR on D7 (pinout corrected 2026-08-15) -----
+// --- Linear actuator: DIR on A3, PWM on A2 ----------------------------------
 // Direction comes from the ground station's 3-position actuator switch
 // (GPIO16/19 on the Pi), decoded there and arriving as one signed number:
 // > 0 extends, < 0 retracts, 0 STOPS.
@@ -206,48 +175,34 @@ const uint8_t PWM2 = 5;    // channel 2 speed, Timer0 OC0B - 62.5 kHz, SAME time
 // MEASURED ON THE RIG, and this is the authority — the levels below are the
 // ones the driver actually wants, not an inference from how the wheels work:
 //
-//     level 1 / EXTEND    D7 = LOW    D4 = HIGH
-//     middle  / STOP      D7 = held   D4 = LOW    -> rod holds position
-//     level 3 / RETRACT   D7 = HIGH   D4 = HIGH
+//     level 1 / EXTEND    A3 = LOW    A2 = HIGH
+//     middle  / STOP      A3 = held   A2 = LOW    -> rod holds position
+//     level 3 / RETRACT   A3 = HIGH   A2 = HIGH
 //
 // EXTEND IS DIR **LOW**. Every other direction line on this board (the wheels,
 // the brush) treats HIGH as forward, so the natural assumption is wrong here and
 // applyMotor()'s convention must not be copied onto this channel. That is why
 // the two levels are named constants below instead of a bare ternary.
 //
-// D4 IS THE ONLY THING THAT GATES THE ROD. D7 selects a direction but does not
-// start or stop anything, so STOP is D4 LOW with D7 left wherever it was — which
+// A2 IS THE ONLY THING THAT GATES THE ROD. A3 selects a direction but does not
+// start or stop anything, so STOP is A2 LOW with A3 left wherever it was — which
 // is what "hold that position" means, and why applyActuator() deliberately does
 // not touch the direction line on a stop.
-//
-// THE DIRECTION LINE IS D7, NOT D2. It was on D2 until this was measured, and D2
-// is now free. D7's previous owner was BRUSH_DIR — see the brush block below,
-// because that pin cannot serve both and the brush had to move.
 //
 // Neither pin has a timer behind it, which costs nothing: this channel lost its
 // speed demand when the pot moved to the light, so the only levels it ever needs
 // are full-scale and off, and a static HIGH is 255/255 duty. The middle stage,
-// if it is ever wanted again, is synthesised on D4 — see serviceActuatorPwm().
+// if it is ever wanted again, is synthesised on A2 — see serviceActuatorPwm().
 //
 // ---------------------------------------------------------------------------
-// THE ROD IS OFF THE SHIELD'S PINS ENTIRELY AS OF 2026-08-29.
+// THE ROD IS CLEAR OF THE SHIELD.
 // ---------------------------------------------------------------------------
-// ACT_PWM was D4 - the shield's microSD chip select - from 2026-08-15 until the
-// rewire, and that shared pin caused a fault worth remembering: CS is active-LOW,
-// so the rod's STOP level (D4 LOW) SELECTED the card, and stopped is what a rod
-// mostly is. A selected card drives MISO during the SPI reads this sketch makes
-// to the W5100 every pass of loop() and corrupts them. The symptom was a link
-// that worked while the rod moved and died when it stopped.
+// A2/A3 carry no timer, no SPI and nothing the W5100 wants. This channel is
+// driven by digitalWrite and soft-PWM and needs neither, so nothing the rod does
+// can disturb the Ethernet link.
 //
-// A2/A3 have no such entanglement: no timer, no SPI, no shield. This channel is
-// driven by digitalWrite and soft-PWM and needs neither. Nothing about the rod
-// can disturb the Ethernet link any more.
-//
-// THE HAZARD DID NOT LEAVE THE BOARD, IT MOVED - see DIR2, which is D4 now. The
-// difference is when the pin goes low. It is no longer "whenever the rod is
-// stopped", it is "whenever the right wheel is driven in the LOW direction", and
-// setup() parks it HIGH, which is the deselected state. Still: RUN WITH THE
-// microSD SLOT EMPTY.
+// THE SHIELD'S microSD CHIP SELECT IS STILL ON THE BOARD THOUGH - it is DIR2
+// (D4). See that constant. RUN WITH THE microSD SLOT EMPTY.
 const uint8_t ACT_DIR = A3;  // "Dir" on the rig — LOW extends, HIGH retracts
 const uint8_t ACT_PWM = A2;  // "Pwm" on the rig — the only line that gates it
 
@@ -326,8 +281,8 @@ const unsigned long ACT_PWM_PERIOD_US = 4000UL * 64UL;
  * less doing it, which on a rail this marginal is the point. */
 const unsigned long LOOP_PAUSE_US = 10000UL * 64UL;   // 10 ms REAL
 
-// The duty currently demanded on D4, 0..255. Written by applyActuator(), acted
-// on by serviceActuatorPwm() every pass of loop().
+// The duty currently demanded on ACT_PWM, 0..255. Written by applyActuator(),
+// acted on by serviceActuatorPwm() every pass of loop().
 int actDuty = 0;
 
 // Flip if EXTEND on the panel drives the rod the wrong way. Equivalent to
@@ -341,51 +296,24 @@ const bool INVERT_ACT = false;
 // because the actuator above lost its PWM pin, and with it any use for a speed
 // demand — the two changes are one change.
 //
-// A0 is an ANALOG pin driven as a plain digital output, which is legal on the
-// Uno (A0 == D14) and is what makes this fit at all: every real digital pin is
-// spoken for. It carries the driver channel's direction line, which a lamp does
-// not actually need — see applyLight().
-const uint8_t LIGHT_DIR = 8;   // was A0
-const uint8_t LIGHT_PWM = 9;   // Timer1 OC1A - hardware PWM 62.5 kHz, was D5
+// LIGHT_DIR carries the driver channel's direction line, which a lamp does not
+// actually need — see applyLight(). It is a static level, so it costs no timer.
+const uint8_t LIGHT_DIR = 8;
+const uint8_t LIGHT_PWM = 9;   // Timer1 OC1A - hardware PWM 62.5 kHz
 
 // --- Brush motor: DIR + PWM on a driver channel (rewired 2026-08-14) ---------
 // Driven from the panel's TOGGLE switch (Pi GPIO13).
 //
-// THIS WAS ONE PIN AND THAT IS WHY IT DID NOT WORK. The brush hangs off a
-// dual-channel driver channel, exactly like the wheels, so it needs BOTH inputs:
-// a direction line AND a speed line. Driving D7 alone set the direction of a
-// channel whose PWM input was never asserted, so the bridge stayed off and the
-// motor never turned — while the telemetry cheerfully reported BRUSH=ON, because
-// the sketch really was driving the one pin it knew about.
+// THE BRUSH NEEDS BOTH INPUTS. It hangs off a dual-channel driver channel,
+// exactly like the wheels, so a direction line alone does nothing: drive DIR
+// without asserting PWM and the bridge stays off while the telemetry happily
+// reports BRUSH=ON. Both pins, every time.
 //
-// SPEED CONTROL ARRIVED 2026-08-17: the pot (freed from the rod, then shared
-// with the light) now sets the brush duty, 0..255 in the <brush> field. A1 has
-// no timer behind it, so the duty is SOFT-PWM — serviceBrushPwm() below chops
-// the pin from loop() exactly the way serviceActuatorPwm() runs the rod's D4.
-// The 0 and 255 endpoints still resolve to static levels, so OFF cannot be
-// caught mid-cycle and full speed cannot be chopped by a stalled loop; only
-// the middle range is synthesised, where a stall costs a slower brush, never a
-// runaway one. (Hardware PWM was never an option: 3 and 6 are the wheels, 5
-// the light, 9 is DIR1, 10-13 belong to the shield's SPI.)
-// MOVED D7 -> D2 ON 2026-08-15, AND THIS WAS NOT A TIDY-UP. D7 is the linear
-// actuator's direction line on the rig, and this sketch was holding it HIGH
-// permanently as the brush's direction — a constant, written on every frame.
-// HIGH on that pin means RETRACT, so between this and the SD-deselect park on
-// D4 the rod was handed a full-scale retract command from reset onwards, by two
-// lines neither of which anyone thought of as the actuator's. That is the whole
-// explanation for a rod that only ever drove one way and never stopped.
-//
-// D2 IS CONFIRMED AGAINST THE RIG (Harshil, 2026-08-15): brush is Dir -> D2,
-// Pwm -> A1, driven from the panel TOGGLE on Pi GPIO13. This is not an inference
-// from D7 having been taken — the wire really is on D2, and the sketch was the
-// thing that was wrong.
+// The pot (shared with the light) sets the duty, 0..255 in the <brush> field.
+// BRUSH_PWM is Timer2 OC2B, so that duty is real hardware PWM at 62.5 kHz - the
+// same figure the wheels and the lamp run at - and the loop does no work for it.
 const uint8_t BRUSH_DIR = 2;
-// MOVED A1 -> D9, 2026-08-27, and this is the whole point of the swap. A1 has
-// no timer, so the brush was chopped in software from loop() at 250 Hz. D9 is
-// Timer1, so the duty becomes real hardware PWM at 62.5 kHz - the same figure
-// both wheels already run at.
-// REWIRE BEFORE FLASHING: the brush's PWM wire moves from A1 to D9.
-const uint8_t BRUSH_PWM = 3;    // Timer2 OC2B - hardware PWM 62.5 kHz, was D9
+const uint8_t BRUSH_PWM = 3;    // Timer2 OC2B - hardware PWM 62.5 kHz
 
 // The brush spins one way only, so its direction is a constant rather than a
 // demand. Flip this if the brush runs backwards.
@@ -398,8 +326,8 @@ const bool BRUSH_DIR_LEVEL = HIGH;
 // serviceBrushPwm() inverts through this same constant.
 const bool BRUSH_ACTIVE_HIGH = true;
 
-// The duty currently demanded on A1, 0..255. Written by applyBrush(), acted on
-// by serviceBrushPwm() every pass of loop() — the same pairing as
+// The duty currently demanded on BRUSH_PWM, 0..255. Written by applyBrush() —
+// the same pairing as
 // actDuty / serviceActuatorPwm(), and it shares ACT_PWM_PERIOD_US (250 Hz)
 // because two independent soft-PWM periods would just be two numbers to keep
 // in sync for no benefit. A brush motor's inertia makes 250 Hz ripple
@@ -604,9 +532,8 @@ void applyMotor(uint8_t dirPin, uint8_t pwmPin, int demand, bool invert) {
   int duty = demand >= 0 ? demand : -demand;
   if (duty == 0) {
     // NOT analogWrite(pwmPin, 0) — on a Timer0 pin that can still emit a
-    // narrow pulse each period and leave the motor creeping. Since the
-    // 2026-08-29 rewire BOTH wheels are on Timer0 (D6 and D5), so this now
-    // matters for both of them rather than just the one. See the pin map.
+    // narrow pulse each period and leave the motor creeping. BOTH wheels are
+    // on Timer0 (D6 and D5), so this matters for both. See the pin map.
     digitalWrite(pwmPin, LOW);
   } else {
     if (MIN_DUTY > 0) {
@@ -699,16 +626,15 @@ void applyBrush(int duty) {
  * If the supply is ever fixed and the brush still disturbs the link, this is the
  * first thing to try again - the code is in git history at 7c52a31. */
 void serviceBrushPwm() {
-  // NOTHING TO DO. The brush is on D9 (Timer1) and its duty is applied in
-  // hardware by applyBrush(), so there is no waveform to synthesise and no ramp
-  // to advance. Kept as an empty call because loop() and the failsafe path both
-  // invoke it, and because this is where a chopper would go if the brush ever
-  // moved back to a timer-less pin. That code is in git history.
+  // NOTHING TO DO. The brush is on Timer2 and its duty is applied in hardware by
+  // applyBrush(), so there is no waveform to synthesise. Kept as an empty call
+  // because loop() and the failsafe path both invoke it, and because this is
+  // where a chopper would go if the brush ever moved to a timer-less pin.
 }
 
-/* Linear actuator: D7 picks the direction, D4 gates it, zero holds position.
+/* Linear actuator: A3 picks the direction, A2 gates it, zero holds position.
  *
- * ZERO IS A REAL STOP. D4 is what powers the channel, so dropping it low leaves
+ * ZERO IS A REAL STOP. A2 is what powers the channel, so dropping it low leaves
  * the rod exactly where it is — which is what the panel's middle throw means and
  * what the failsafe needs. It is not a brake and not a reversal; the rod simply
  * stops being driven.
@@ -796,15 +722,15 @@ void applyLight(int level) {
   // upstream - the pot table, light_demand(), the panel readout - already
   // assumes.
   //
-  // THE LEGS CANNOT BE SWAPPED, so do not try it as a fix: LIGHT_DIR is A0,
+  // THE LEGS CANNOT BE SWAPPED, so do not try it as a fix: LIGHT_DIR is D8,
   // which has no timer behind it and cannot carry a PWM at all. The static leg
   // has to be that one, which means it has to be the LOW one.
   digitalWrite(LIGHT_DIR, LOW);
 
   if (level == 0) {
-    // D5 is a Timer0 pin, so analogWrite(pin, 0) can still emit a narrow pulse
-    // every period. On a motor that is a creep; on a lamp it is a faint glow
-    // that will not go out. digitalWrite is the only certain dark.
+    // LIGHT_PWM is a timer pin, so analogWrite(pin, 0) can still emit a narrow
+    // pulse every period. On a motor that is a creep; on a lamp it is a faint
+    // glow that will not go out. digitalWrite is the only certain dark.
     digitalWrite(LIGHT_PWM, LOW);
   } else {
     analogWrite(LIGHT_PWM, level);
@@ -1115,10 +1041,9 @@ void setup() {
   digitalWrite(DIR2, LOW);
   digitalWrite(PWM1, LOW);
   digitalWrite(PWM2, LOW);
-  // BOTH rod lines must be at their stopped level before they become outputs —
-  // the same reasoning as the brush's A1 below. This is also what replaced the
-  // old "park pin 4 HIGH to deselect the SD card" line: HIGH on D4 is the rod's
-  // RETRACT drive, and that park is why the rod ran from reset forever.
+  // BOTH rod lines must be at their stopped level before they become outputs,
+  // for the same reason the brush's gate is driven first: a pin that is still an
+  // input is held nowhere, and a driver whose enable drifts high will run.
   digitalWrite(ACT_DIR, ACT_LEVEL_EXTEND);
   digitalWrite(ACT_PWM, LOW);
   digitalWrite(LIGHT_DIR, LOW);
@@ -1139,8 +1064,8 @@ void setup() {
   pinMode(PWM2, OUTPUT);
   pinMode(ACT_DIR, OUTPUT);
   pinMode(ACT_PWM, OUTPUT);
-  // A0 as a digital output. pinMode(A0, OUTPUT) is the whole ceremony — nothing
-  // else is needed to stop it being an ADC input.
+  // Nothing special is needed for these two; pinMode(OUTPUT) is the whole
+  // ceremony.
   pinMode(LIGHT_DIR, OUTPUT);
   pinMode(LIGHT_PWM, OUTPUT);
   // --- PWM frequency ---------------------------------------------------
@@ -1157,16 +1082,13 @@ void setup() {
   //
   //     16e6 / (256 * 1) = 62500 Hz   both channels
   //
-  // Timer2 CARRIES THE BRUSH NOW (D3), not a wheel. The register writes are
-  // unchanged by the 2026-08-29 rewire - the timer and the frequency are the
-  // same, only the load on the pin is different - but the reasoning above about
-  // MATCHING two wheels no longer applies to this timer. Both wheels are on
-  // Timer0 together now, so they match by construction rather than by two
-  // separately-tuned timers agreeing. See the pin map at the top.
+  // Timer2 carries the BRUSH (D3). The matching argument above is about the two
+  // wheels, which share Timer0 and therefore cannot disagree; this timer drives
+  // one load and only needs to be fast. See the pin map at the top.
   TCCR2A |= _BV(WGM21);
   TCCR2B = (TCCR2B & 0b11111000) | 0b001;
 
-  // Timer0: D6 AND D5 - BOTH WHEELS since the 2026-08-29 rewire.
+  // Timer0: D6 AND D5 - BOTH WHEELS.
   // Prescaler = 1 -> about 62.5 kHz on both, which is the point: one prescaler
   // write now sets both channels, so left and right cannot drift apart.
   // WARNING: this breaks normal millis()/micros()/delay() timing - millis()
@@ -1177,11 +1099,8 @@ void setup() {
   // on a static IP so nothing here waits on a DHCP timeout.
   TCCR0B = (TCCR0B & 0b11111000) | 0b001;
 
-  // Timer1: D9, THE LAMP since the 2026-08-29 rewire (it carried the brush from
-  // 2026-08-27 until then; the brush is on Timer2/D3 now). The configuration
-  // below is unchanged - same timer, same 62.5 kHz - because what it does for a
-  // lamp is exactly what it did for a brush: a hardware waveform far above
-  // anything the load can follow mechanically or the eye can see.
+  // Timer1: D9, the lamp. A hardware waveform far above anything the eye can
+  // follow, which is what keeps a dimmed lamp free of visible flicker.
   //
   // The core leaves Timer1 in 8-bit PHASE-CORRECT with prescaler 64, which is
   // 490 Hz. Fast PWM 8-bit (WGM13:0 = 0101) with prescaler 1 gives
@@ -1202,17 +1121,8 @@ void setup() {
   pinMode(STATUS_LED, OUTPUT);
   safeState();
 
-  // NO SD DESELECT HERE ANY MORE, AND THIS WAS HALF THE BUG. Pin 4 is the rod's
-  // gate (ACT_PWM), and the old pinMode(4, OUTPUT)/digitalWrite(4, HIGH) pair
-  // asserted it at every reset and never lowered it again — nothing else in the
-  // sketch touched pin 4. The other half was D7, held HIGH as the brush's
-  // direction, which on the rod's driver means RETRACT. Full-scale retract,
-  // latched from reset, from two pins neither of which was thought of as the
-  // actuator's. Neither line looked wrong on its own.
-  //
-  // With the slot empty there is no card to deselect, so the line is simply
-  // gone; safeState() above has already left D4 LOW. See the ACT_DIR/ACT_PWM
-  // block.
+  // NO SD DESELECT HERE. D4 is DIR2 and safeState() has already parked it HIGH,
+  // which is the deselected level in any case. Run with the slot empty.
 
   // Static IP — no DHCP. Ethernet.begin(mac, ip) cannot fail or block, unlike
   // the DHCP form which stalls ~60 s when no server answers. On a point-to-point
@@ -1372,10 +1282,9 @@ void setup() {
   Serial.print(MIN_DUTY);
   Serial.print(F(".."));
   Serial.println(MAX_PWM);
-  // Printed as the truth table rather than as two pin numbers, because the bug
-  // this channel spent a day on was a WIRING SCHEME misread, not a wrong pin:
-  // both pin numbers were right the whole time. A banner that says only
-  // "ACT=D2/D4" would have looked correct on the broken build too.
+  // Printed as the truth table rather than as two bare pin numbers: the failure
+  // this channel is prone to is a WIRING SCHEME misread, which two correct pin
+  // numbers would not reveal.
   Serial.print(F("ACT_DIR="));   printPin(ACT_DIR);
   Serial.print(F(" ACT_PWM="));  printPin(ACT_PWM);
   Serial.print(F(" - LOW on ")); printPin(ACT_DIR);
@@ -1386,11 +1295,9 @@ void setup() {
   Serial.print(ACT_DUTY_EXTEND);
   Serial.println(F(" (stop/retract/extend)"));
   // Loud, and in the banner rather than a comment, because the failure it warns
-  // about looks like a flaky cable. The pin it applies to MOVED on 2026-08-29:
-  // D4 is the right wheel's direction line now, not the rod's gate, so the link
-  // dies while that wheel is driven in the LOW direction rather than while the
-  // rod is stopped. Same cause, same cure, different moment - which is exactly
-  // why this line is printed from DIR2 rather than typed out.
+  // about looks like a flaky cable: with a card in the slot the link dies while
+  // the right wheel is driven in the LOW direction. Printed from DIR2 rather
+  // than typed out, so it cannot go stale if that pin ever moves.
   Serial.print(F("  ^ "));
   printPin(DIR2);
   Serial.println(F(" is the shield's SD chip select - RUN WITH THE SLOT EMPTY"));

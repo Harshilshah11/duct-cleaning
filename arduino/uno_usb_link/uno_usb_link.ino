@@ -66,35 +66,24 @@
  * MOTOR PIN MAP — chosen around the shield, NOT freely
  * ---------------------------------------------------------------------------
  *
- *   channel 1 / LEFT    DIR1 = A1        PWM1 = D3    (Timer2)
- *   channel 2 / RIGHT   DIR2 = D8        PWM2 = D6    (Timer0)
- *   linear actuator     ACT_DIR = D7     ACT_PWM = D4  (LOW extends! see below)
- *   brush motor         BRUSH_DIR = D2   BRUSH_PWM = D9 (soft-PWM, 0..255)
- *   light               LIGHT_DIR = A0   LIGHT_PWM = D5 (Timer0)
+ *   channel 1 / LEFT    DIR1 = D7        PWM1 = D6    (Timer0 OC0A, 62.5 kHz)
+ *   channel 2 / RIGHT   DIR2 = D4        PWM2 = D5    (Timer0 OC0B, 62.5 kHz)
+ *   linear actuator     ACT_DIR = A3     ACT_PWM = A2  (LOW on A3 extends!)
+ *   brush motor         BRUSH_DIR = D2   BRUSH_PWM = D3 (Timer2 OC2B, 62.5 kHz)
+ *   light               LIGHT_DIR = D8   LIGHT_PWM = D9 (Timer1 OC1A, 62.5 kHz)
  *
- * EVERY PIN IS NOW SPOKEN FOR. D0/D1 are the USB serial this telemetry goes out
- * on, D10-D13 belong to the shield, and all four of the Uno's usable PWM pins
- * (D3, D5, D6, D9) are allocated — D9 to the brush's speed line since the
- * 2026-08-27 swap noted below. A1 is now the LEFT direction line: a direction
- * line only needs digitalWrite, so spending an analog-capable pin on it costs
- * nothing, and it frees D9's timer for the brush. A2-A5 are spare plain digital
- * I/O since the rod's enable moved off A2 to D4.
+ * ONE TIMER PER JOB:
+ *   Timer0 (D5+D6) - BOTH wheels, so they share a frequency by construction
+ *   Timer1 (D9)    - the lamp
+ *   Timer2 (D3)    - the brush
+ * The rod needs no timer, being soft-PWM, and lives on A2/A3 - which is what
+ * frees the timer pins for the four things that actually need dimming.
  *
- * D4 IS THE SHIELD'S microSD CHIP SELECT AND THE ROD NOW OWNS IT — see the
- * ACT_DIR/ACT_PWM block below. RUN THIS BOARD WITH THE microSD SLOT EMPTY.
+ * D4 IS THE SHIELD'S microSD CHIP SELECT AND THE RIGHT WHEEL'S DIRECTION LINE
+ * OWNS IT — see the DIR2 block below. RUN THIS BOARD WITH THE SLOT EMPTY.
  *
- * REWIRED 2026-08-14: D7 is freed and the old DIR1=D7 / PWM1=D9 / PWM2=D3 map
- * is gone. DIR1 took over D9 (a direction line only needs digitalWrite, so
- * spending a PWM-capable pin on it is fine), PWM1 moved to D3, and PWM2 moved
- * to the newly used D6.
- *
- * SWAPPED 2026-08-27, on the operator's word that the rig is wired BRUSH_PWM=D9
- * and DIR1=A1. This sketch still held the reverse - DIR1=D9, BRUSH_PWM=A1 - so
- * flashing it would have crossed the brush with the left wheel's direction: the
- * brush would not run and the left wheel would steer wrong, which reads as two
- * separate mechanical faults rather than one wrong constant. uno_eth_link made
- * this move on 2026-08-27 and this file had not followed. The two sketches share
- * a rig; a pin map that differs between them is a trap, not a variant.
+ * THIS MAP MUST MATCH uno_eth_link. Both sketches drive one rig; a pin map that
+ * differs between them is a trap, not a variant.
  *
  * The obvious map (PWM on D10/D11) is IMPOSSIBLE with this shield fitted: the
  * W5100/W5500 owns D10 (chip select), D11 (MOSI), D12 (MISO) and D13 (SCK) for
@@ -179,14 +168,14 @@
 const unsigned long SERIAL_BAUD = 115200;
 
 // --- Motor driver pins (see the pin-map note above before changing) ----------
-const uint8_t DIR1 = 7;    // channel 1 direction (LEFT)  - was A1, rewired 2026-08-29
-const uint8_t PWM1 = 6;    // channel 1 speed, Timer0 OC0A - 62.5 kHz, was D3
+const uint8_t DIR1 = 7;    // channel 1 direction (LEFT)
+const uint8_t PWM1 = 6;    // channel 1 speed, Timer0 OC0A - 62.5 kHz
 // DIR2 IS THE SHIELD'S microSD CHIP SELECT (D4). It goes LOW whenever the right
 // wheel is driven in the negative direction, and LOW is what SELECTS a card in
 // that slot - which then drives MISO through any SPI the board is doing and
 // corrupts it. With the slot EMPTY, as it must be, D4 is an ordinary output.
 // setup() parks it HIGH, which is the deselected state.
-const uint8_t DIR2 = 4;    // channel 2 direction (RIGHT) - was D8; SD CS, see above
+const uint8_t DIR2 = 4;    // channel 2 direction (RIGHT) - SD CS, see above
 const uint8_t PWM2 = 5;    // channel 2 speed, Timer0 OC0B - 62.5 kHz, SAME timer as PWM1
 //
 // BOTH WHEEL PWMs ARE ON TIMER2, and that is the point of the D11 choice, not a
@@ -394,10 +383,8 @@ const bool INVERT_ACT = false;
 // because the actuator above lost its PWM pin, and with it any use for a speed
 // demand — the two changes are one change.
 //
-// A0 is an ANALOG pin driven as a plain digital output, which is legal on the
-// Uno (A0 == D14) and is what makes this fit at all: every real digital pin is
-// spoken for. It carries the driver channel's direction line, which a lamp does
-// not actually need — see applyLight().
+// LIGHT_DIR carries the driver channel's direction line, which a lamp does not
+// actually need — see applyLight(). It is a static level, so it costs no timer.
 // ---------------------------------------------------------------------------
 // PIN MAP vs THE ETHERNET SHIELD - READ BEFORE GOING BACK TO uno_eth_link.ino
 //
@@ -418,7 +405,7 @@ const bool INVERT_ACT = false;
 // note above, and it cost this rig a day when the SD chip-select and the rod's
 // gate turned out to be the same pin.
 // ---------------------------------------------------------------------------
-const uint8_t LIGHT_DIR = 8;   // was A0
+const uint8_t LIGHT_DIR = 8;
 // THE LAMP'S PWM, set to D5 on the operator's pin map 2026-08-26.
 //
 // D5 is Timer0 OC0B, and Timer0 is ALREADY at prescaler 1 for D6's wheel PWM -
@@ -439,7 +426,7 @@ const uint8_t LIGHT_DIR = 8;   // was A0
 // IF IT IS DARK AGAIN, D5 is the pin to suspect first - it and D6 are Timer0's
 // only two PWM outputs and both have been reported dead at least once today.
 // D10 and D11 are free and both are on healthy timers.
-const uint8_t LIGHT_PWM = 9;   // Timer1 OC1A - hardware PWM 62.5 kHz, was D5
+const uint8_t LIGHT_PWM = 9;   // Timer1 OC1A - hardware PWM 62.5 kHz
 
 // --- Brush motor: DIR + PWM on a driver channel (rewired 2026-08-14) ---------
 // Driven from the panel's TOGGLE switch (Pi GPIO13).
@@ -469,12 +456,11 @@ const uint8_t LIGHT_PWM = 9;   // Timer1 OC1A - hardware PWM 62.5 kHz, was D5
 // explanation for a rod that only ever drove one way and never stopped.
 //
 // D2 IS CONFIRMED AGAINST THE RIG (Harshil, 2026-08-15): brush is Dir -> D2,
-// Pwm -> D9 (A1 until the 2026-08-27 swap), driven from the panel TOGGLE on Pi
-// GPIO13. This is not an inference
+// Pwm -> D3, driven from the panel TOGGLE on Pi GPIO13. This is not an inference
 // from D7 having been taken — the wire really is on D2, and the sketch was the
 // thing that was wrong.
 const uint8_t BRUSH_DIR = 2;
-const uint8_t BRUSH_PWM = 3;    // Timer2 OC2B - was D9, rewired 2026-08-29
+const uint8_t BRUSH_PWM = 3;    // Timer2 OC2B - hardware-capable pin
 
 // The brush spins one way only, so its direction is a constant rather than a
 // demand. Flip this if the brush runs backwards.
@@ -746,8 +732,8 @@ void applyBrush(int duty) {
 
 /* Software PWM for the brush. D9 DOES have a timer (Timer1, already configured
  * for 8-bit fast PWM below), so this could be handed to hardware the way
- * uno_eth_link does it - deliberately not done in the 2026-08-27 pin swap, which
- * was kept to the pin map alone. Chopping D9 from loop() works because
+ * uno_eth_link does it - deliberately not done here, to keep this sketch's
+ * change to the pin map alone. Chopping D9 from loop() works because
  * digitalWrite() clears the timer's compare-output bits on the way past. Same
  * contract as
  * serviceActuatorPwm(): called every pass of loop(), static levels for the 0
@@ -1067,8 +1053,8 @@ void setup() {
   pinMode(PWM2, OUTPUT);
   pinMode(ACT_DIR, OUTPUT);
   pinMode(ACT_PWM, OUTPUT);
-  // A0 as a digital output. pinMode(A0, OUTPUT) is the whole ceremony — nothing
-  // else is needed to stop it being an ADC input.
+  // Nothing special is needed for these two; pinMode(OUTPUT) is the whole
+  // ceremony.
   pinMode(LIGHT_DIR, OUTPUT);
   pinMode(LIGHT_PWM, OUTPUT);
   // --- PWM frequency ---------------------------------------------------
