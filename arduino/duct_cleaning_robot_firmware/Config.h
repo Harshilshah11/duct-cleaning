@@ -88,9 +88,26 @@ const unsigned long MILLIS_SCALE = 64;
 // one setting living in two files — change one, reflash the other, or the link
 // is dead rather than slow.
 //
-// YOUR TERMINAL MUST SUPPORT IT: the Arduino IDE offers 250000 and
-// `screen /dev/ttyACM0 250000` takes it, but some older tools stop at 115200.
-const unsigned long SERIAL_BAUD = 250000;
+// RAISED AGAIN TO 500000 on 2026-08-29. Still exact on a 16 MHz AVR - UBRR=3
+// with U2X gives 500000.0, error 0.00% - so this costs no accuracy, and it
+// halves the print cost once more: a telemetry line falls from ~3.8 ms to
+// ~1.9 ms of loop time.
+//
+// 500000 IS THE LAST SAFE STEP UP on the Ethernet build, and the reason is the
+// RECEIVE side rather than the transmit one. The Uno's serial RX buffer is 64
+// bytes and fills in 1.3 ms at this rate. That does not matter here because
+// nothing SENDS to this port on the Ethernet build - SERIAL_COMMANDS is false
+// and the port is only drained - but on the SERIAL build it carries commands,
+// and there the buffer would overrun inside a single loop pass. If
+// LINK_TRANSPORT ever goes back to LINK_SERIAL, drop this to 250000 with it.
+//
+// 1000000 is also exact (UBRR=1) and is NOT worth taking: it halves that buffer
+// margin again for a saving of under a millisecond, on a port that is now
+// diagnostic-only anyway since TELEMETRY_ENABLED went false.
+//
+// YOUR TERMINAL MUST SUPPORT IT: the Arduino IDE offers 500000 and
+// `screen /dev/ttyACM0 500000` takes it, but some older tools stop at 115200.
+const unsigned long SERIAL_BAUD = 500000;
 
 // ===========================================================================
 // NETWORK — why .50.20 and not .1.20
@@ -329,6 +346,26 @@ const uint16_t RX_BUFFER = 96;
 // ===========================================================================
 // Report on change no faster than this, and on a heartbeat regardless, so a
 // resting link still proves itself.
+// SERIAL TELEMETRY OFF on the operator's order 2026-08-29.
+//
+// This silences the continuous "L=.. R=.. ACT=.. BRUSH=.. LIGHT=.. pkts=.." line
+// ONLY. The boot banner, the RESET cause, the W5100 lines and the LINK DOWN /
+// LINK SILENT faults still print: those are one-off events, not a stream, and
+// they are the things that have actually diagnosed this rig. Silencing them
+// would leave a board that cannot say why it came back.
+//
+// IT ALSO BUYS LOOP TIME, which is the reason worth knowing. That line is
+// printed FROM loop(), so its cost is loop time - about 3.8 ms at 250000 baud.
+// With LOOP_PAUSE_US at a real 10 ms, dropping it takes a printing pass from
+// ~14 ms to ~10 ms, which is a third more passes per second and therefore a
+// third more headroom against the Pi's 50 Hz. The drain in loop() means the
+// link no longer depends on that margin, but more of it is free here.
+//
+// TURN IT BACK ON TO WATCH THE ROBOT. diag/uno_logger.py on the Pi records this
+// stream, and it is how L and R were read back while chasing the crossed axes
+// and the reversed motor. One line, then reflash.
+const bool TELEMETRY_ENABLED = false;
+
 const unsigned long TELEMETRY_MIN_INTERVAL_MS = REAL_MS(200);
 const unsigned long TELEMETRY_HEARTBEAT_MS    = REAL_MS(3000);
 

@@ -7,6 +7,11 @@ static int printedB = 0, printedLight = 0;
 static unsigned long lastPrintMs = 0;
 
 void telemetryReport() {
+    // Off by default — see TELEMETRY_ENABLED. Returning here rather than at the
+    // call site keeps loop() reading the same either way, and costs nothing: the
+    // compiler folds a compile-time false into a dropped call.
+    if (!TELEMETRY_ENABLED) return;
+
     unsigned long now = millis();
 
     bool changed = (applied.left  != printedL || applied.right != printedR
