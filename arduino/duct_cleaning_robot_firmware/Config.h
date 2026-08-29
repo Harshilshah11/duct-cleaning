@@ -65,20 +65,32 @@ const unsigned long MILLIS_SCALE = 64;
 // ===========================================================================
 // SERIAL
 // ===========================================================================
-// 115200 on the operator's order 2026-08-27, down from 250000. On a 16 MHz AVR:
+// 250000 on the operator's order 2026-08-29, back up from 115200. On a 16 MHz
+// AVR this is also the more accurate of the two, which is the rare case where
+// the faster option is the safer one:
 //
 //     250000 -> UBRR=7   actual 250000.0   error  0.00%
 //     115200 -> UBRR=16  actual 117647.1   error +2.12%
 //
-// 2.12% is inside the ~4% a UART tolerates, so it works — with less margin for
-// a long cable or a warm clock. If the banner ever comes back as garbage, that
-// missing margin is the first thing to suspect.
+// IT BUYS LOOP HEADROOM, NOT JUST THROUGHPUT, and that is the real reason to
+// want it here. The telemetry line is printed from loop(), so its cost is loop
+// time: about 8.2 ms at 115200 against 3.8 ms at 250000. With LOOP_PAUSE_US at a
+// real 10 ms, a printing pass was ~18 ms — roughly 55 passes a second against a
+// Pi sending 50, which is no margin at all. Halving the print cost restores it.
+//
+// The drain in loop() means the link no longer DEPENDS on that margin (it takes
+// up to eight packets a pass rather than one), so this is insurance rather than
+// a fix. Both together is the point: the drain stops a backlog forming, and the
+// faster print stops the loop being slow enough to create one.
 //
 // ON THE ETHERNET BUILD this port is a CONSOLE and the number is a preference.
 // ON THE SERIAL BUILD it carries the commands, so it and the Pi's UNO_BAUD are
 // one setting living in two files — change one, reflash the other, or the link
 // is dead rather than slow.
-const unsigned long SERIAL_BAUD = 115200;
+//
+// YOUR TERMINAL MUST SUPPORT IT: the Arduino IDE offers 250000 and
+// `screen /dev/ttyACM0 250000` takes it, but some older tools stop at 115200.
+const unsigned long SERIAL_BAUD = 250000;
 
 // ===========================================================================
 // NETWORK — why .50.20 and not .1.20
@@ -137,9 +149,30 @@ const uint8_t PIN_PWM2 = 5;    // channel 2 speed, Timer0 OC0B
 // safer than negating on the Pi — the Pi feeds BOTH transports, so a sign flip
 // there would silently desync them.
 //
-// INVERT_2 IS true ON THIS RIG. That is measured, not a default.
+// BOTH ARE false ON THIS RIG. That is measured, not a default, and it took two
+// passes on 2026-08-29 because these constants answer TWO questions at once.
+//
+// The loom moved DIR1 to D7 and DIR2 to D4, so each channel landed on a
+// different driver input and the pair stopped agreeing. Two wheels that disagree
+// on a straight command is a SPIN: "robot is start turing when moving forward
+// and backwork", with the UI reading correctly.
+//
+// WHETHER THEY MATCH and WHICH WAY THEY BOTH GO are separate, and only the first
+// is visible as a spin. Setting INVERT_1 true made them match - the spin went -
+// but the pair settled on the wrong direction, reported next as "forward is
+// running back work and backward forward". Clearing BOTH keeps them matched and
+// reverses the pair together.
+//
+// SO THE ORDER TO DEBUG THESE IN IS: stop the spin first, then check the
+// direction. A spin means the two DISAGREE, and either constant fixes it -
+// but the two choices leave the robot driving opposite ways, and you cannot
+// tell which you want until the spin is gone and there is a single direction
+// to judge. Chasing both at once is how a two-line fix becomes four flashes.
+//
+// The wheels-up observation that started it: a forward push drove the RIGHT
+// wheel correctly and the LEFT one backward.
 const bool INVERT_1 = false;
-const bool INVERT_2 = true;
+const bool INVERT_2 = false;
 
 // ===========================================================================
 // LINEAR ACTUATOR — A3 picks direction, A2 gates it

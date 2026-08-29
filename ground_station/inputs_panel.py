@@ -2511,20 +2511,31 @@ class InputsPanel(QFrame):
         held = self._joy_disp["y"]
         if y is None and held is not None and now - held[1] < JOY_DISPLAY_HOLD_S:
             y = held[0]
-        # DISPLAY-ONLY AXIS SWAP, operator 2026-08-26: "in my backend my x and y
-        # is swaped ... only frontend, backend side no any change because its
-        # correct".
+        # NO DISPLAY-ONLY AXIS SWAP ANY MORE. Removed 2026-08-29.
         #
-        # The wheels are right and must not be touched, so this cannot go in
-        # inputs.py - SWAP_XY there feeds the mixer as well and would undo a
-        # calibration that is already correct on the rig. This is the last point
-        # before the picture, and nothing downstream of it reaches a motor.
+        # This line read set_pos(y, x) from 2026-08-26, added on the operator's
+        # report: "in my backend my x and y is swaped ... only frontend, backend
+        # side no any change because its correct". It was right then.
         #
-        # KEEP IT HERE IF THE PANEL EVER LOOKS WRONG AGAIN. The rule for this
-        # file is the same one the dot's ox/oy signs already follow: it is not an
-        # opinion about orientation, it is whatever makes the PICTURE match the
-        # hand, given whatever inputs.py is sending. Change one, check the other.
-        self.joy.set_pos(y, x)
+        # It is wrong now, reported 2026-08-29: "turning right indicating front
+        # and left indicating back". That is precisely what a swap does once it is
+        # no longer needed - the arrows and the dot both read _x/_y, so feeding
+        # them crossed makes a turn drive the forward/reverse pair and a push
+        # drive the left/right pair.
+        #
+        # THE RULE THIS FILE ALREADY STATES IS WHY IT COMES OUT rather than being
+        # inverted somewhere else: it is not an opinion about orientation, it is
+        # whatever makes the PICTURE match the hand given whatever inputs.py is
+        # sending. inputs.py sends x as turn and y as forward/back; the panel now
+        # takes them that way. Both the arrows and the dot follow from this one
+        # line, so if the dot ever looks wrong, look here first.
+        #
+        # STILL DISPLAY-ONLY EITHER WAY. Nothing downstream of this reaches a
+        # motor - the wheels are fed from inputs.py through mix(), and the drive
+        # is correct on the rig (a forward push drives straight, confirmed
+        # 2026-08-29). This must not be "fixed" by touching SWAP_XY in inputs.py,
+        # which feeds the mixer too and would break a calibration that is right.
+        self.joy.set_pos(x, y)
         # ONE number for the whole stick, 2026-08-24 on the operator's ask:
         # "remove turn and add all in throttle". Not |y|, which would read 0%
         # while spinning on the spot at full power - THE PEAK WHEEL DEMAND, so

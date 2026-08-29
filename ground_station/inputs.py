@@ -380,7 +380,32 @@ AXIS_TRAVEL_Y_NEG = float(os.environ.get("INPUTS_AXIS_TRAVEL_Y_NEG", "0.645"))
 # off the PHYSICAL channel (ch 0 / ch 1) inside _norm_axis, because those were
 # measured against real electrical travel and the wiring did not change - only
 # the label on it did.
-SWAP_XY = os.environ.get("INPUTS_SWAP_XY", "1") == "1"
+# FLIPPED TO 0 on 2026-08-29, and this one was MEASURED rather than reasoned.
+#
+# Operator: "the issue in the physical mounting is not align with the joystick in
+# the ui. i am holding front physically but showing right in ui". With the stick
+# held physically FORWARD the logger recorded fourteen consecutive samples of
+#
+#     x = -1.0    y = 0.0
+#
+# Full deflection on the ELECTRICAL X channel and nothing at all on Y. The stick
+# is mounted a quarter turn round, so its forward throw lands on the channel this
+# code was calling turn.
+#
+# WHY THIS BELONGS HERE AND NOT IN THE PANEL. A display-only swap lived in
+# inputs_panel.py for three days doing half of this job, and it could only ever
+# have been half: the panel and the mixer read the SAME joy["x"] / joy["y"], so
+# crossed axes bend the wheels exactly as much as the arrows. Correcting it at
+# the source fixes both at once, and it is the honest description of the fault -
+# the wiring is rotated, not the picture.
+#
+# WHAT THIS ALSO EXPLAINS, which is how a display bug turned out to be a drive
+# bug. The FRONT/BACK camera highlight lights on `left + right`, the pair's
+# common component, which a pure turn cancels to zero. With the axes crossed, a
+# physical LEFT/RIGHT throw arrived as y and drove both wheels together - a
+# non-zero sum - so turning lit a camera while pushing forward did not. That was
+# reported as a highlight bug and chased as one; it was this.
+SWAP_XY = os.environ.get("INPUTS_SWAP_XY", "0") == "1"
 
 INVERT_X = os.environ.get("INPUTS_INVERT_X", "0") == "1"
 # Y FLIPPED TO 0 (2026-08-25). Operator: "my forward backward is interchange in
