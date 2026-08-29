@@ -179,10 +179,15 @@
 const unsigned long SERIAL_BAUD = 115200;
 
 // --- Motor driver pins (see the pin-map note above before changing) ----------
-const uint8_t DIR1 = A1;   // channel 1 direction (LEFT) - was D9, see the 2026-08-27 swap
-const uint8_t PWM1 = 3;    // channel 1 speed, Timer2 OC2B - 62.5 kHz, see PWM_FAST
-const uint8_t DIR2 = 8;    // channel 2 direction (RIGHT)
-const uint8_t PWM2 = 6;    // channel 2 speed, Timer0 OC0A - BACK ON D6 2026-08-26, operator's instruction
+const uint8_t DIR1 = 7;    // channel 1 direction (LEFT)  - was A1, rewired 2026-08-29
+const uint8_t PWM1 = 6;    // channel 1 speed, Timer0 OC0A - 62.5 kHz, was D3
+// DIR2 IS THE SHIELD'S microSD CHIP SELECT (D4). It goes LOW whenever the right
+// wheel is driven in the negative direction, and LOW is what SELECTS a card in
+// that slot - which then drives MISO through any SPI the board is doing and
+// corrupts it. With the slot EMPTY, as it must be, D4 is an ordinary output.
+// setup() parks it HIGH, which is the deselected state.
+const uint8_t DIR2 = 4;    // channel 2 direction (RIGHT) - was D8; SD CS, see above
+const uint8_t PWM2 = 5;    // channel 2 speed, Timer0 OC0B - 62.5 kHz, SAME timer as PWM1
 //
 // BOTH WHEEL PWMs ARE ON TIMER2, and that is the point of the D11 choice, not a
 // coincidence to be tidied away. D3 is OC2B and D11 is OC2A - two compare
@@ -291,8 +296,8 @@ const uint8_t PWM2 = 6;    // channel 2 speed, Timer0 OC0A - BACK ON D6 2026-08-
 // If a card ever has to go in that slot, A2 is free and is a drop-in replacement
 // — change the one constant below and nothing else, because this channel is
 // driven by digitalWrite/soft-PWM and needs no timer.
-const uint8_t ACT_DIR = 7;   // "Dir" on the rig — LOW extends, HIGH retracts
-const uint8_t ACT_PWM = 4;   // "Pwm" on the rig — the only line that gates it
+const uint8_t ACT_DIR = A3;  // "Dir" on the rig — LOW extends, HIGH retracts
+const uint8_t ACT_PWM = A2;  // "Pwm" on the rig — no timer, soft-PWM; off the shield now
 
 // Spelled out because this channel is the ODD ONE OUT: LOW is forward here and
 // HIGH is forward everywhere else on the board. Swap these two if the rod
@@ -343,6 +348,36 @@ const int ACT_DUTY_EXTEND = 255;
 // visibly. See MILLIS_SCALE - the two are the same setting.
 const unsigned long ACT_PWM_PERIOD_US = 4000UL * 64UL;
 
+/* HOW LONG loop() PAUSES EACH PASS. Raised to 10 ms real on the operator's
+ * instruction 2026-08-27 ("delay(10) in the void loop so the uno wont stuck").
+ *
+ * IT IS STILL NOT delay(10), AND THAT REMAINS THE WHOLE POINT - see the pause
+ * itself at the bottom of loop(). delay() stops the world, and the world it
+ * stops includes serviceActuatorPwm() and serviceBrushPwm(). Their period is
+ * ACT_PWM_PERIOD_US, 4 ms. Servicing a 4 ms waveform once per 10 ms pause is
+ * worse than the 5 ms case this file already documents: 10000 % 4000 leaves the
+ * sampled phase alternating between just 0 and 2000 us, so the chopper can only
+ * ever express 0% or 50% duty at about 100 Hz. That is visible flicker and
+ * audible stutter, and it is exactly the "brush powered on off on off" symptom
+ * already recorded here. The busy-wait keeps both stages serviced at loop speed
+ * throughout the pause, so the pacing costs nothing.
+ *
+ * THE OLD VALUE WAS NOT 5 ms EITHER, which is worth knowing before trusting any
+ * timing comment in this file. It read `micros() - pauseStart < 5000UL`,
+ * unscaled - and micros() runs MILLIS_SCALE times fast because Timer0 is at
+ * prescaler 1 for the brush PWM. 5000 of those is 78 REAL microseconds, so the
+ * loop was never paced at 200 Hz; it ran flat out and polled the W5100 as fast
+ * as SPI allowed. Note ACT_PWM_PERIOD_US directly above IS scaled, which is why
+ * the actuator's 4 ms was right while the pause beside it was 64x short.
+ *
+ * WHAT THE PAUSE BUYS, now that it is real: the AVR stops hammering the shield
+ * with back-to-back SPI transactions it has no reason to make. The Pi sends at
+ * 50 Hz, so polling at tens of kHz finds nothing almost every time. At 10 ms a
+ * command waits at most 10 ms longer inside the W5100 - well inside the 20 ms
+ * command period and nowhere near the 300 ms failsafe - and the board draws
+ * less doing it, which on a rail this marginal is the point. */
+const unsigned long LOOP_PAUSE_US = 10000UL * 64UL;   // 10 ms REAL
+
 
 // The duty currently demanded on D4, 0..255. Written by applyActuator(), acted
 // on by serviceActuatorPwm() every pass of loop().
@@ -383,7 +418,7 @@ const bool INVERT_ACT = false;
 // note above, and it cost this rig a day when the SD chip-select and the rod's
 // gate turned out to be the same pin.
 // ---------------------------------------------------------------------------
-const uint8_t LIGHT_DIR = A0;
+const uint8_t LIGHT_DIR = 8;   // was A0
 // THE LAMP'S PWM, set to D5 on the operator's pin map 2026-08-26.
 //
 // D5 is Timer0 OC0B, and Timer0 is ALREADY at prescaler 1 for D6's wheel PWM -
@@ -404,7 +439,7 @@ const uint8_t LIGHT_DIR = A0;
 // IF IT IS DARK AGAIN, D5 is the pin to suspect first - it and D6 are Timer0's
 // only two PWM outputs and both have been reported dead at least once today.
 // D10 and D11 are free and both are on healthy timers.
-const uint8_t LIGHT_PWM = 5;   // Timer0 OC0B - hardware PWM, 62.5 kHz
+const uint8_t LIGHT_PWM = 9;   // Timer1 OC1A - hardware PWM 62.5 kHz, was D5
 
 // --- Brush motor: DIR + PWM on a driver channel (rewired 2026-08-14) ---------
 // Driven from the panel's TOGGLE switch (Pi GPIO13).
@@ -439,7 +474,7 @@ const uint8_t LIGHT_PWM = 5;   // Timer0 OC0B - hardware PWM, 62.5 kHz
 // from D7 having been taken — the wire really is on D2, and the sketch was the
 // thing that was wrong.
 const uint8_t BRUSH_DIR = 2;
-const uint8_t BRUSH_PWM = 9;    // was A1 - swapped with DIR1 2026-08-27 to match the rig
+const uint8_t BRUSH_PWM = 3;    // Timer2 OC2B - was D9, rewired 2026-08-29
 
 // The brush spins one way only, so its direction is a constant rather than a
 // demand. Flip this if the brush runs backwards.
@@ -459,11 +494,6 @@ const bool BRUSH_ACTIVE_HIGH = true;
 // in sync for no benefit. A brush motor's inertia makes 250 Hz ripple
 // invisible, exactly as it does for the rod.
 int brushDuty = 0;
-// Where the brush is being ramped TO, and when the last ramp step landed. See
-// serviceBrushPwm(). BRUSH_RAMP_MS is defined with the other scaled durations,
-// below MILLIS_SCALE.
-int brushTarget = 0;
-unsigned long brushRampLastMs = 0;
 
 
 // The smallest duty that actually TURNS the brush rather than buzzing it, the
@@ -549,12 +579,6 @@ const bool PWM_FAST = true;
 // ONE SETTING IN THREE PLACES: this, ACT_PWM_PERIOD_US, and the TCCR0B line in
 // setup(). Change one, change all three.
 const unsigned long MILLIS_SCALE = 64UL;
-
-// How long the brush takes to reach full duty from a standstill - see
-// serviceBrushPwm(). Ported from uno_eth_link 2026-08-27. Slow enough to blunt
-// the locked-rotor inrush that resets the board, short enough that the operator
-// still reads the brush as coming on at once. Scaled, like every duration here.
-const unsigned long BRUSH_RAMP_MS = 1500UL * MILLIS_SCALE;
 
 // 300 ms REAL: long enough to ride out a handful of dropped datagrams at the
 // 50 Hz command rate, short enough that the robot stops within a third of a
@@ -708,31 +732,15 @@ void applyBrush(int duty) {
            + (int)(((long)(duty - 1) * (MAX_PWM - BRUSH_MIN_DUTY))
                    / (MAX_PWM - 1));
   }
-  // RISING DEMAND IS RAMPED, FALLING DEMAND IS IMMEDIATE - see
-  // serviceBrushPwm(). Only the target is set here on a rise; the ramp walks
-  // brushDuty up and the chopper below acts on whatever it finds.
-  // ANCHOR THE RAMP CLOCK WHEN A RISE BEGINS. Without this the ramp does
-  // nothing on the first switch-on: brushRampLastMs starts at 0, so the very
-  // first step measures the whole uptime as elapsed, computes hundreds of
-  // steps, and slams to full duty - exactly the inrush the ramp exists to
-  // prevent. Only a SECOND switch-on shortly after would have ramped, which is
-  // the kind of bug that tests clean and fails in the field.
-  if (duty > brushDuty && brushDuty >= brushTarget) {
-    brushRampLastMs = millis();
-  }
-  brushTarget = duty;
-  if (duty <= brushDuty) {
-    // A stop, or any reduction, takes effect on THIS line. Never make stopping
-    // wait for a ramp: the failsafe stop and the operator's off switch both
-    // come through here and both must be instant. The static endpoints are
-    // written here as well as in serviceBrushPwm(), so a stop lands now rather
-    // than on the next loop() pass.
-    brushDuty = duty;
-    if (duty <= 0) {
-      digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
-    } else if (duty >= MAX_PWM) {
-      digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? HIGH : LOW);
-    }
+  // APPLIED ON THIS LINE, RISING OR FALLING - see the note at serviceBrushPwm().
+  // The two ENDPOINTS land here rather than waiting for the chopper's next pass,
+  // so a demand of 255 is at 255 before this function returns and a stop is a
+  // stop. Mid-range duty is still synthesised by serviceBrushPwm().
+  brushDuty = duty;
+  if (duty <= 0) {
+    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
+  } else if (duty >= MAX_PWM) {
+    digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? HIGH : LOW);
   }
 }
 
@@ -747,38 +755,28 @@ void applyBrush(int duty) {
  * only the middle range is chopped — where a stalled loop costs a slower
  * brush, never a runaway one. Shares ACT_PWM_PERIOD_US; both mechanisms are
  * far too slow mechanically to care about 250 Hz ripple. */
-/* BRUSH SOFT-START, ported from uno_eth_link 2026-08-27.
+/* THE BRUSH GOES STRAIGHT TO THE DEMANDED DUTY. No ramp, no soft-start.
  *
- * WHY. applyBrush(255) used to drive the pin high in one step, which is a
- * 0-to-100% slam into a motor that is not yet turning. A stalled DC motor draws
- * its locked-rotor current - several times its running current - until it spins
- * up, and on a rail shared with the Uno that is the sag that resets the board or
- * wedges the link. The operator sees it as the robot disconnecting and
- * reconnecting for as long as the brush is on.
+ * A 1.5 s soft-start lived here for part of 2026-08-27 and was REMOVED THE SAME
+ * DAY on the operator's instruction: "make brush not slow to fast, jake direct
+ * fast 255". The brush is a toggle in practice - the Pi sends 0 or 255 - and
+ * waiting a second and a half for it to wind up is not what the job wants.
  *
- * ADAPTED, NOT COPIED. uno_eth_link drives the brush from D9 in HARDWARE, so
- * there the ramp writes the pin itself. This sketch is on the same D9 since the
- * 2026-08-27 swap but still chops in SOFTWARE, so the ramp's only job here is to
- * walk brushDuty upward and let the existing chopper act on it. Falling
- * demand is applied immediately in applyBrush(); a stop never waits for a ramp. */
-void serviceBrushRamp() {
-  if (brushDuty >= brushTarget) return;          // falls are handled instantly
-
-  const unsigned long now = millis();
-  unsigned long stepEvery = BRUSH_RAMP_MS / (unsigned long)MAX_PWM;
-  if (stepEvery == 0) stepEvery = 1;
-
-  if (now - brushRampLastMs < stepEvery) return;
-  unsigned long steps = (now - brushRampLastMs) / stepEvery;
-  brushRampLastMs += steps * stepEvery;
-
-  long next = (long)brushDuty + (long)steps;
-  if (next > brushTarget) next = brushTarget;
-  brushDuty = (int)next;
-}
-
+ * THE REASON IT WAS TRIED IS STILL TRUE, and is written down so the next person
+ * weighs it rather than rediscovers it. Going 0-to-100% in one step is a slam
+ * into a motor that is not yet turning, and a stalled DC motor draws its
+ * locked-rotor current - several times its running current - until it spins up.
+ * On a shared rail that is a real sag.
+ *
+ * What changed is the diagnosis, not the physics. The disconnects that motivated
+ * the ramp were later measured to be a power fault in their own right: the
+ * board's .noinit boot counter caught "ram=LOST (true power loss)", meaning the
+ * 5 V rail reached zero, and the Pi hard-reset eight times the same day with a
+ * 60 s watchdog armed. A ramp cannot fix a rail that is being cut, so it was
+ * paying a real cost in responsiveness for a benefit that was never the cure.
+ * If the supply is ever fixed and the brush still disturbs the link, this is the
+ * first thing to try again - the code is in git history at 7c52a31. */
 void serviceBrushPwm() {
-  serviceBrushRamp();      // advance the ramp first, then chop at the new duty
   if (brushDuty <= 0) {
     digitalWrite(BRUSH_PWM, BRUSH_ACTIVE_HIGH ? LOW : HIGH);
     return;
@@ -1176,7 +1174,10 @@ void setup() {
   // this channel spent a day on was a WIRING SCHEME misread, not a wrong pin:
   // both pin numbers were right the whole time. A banner that says only
   // "ACT=D2/D4" would have looked correct on the broken build too.
-  Serial.println(F("ACT_DIR=D7 ACT_PWM=D4 - LOW on D7 EXTENDS (opposite the wheels)"));
+  Serial.print(F("ACT_DIR="));   printPin(ACT_DIR);
+  Serial.print(F(" ACT_PWM="));  printPin(ACT_PWM);
+  Serial.print(F(" - LOW on ")); printPin(ACT_DIR);
+  Serial.println(F(" EXTENDS (opposite the wheels)"));
   Serial.print(F("  soft-PWM stages 0/"));
   Serial.print(ACT_DUTY_RETRACT);
   Serial.print(F("/"));
@@ -1185,7 +1186,11 @@ void setup() {
   // Loud, and in the banner rather than a comment, because the failure it warns
   // about looks like a flaky cable: with a card in the slot the link dies except
   // while retracting. A reset is the one moment someone is watching.
-  Serial.println(F("  ^ D4 is the shield's SD chip select - RUN WITH THE SLOT EMPTY"));
+  // Printed from DIR2, not typed: the pin this warns about moved on 2026-08-29
+  // from the rod's gate to the right wheel's direction line.
+  Serial.print(F("  ^ "));
+  printPin(DIR2);
+  Serial.println(F(" is the shield's SD chip select - RUN WITH THE SLOT EMPTY"));
   // The build with pot speed control announces itself: an ACK-identical old
   // build is otherwise indistinguishable over the LAN (see the banner note
   // above), and "held 255" vs "soft-PWM" is exactly the difference that
@@ -1197,8 +1202,11 @@ void setup() {
   Serial.print(F(" floor "));
   Serial.print(BRUSH_MIN_DUTY);
   Serial.println(F(" (TOGGLE on/off, Pi sends 0 or 255)"));
-  Serial.print(F("LIGHT: HARDWARE PWM D5 (Timer0, 62.5kHz), return A0 "));
-  Serial.println(F("[D12 no longer used]"));
+  Serial.print(F("LIGHT: HARDWARE PWM "));
+  printPin(LIGHT_PWM);
+  Serial.print(F(" (Timer1, 62.5kHz), return "));
+  printPin(LIGHT_DIR);
+  Serial.println();
   // DIVIDED BY MILLIS_SCALE, because FAILSAFE_MS is counted in the 64x-fast
   // milliseconds a prescaled Timer0 produces. Printing the raw constant said
   // "19200 ms" on a board whose failsafe is really 300 ms, which reads like a
@@ -1424,7 +1432,7 @@ void loop() {
   // through it. The pacing the operator asked for is unchanged; the PWM now
   // gets serviced at loop speed - tens of kHz - instead of once per pause.
   unsigned long pauseStart = micros();
-  while (micros() - pauseStart < 5000UL) {
+  while (micros() - pauseStart < LOOP_PAUSE_US) {
     serviceActuatorPwm();
     serviceBrushPwm();
     serviceLightPwm();

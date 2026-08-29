@@ -1,23 +1,23 @@
 /* ===========================================================================
  * DO NOT FLASH THIS AS-IS. ITS PIN MAP IS NOT THE RIG'S.
  *
- * Checked 2026-08-27 against the wiring the operator confirmed - DIR1 = A1 and
- * BRUSH_PWM = D9 - and this file disagrees on both counts:
+ * SUPERSEDED 2026-08-29, AND ITS WHOLE PURPOSE IS NOW MET ELSEWHERE.
  *
- *     here                       the rig
- *     DIR1      = A2             DIR1      = A1
- *     BRUSH_PWM = A1             BRUSH_PWM = D9
+ * This was the 25 kHz experiment. The filename says NEEDS_REWIRE because
+ * reaching 25 kHz meant moving DIR1 off its pin to free a timer - the rig was
+ * wired so that the channels that needed dimming were sharing timers with
+ * channels that did not.
  *
- * That is deliberate and it is the point of the file: this is the 25 kHz
- * experiment, and the filename says NEEDS_REWIRE because reaching 25 kHz meant
- * moving DIR1 off its pin to free a timer. It is kept as .txt, not .ino, so no
- * IDE offers to build it by accident.
+ * The 2026-08-29 rewire solves that properly and goes further: every driven
+ * channel now has hardware PWM at 62.5 kHz, well above the 25 kHz this file was
+ * chasing, with both wheels sharing one timer so they cannot drift apart:
  *
- * The three live sketches - uno_eth_link, uno_usb_link, uno_serial_drive - all
- * carry the rig's map. This one is a proposal that was never wired. If you ever
- * adopt it, REWIRE FIRST and move the other three with it; a robot has one loom,
- * and a sketch that disagrees with it fails as a mechanical fault, not as a
- * compile error.
+ *     Timer0 (D6 + D5) - both wheels        Timer1 (D9) - lamp
+ *     Timer2 (D3)      - brush              A2/A3       - rod, soft-PWM
+ *
+ * There is nothing left for this proposal to buy. Its pin constants have been
+ * brought to the rig's map so that NO file in this repo disagrees with the loom,
+ * but the file stays .txt and stays unbuilt: it is history, not an option.
  * =========================================================================== */
 
 /*
@@ -196,10 +196,10 @@ const uint16_t LISTEN_PORT = 5005;
 //
 // D6 IS NOW FREE and D5 (the light) still sits on an untouched Timer0 at its
 // stock ~980 Hz, which a lamp does not care about.
-const uint8_t DIR1 = A2;   // channel 1 direction (LEFT)   - moved off D9
-const uint8_t PWM1 = 3;    // channel 1 speed, Timer2  (7812.5 Hz)
-const uint8_t DIR2 = 8;    // channel 2 direction (RIGHT)
-const uint8_t PWM2 = 9;    // channel 2 speed, Timer1  (7812.5 Hz) - moved off D6
+const uint8_t DIR1 = 7;    // channel 1 direction (LEFT)   - rig map 2026-08-29
+const uint8_t PWM1 = 6;    // channel 1 speed, Timer0 OC0A
+const uint8_t DIR2 = 4;    // channel 2 direction (RIGHT)  - SD CS, slot must be empty
+const uint8_t PWM2 = 5;    // channel 2 speed, Timer0 OC0B
 
 // NEITHER channel goes through analogWrite() any more. Both timers run with a
 // register TOP so the period can be exact, and analogWrite() assumes TOP is 255
@@ -291,8 +291,8 @@ const uint16_t T1_TOP = 639;    // 16 MHz / (1 * (639+1)) = 25000 Hz
 // If a card ever has to go in that slot, A2 is free and is a drop-in replacement
 // — change the one constant below and nothing else, because this channel is
 // driven by digitalWrite/soft-PWM and needs no timer.
-const uint8_t ACT_DIR = 7;   // "Dir" on the rig — LOW extends, HIGH retracts
-const uint8_t ACT_PWM = 4;   // "Pwm" on the rig — the only line that gates it
+const uint8_t ACT_DIR = A3;  // "Dir" on the rig — LOW extends, HIGH retracts
+const uint8_t ACT_PWM = A2;  // "Pwm" on the rig — no timer, soft-PWM
 
 // Spelled out because this channel is the ODD ONE OUT: LOW is forward here and
 // HIGH is forward everywhere else on the board. Swap these two if the rod
@@ -348,8 +348,8 @@ const bool INVERT_ACT = false;
 // Uno (A0 == D14) and is what makes this fit at all: every real digital pin is
 // spoken for. It carries the driver channel's direction line, which a lamp does
 // not actually need — see applyLight().
-const uint8_t LIGHT_DIR = A0;
-const uint8_t LIGHT_PWM = 5;   // Timer0 (~980 Hz) — same 0-duty caveat as D6
+const uint8_t LIGHT_DIR = 8;
+const uint8_t LIGHT_PWM = 9;   // Timer1 OC1A - hardware PWM 62.5 kHz
 
 // --- Brush motor: DIR + PWM on a driver channel (rewired 2026-08-14) ---------
 // Driven from the panel's TOGGLE switch (Pi GPIO13).
@@ -383,7 +383,7 @@ const uint8_t LIGHT_PWM = 5;   // Timer0 (~980 Hz) — same 0-duty caveat as D6
 // from D7 having been taken — the wire really is on D2, and the sketch was the
 // thing that was wrong.
 const uint8_t BRUSH_DIR = 2;
-const uint8_t BRUSH_PWM = A1;
+const uint8_t BRUSH_PWM = 3;    // Timer2 OC2B
 
 // The brush spins one way only, so its direction is a constant rather than a
 // demand. Flip this if the brush runs backwards.

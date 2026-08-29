@@ -15,8 +15,8 @@
  *
  * PIN MAP — the rig's wiring, confirmed by the operator 2026-08-27:
  *
- *   channel 1 / LEFT    DIR1 = A1    PWM1 = D3   (Timer2)
- *   channel 2 / RIGHT   DIR2 = D8    PWM2 = D6   (Timer0)
+ *   channel 1 / LEFT    DIR1 = D7    PWM1 = D6   (Timer0 OC0A)
+ *   channel 2 / RIGHT   DIR2 = D4    PWM2 = D5   (Timer0 OC0B)
  *
  * BROUGHT INTO LINE 2026-08-27. This sketch used to carry the original
  * 2026-08-14 map, DIR1=D9 / PWM1=D10 / PWM2=D11, from back when it was the only
@@ -37,13 +37,13 @@
  * timer pin for something that actually needs to be dimmed. That is the same
  * reasoning the old map used to justify D9, applied to the current wiring.
  *
- * PWM runs at the stock rate on both channels: D3 is Timer2 (~490 Hz) and D6 is
- * Timer0 (~980 Hz). THE TWO ARE NOT EQUAL, and that matters more than the
- * absolute numbers - channels on different frequencies answer the same demand
- * differently and read as a pull to one side on a straight run. uno_eth_link
- * solves this by putting both on fast timers; this sketch is the minimal
- * wheels-only build and leaves the stock rates alone. If a straight-line pull
- * appears here and not there, suspect this before suspecting the motors.
+ * BOTH CHANNELS ARE ON TIMER0 SINCE THE 2026-08-29 REWIRE, and that fixes a
+ * defect this sketch used to carry. PWM1 was D3 (Timer2, ~490 Hz) and PWM2 was
+ * D6 (Timer0, ~980 Hz) - NOT EQUAL, and channels on different frequencies answer
+ * the same demand differently, which reads as a pull to one side on a straight
+ * run. D6 and D5 are OC0A and OC0B of the same timer, so they cannot disagree:
+ * one prescaler governs both. This sketch still leaves Timer0 at the stock
+ * prescaler, so both run at about 980 Hz - equal, which is what mattered.
  *
  * THIS SKETCH DRIVES WHEELS ONLY - no brush, no actuator, no light. It predates
  * all three. uno_usb_link is the current USB-tether build and drives everything;
@@ -59,10 +59,13 @@
  */
 
 // --- Motor driver pins -------------------------------------------------------
-const uint8_t DIR1 = A1;   // channel 1 direction  (LEFT)  - was D9 until 2026-08-27
-const uint8_t PWM1 = 3;    // channel 1 speed, Timer2       - was D10
-const uint8_t DIR2 = 8;    // channel 2 direction  (RIGHT)
-const uint8_t PWM2 = 6;    // channel 2 speed, Timer0       - was D11
+const uint8_t DIR1 = 7;    // channel 1 direction  (LEFT)  - was A1, rewired 2026-08-29
+const uint8_t PWM1 = 6;    // channel 1 speed, Timer0 OC0A  - was D3
+// D4 IS THE SHIELD'S microSD CHIP SELECT, and it goes LOW when the right wheel
+// runs in the negative direction. Harmless with the slot EMPTY, which is how
+// this board must be run. See the note in uno_eth_link for the full story.
+const uint8_t DIR2 = 4;    // channel 2 direction  (RIGHT) - was D8; SD CS
+const uint8_t PWM2 = 5;    // channel 2 speed, Timer0 OC0B  - was D6, SAME timer as PWM1
 
 const uint8_t STATUS_LED = LED_BUILTIN;
 
@@ -121,6 +124,22 @@ void safeState() {
   digitalWrite(STATUS_LED, LOW);
 }
 
+/* Print a pin the way the schematic names it. Added 2026-08-29 with the rewire,
+ * because the banner below was a hand-typed literal still naming the ORIGINAL
+ * 2026-08-14 map - D9/D10/D8/D11 - two rewires after it stopped being true. A
+ * banner exists to catch a stale board; one that is typed out restates the bug
+ * it was meant to reveal, and this repo has now been bitten by that three times.
+ * Derived from the constants, it cannot go stale again. */
+void printPin(uint8_t pin) {
+  if (pin >= A0) {
+    Serial.print('A');
+    Serial.print(pin - A0);
+  } else {
+    Serial.print('D');
+    Serial.print(pin);
+  }
+}
+
 void setup() {
   // Outputs are driven to a stopped state BEFORE they are made outputs, so the
   // pins cannot glitch high for the instant between pinMode and the first write.
@@ -138,7 +157,11 @@ void setup() {
 
   Serial.begin(115200);
   Serial.println(F("uno_serial_drive ready"));
-  Serial.print(F("DIR1=D9 PWM1=D10 (left)  DIR2=D8 PWM2=D11 (right)  failsafe "));
+  Serial.print(F("DIR1="));          printPin(DIR1);
+  Serial.print(F(" PWM1="));         printPin(PWM1);
+  Serial.print(F(" (left)  DIR2=")); printPin(DIR2);
+  Serial.print(F(" PWM2="));         printPin(PWM2);
+  Serial.print(F(" (right)  failsafe "));
   Serial.print(FAILSAFE_MS);
   Serial.println(F(" ms"));
 }
