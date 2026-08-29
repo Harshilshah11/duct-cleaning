@@ -57,7 +57,11 @@ import threading
 import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)          # the bit-bang modules live in ~
+# The bit-bang helpers live in tools/, one level up and across. They are not
+# diagnostics-only: the ADC fallback below imports them at runtime, which is why
+# this path is computed rather than assumed. Moved there 2026-08-29 when the
+# repo root was tidied; before that they sat loose beside it.
+_PARENT = os.path.join(os.path.dirname(_HERE), "tools")
 
 # --- tuning ------------------------------------------------------------------
 # Switch poll rate. This is now a REAL 20 Hz because the switches no longer wait

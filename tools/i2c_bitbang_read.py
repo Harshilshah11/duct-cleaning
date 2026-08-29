@@ -11,10 +11,14 @@ Config word is taken from joystick_link.py so the readings are directly
 comparable: PGA +/-6.144V, single-shot, 860 SPS, comparator off.
 """
 
+import os
 import sys
 import time
 
-sys.path.insert(0, "/home/arnobot")
+# Import a sibling in tools/ regardless of where this is run from. This used
+# to read "/home/arnobot", which stopped being right when the tree moved into
+# DuctCleaning/ and was simply broken until 2026-08-29.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from i2c_bitbang_probe import IN, CHIP, Bus  # noqa: E402
 
 import gpiod  # noqa: E402

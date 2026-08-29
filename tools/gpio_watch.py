@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Find and prove out switch GPIOs without being told which pins they are.
 
 Idle level cannot tell an open switch from a floating pin - both just follow

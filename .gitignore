@@ -13,3 +13,8 @@ __pycache__/
 .claude/
 Thumbs.db
 desktop.ini
+
+# Scratch. The .bak snapshots git already replaces were swept in here on
+# 2026-08-29 rather than deleted, so an old copy is still reachable by hand
+# without ever becoming a tracked file. Nothing in here is loaded by anything.
+temp/
