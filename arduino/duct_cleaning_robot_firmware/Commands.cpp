@@ -11,75 +11,79 @@ unsigned long lastPacketMs = 0;
 void arcadeMix(int x, int y, int *left, int *right) {
     long l = (long)y + (long)x;
     long r = (long)y - (long)x;
-
-    // Scale the PAIR, not each wheel, in ONE division. peak starts at 1000
-    // (== max(1.0, ...) in the Python) so a stick inside full scale is passed
-    // through untouched; only an over-range pair is scaled down.
-    //
-    // Keep this as a single divide. Normalising to 1000 first and converting to
-    // PWM second truncates twice and drifts from uno_serial.py by a count or so
-    // across the range, which is exactly the silent desync this function's
-    // must-match rule exists to prevent.
+    // Scale the PAIR in ONE divide; peak starts at 1000 (== max(1.0,..)).
     long peak = 1000;
     if (labs(l) > peak) peak = labs(l);
     if (labs(r) > peak) peak = labs(r);
-
-    // NOTE: C truncates where the Python mix() rounds, so the two can differ by
-    // one count. That divergence predates this refactor and is preserved rather
-    // than fixed, because changing it here alone would widen the gap it sits in.
     *left  = (int)(l * MAX_PWM / peak);
     *right = (int)(r * MAX_PWM / peak);
 }
 
+// Hand-rolled to keep sscanf out of the binary - it costs ~1.5 KB of flash.
+static void skipSpace(const char *&p) { while (*p == ' ' || *p == '\t') p++; }
+
+static bool parseInt(const char *&p, int &out) {
+    skipSpace(p);
+    bool neg = false;
+    if (*p == '-') { neg = true; p++; } else if (*p == '+') p++;
+    if (*p < '0' || *p > '9') return false;
+    long v = 0;
+    while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+    out = (int)(neg ? -v : v);
+    return true;
+}
+
 bool handleCommand(const char *text, unsigned int *seqOut) {
-    unsigned int seq = 0;
-    int left = 0, right = 0, jx = 0, jy = 0, act = 0, brush = 0, light = 0;
-    bool understood = false;
+    const char *p = text;
+    // No leading skipSpace: sscanf would not skip before a literal either.
+    if (p[0] != 'C' || p[1] != 'M' || p[2] != 'D') return false;
+    p += 3;
 
-    int nf = sscanf(text, "CMD %u M %d %d %d %d %d",
-                    &seq, &left, &right, &act, &brush, &light);
-    if (nf >= 3) {
-        // Trailing fields are optional — an older sender that only knows about
-        // wheels still drives, and the channels it never heard of stay off.
-        if (nf < 4) act = 0;
-        if (nf < 5) brush = 0;
-        if (nf < 6) light = 0;
+    int seq;
+    if (!parseInt(p, seq) || seq < 0) return false;
+
+    int v[5] = {0, 0, 0, 0, 0};
+    skipSpace(p);
+    char kind = *p;
+    int left = 0, right = 0;
+
+    if (kind == 'M') {
+        p++;
+        uint8_t n = 0;
+        while (n < 5 && parseInt(p, v[n])) n++;
+        if (n < 2) kind = 0;                    // truncated -> stop, as sscanf did
+        else { left = v[0]; right = v[1]; }
+    } else if (kind == 'J') {
+        p++;
+        int jx, jy;
+        if (parseInt(p, jx) && parseInt(p, jy)) arcadeMix(jx, jy, &left, &right);
+        else kind = 0;
+    }
+
+    if (kind == 'M' || kind == 'J') {
         motorApply(PIN_DIR1, PIN_PWM1, left,  INVERT_1);
         motorApply(PIN_DIR2, PIN_PWM2, right, INVERT_2);
-        actuatorApply(act, INVERT_ACT);
-        brushApply(brush);
-        lightApply(light);
-        applied.left = left; applied.right = right; applied.act = act;
-        applied.brush = brush; applied.light = light;
-        understood = true;
-    } else if (sscanf(text, "CMD %u J %d %d", &seq, &jx, &jy) == 3) {
-        arcadeMix(jx, jy, &left, &right);
-        motorApply(PIN_DIR1, PIN_PWM1, left,  INVERT_1);
-        motorApply(PIN_DIR2, PIN_PWM2, right, INVERT_2);
-        // The J form carries no auxiliary channels, so they are commanded off
-        // rather than left at whatever the last M frame set.
-        actuatorApply(0, INVERT_ACT);
-        brushApply(0);
-        lightApply(0);
-        applied.left = left; applied.right = right;
-        applied.act = 0; applied.brush = 0; applied.light = 0;
-        understood = true;
-    } else if (sscanf(text, "CMD %u STOP", &seq) == 1) {
-        applied.left = 0; applied.right = 0; applied.act = 0;
-        applied.brush = 0; applied.light = 0;
+        actuatorApply(kind == 'M' ? v[2] : 0, INVERT_ACT);
+        brushApply(kind == 'M' ? v[3] : 0);
+        lightApply(kind == 'M' ? v[4] : 0);
+        applied.left  = left;
+        applied.right = right;
+        applied.act   = kind == 'M' ? v[2] : 0;
+        applied.brush = kind == 'M' ? v[3] : 0;
+        applied.light = kind == 'M' ? v[4] : 0;
+    } else {
+        // STOP, and anything not understood after a valid seq. Matches the old
+        // sscanf ladder, where the keepalive branch was unreachable.
+        applied.left = applied.right = applied.act = 0;
+        applied.brush = applied.light = 0;
         safeState();
-        understood = true;
-    } else if (sscanf(text, "CMD %u", &seq) == 1) {
-        understood = true;          // bare keepalive — refreshes the failsafe
     }
 
-    if (understood) {
-        *seqOut = seq;
-        lastSeq = (uint16_t)seq;
-        packetsReceived++;
-        lastPacketMs = millis();
-        linkUp = true;
-        setLinkLed(true);
-    }
-    return understood;
+    *seqOut = (unsigned int)seq;
+    lastSeq = (uint16_t)seq;
+    packetsReceived++;
+    lastPacketMs = millis();
+    linkUp = true;
+    setLinkLed(true);
+    return true;
 }
