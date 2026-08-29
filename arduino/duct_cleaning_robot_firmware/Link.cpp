@@ -150,7 +150,26 @@ void linkBegin() {
     // up with Timer0 already at prescaler 1 and those become 8.75 ms and
     // 0.31 ms, which is what made the board deaf until someone pressed reset.
     // See StockTimer0 in Timers.h.
-    delay(ETH_SETTLE_MS);
+    // NO FIXED SETTLE WAIT. Removed 2026-08-29 on the operator's call: "remove
+    // the wait in setup, directly start, the bot will reconnect anyway if
+    // disconnected". They are right, and the reason is that the retry loop below
+    // now does the same job ADAPTIVELY.
+    //
+    // A 3 s delay sat here from 2026-08-26, to let a slow 5 V rail come up before
+    // the W5100's one-shot init. That was the correct fix at the time - the
+    // sketch had one attempt and no way to tell a dead chip from a not-yet-ready
+    // one. It is no longer the only attempt: the loop below tries eight times at
+    // ETH_RETRY_GAP_MS apart, which is 3.2 s of settling - the same budget, spent
+    // only when the chip is actually not answering, and skipped entirely when it
+    // comes up first time.
+    //
+    // SO THE COST WAS ALWAYS PAID AND THE BENEFIT ALMOST NEVER NEEDED. Every boot
+    // waited 3 s whether the rail was slow or not, which on a board that is
+    // power-cycled repeatedly during debugging is 3 s of every cycle.
+    //
+    // If a cold start ever fails to bring the shield up again, the honest lever
+    // is the RETRY COUNT or ETH_RETRY_GAP_MS, not a blocking delay: those buy the
+    // same time and stop as soon as the chip answers.
 
     IPAddress ip(NET_IP[0], NET_IP[1], NET_IP[2], NET_IP[3]);
     // Static IP, no DHCP: Ethernet.begin(mac, ip) cannot fail or block, unlike

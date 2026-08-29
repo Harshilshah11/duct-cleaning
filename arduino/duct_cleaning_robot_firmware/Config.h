@@ -404,20 +404,17 @@ const unsigned long ETH_REINIT_MS = REAL_MS(5000);
 // board is listening about five seconds in.
 const unsigned long ETH_COLD_WAIT_MS = REAL_MS(45000);
 
-// Let the 5 V rail settle before the W5100's init. 3 s, raised from 1 s
-// 2026-08-26: the board failed only when it and the Pi had been off more than
-// five minutes, which is a capacitor-discharge signature. After a brief outage
-// the bulk caps are part-charged and the rail snaps up; after five minutes they
-// are flat and it crawls up through a regulator already burning (12-5) x 0.23 A.
+// Gap between shield bring-up attempts. NOT SCALED, AND THAT IS DELIBERATE:
+// linkBegin() runs BEFORE timersBegin(), so Timer0 is still on its stock
+// prescaler here and delay() means what it says. Every other duration in this
+// file is used after the switch and goes through REAL_MS(); this is the
+// exception, and putting REAL_MS() on it would make each gap 25 SECONDS.
 //
-// NOT SCALED, AND THAT IS DELIBERATE. linkBegin() runs BEFORE timersBegin(), so
-// Timer0 is still on its stock prescaler and delay() means what it says. Every
-// other duration in this file is used after the switch and goes through
-// REAL_MS(); these two are the exception, and putting REAL_MS() on them would
-// make this a 192-SECOND pause.
-const unsigned long ETH_SETTLE_MS = 3000;
-
-// Gap between shield bring-up attempts, also pre-prescaler real milliseconds.
+// THIS IS ALSO THE RAIL-SETTLING BUDGET now that the fixed 3 s wait is gone -
+// see linkBegin(). Eight attempts at 400 ms is 3.2 s available to a slow 5 V
+// rail, spent only while the chip is not answering. If a cold start ever fails
+// to bring the shield up, raise this or the retry count; do not put a blocking
+// delay back, which charges every boot for a problem most boots do not have.
 const unsigned long ETH_RETRY_GAP_MS = 400;
 
 // ===========================================================================
