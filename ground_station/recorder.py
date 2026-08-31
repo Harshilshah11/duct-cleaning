@@ -588,8 +588,20 @@ class FullViewBuilder(threading.Thread):
     skipped, and the rest of the session still builds.
     """
 
-    def __init__(self, session_dir, clips, offsets, labels, on_done=None):
+    def __init__(self, session_dir, clips, offsets, labels, on_done=None,
+                 join=True):
         super().__init__(daemon=True)
+        # join=False is the WHILE-RECORDING pass - see SessionRecorder._prep_clip.
+        # It normalises a clip that has just been closed and stops there, because
+        # joining is a whole-session operation and the session is still running.
+        # The stop-time pass then finds that clip already H.264 and skips it, so
+        # the same work is never paid for twice.
+        #
+        # NAMED _do_join, NOT _join: _join is already a METHOD on this class (the
+        # ffmpeg concat that produces front.mp4 and back.mp4). An attribute of
+        # that name would shadow it and the session would finish with numbered
+        # fragments and no joined output at all.
+        self._do_join = join
         self.session_dir = session_dir
         self.clips = clips              # {clip_no: [(slug, path), ...]}
         # Slug -> FRONT / BACK, used to name the joined outputs. Already passed
@@ -739,18 +751,68 @@ class FullViewBuilder(threading.Thread):
                 problems.append("%s: %s" % (slug, reason))
         return problems
 
+    @staticmethod
+    def _codec_of(path):
+        """Video codec name for one file, or None if it cannot be read."""
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name", "-of",
+                 "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=20)
+            return (out.stdout or "").strip() or None
+        except Exception:
+            return None
+
     def _normalize_one(self, path, frames):
         """One master -> constant-bitrate H.264 of `frames` frames, in place.
 
         Returns None on success, else a reason. The master is only ever replaced
         by a file that has been probed and found readable.
         """
+        # ALREADY DONE? The recorder writes MPEG-4 while filming because that is
+        # the only codec cv2 can encode fast enough to keep up - measured
+        # 2026-08-31 at 2.6s per 60 frames against 49s for H.264, an 18x gap that
+        # would stall a live recording outright. So "still mpeg4" means this
+        # master has not been through here yet, and "h264" means it has.
+        #
+        # NOT AN OPTIMISATION - it is what makes the while-recording pass safe.
+        # Without it the stop-time pass would re-encode every clip the recording
+        # pass already did, and a session would take LONGER than before rather
+        # than finishing in seconds.
+        if self._codec_of(path) == "h264":
+            return None
+
         rate = config.RECORD_NORM_BITRATE
         head, tail = os.path.split(path)
         # Leading dot: usb_backup skips dotfiles, so a stick plugged in while
         # this is running cannot copy a half-written master onto itself.
         tmp = os.path.join(head, "." + tail + ".norm")
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-nostdin",
+        # THE WHILE-RECORDING PASS RUNS AT THE BACK OF THE QUEUE. Operator,
+        # 2026-08-31: "its very laging so its make lag datas send in bot". It
+        # was, and this is why.
+        #
+        # main.py already sits near 245% on a 4-core Pi while filming - two
+        # camera decodes plus two live encodes - so there is about one core of
+        # headroom and no more. Normalising a clip in that gap took the load
+        # average to 10, and at 2.5x oversubscription everything queues: the UI
+        # paint, the 50 Hz joystick frame, the ACK the Uno is waiting for. A
+        # video encoder was competing with the drive loop on equal terms.
+        #
+        # nice 19 and one thread fixes that without giving up the feature. This
+        # work is OPPORTUNISTIC - the whole point is that it happens in time the
+        # machine is not otherwise using - so it should run only when nothing
+        # else wants the core, and it takes longer in exchange. It still finishes
+        # far inside the roll interval: at 4x realtime a 120s clip needs ~30s of
+        # CPU, and even a quarter of a core clears it in time.
+        #
+        # The STOP-time pass is left at normal priority deliberately. Nothing is
+        # being driven then, the operator is waiting on it, and it should have
+        # the machine.
+        nice = [] if self._do_join else ["nice", "-n", "19"]
+        threads = [] if self._do_join else ["-threads", "1"]
+        cmd = nice + ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+               "-nostdin"] + threads + [
                "-i", path,
                "-c:v", config.RECORD_NORM_VCODEC,
                "-b:v", rate, "-minrate", rate, "-maxrate", rate, "-bufsize", rate,
@@ -1144,7 +1206,7 @@ class FullViewBuilder(threading.Thread):
         # some clips failed: the clips that DID build are still worth joining,
         # and a session that half-merged is more useful than one left as
         # numbered fragments.
-        if not self._stopping.is_set():
+        if not self._stopping.is_set() and self._do_join:
             with self._lock:
                 self._state, self._frac = "joining", 0.0
             try:
@@ -1596,7 +1658,7 @@ class SessionManager:
         members = {c: e for c, e in members.items() if len(e) >= least}
         if not members:
             return
-        job = (pending["dir"], members, pending.get("offsets") or {})
+        job = (pending["dir"], members, pending.get("offsets") or {}, True)
         with self._build_lock:
             if self._building:
                 # One at a time - two builds would fight over all four cores and
@@ -1612,10 +1674,45 @@ class SessionManager:
 
     def _launch_build(self, job):
         """Start one queued build. The caller holds _build_lock."""
-        session_dir, members, offsets = job
+        session_dir, members, offsets, join = job
         self._builder = FullViewBuilder(session_dir, members, offsets,
-                                        self._labels, on_done=self._build_done)
+                                        self._labels, on_done=self._build_done,
+                                        join=join)
         self._builder.start()
+
+    def _prep_clip(self, clip_no):
+        """Normalise one just-closed clip WHILE THE RECORDING CONTINUES.
+
+        This is what makes the save fast. Measured 2026-08-31, the hardware
+        encoder normalises at about 4x realtime, so a clip finalised the moment
+        it closes finishes long before the next one does, and the encoder still
+        spends most of its time idle. At stop only the final partial clip and the
+        join remain - seconds, instead of the ~25 minutes a 100-minute session
+        needed when every frame was re-encoded after the fact.
+
+        Queued through the SAME single-slot lane as the stop-time build, so the
+        two can never run together and fight over four cores.
+
+        NOTHING HERE IS LOAD-BEARING. If the prep never runs, or fails, the
+        stop-time pass normalises the clip exactly as it always did - it simply
+        finds mpeg4 instead of h264 and does the work. This is an optimisation
+        that fails safe, which is the only kind worth putting in the path that
+        saves an operator's footage.
+        """
+        members = {clip_no: [(slug, path)
+                             for slug, path in self._clip_members.get(clip_no, [])
+                             if os.path.exists(path)]}
+        least = 1 if config.RECORD_NORMALIZE else 2
+        if len(members[clip_no]) < least:
+            return
+        offsets = {clip_no: dict(self._clip_offsets.get(clip_no, {}))}
+        job = (self.session_dir, members, offsets, False)
+        with self._build_lock:
+            if self._building:
+                self._build_queue.append(job)
+                return
+            self._building = True
+            self._launch_build(job)
 
     def _build_done(self, _builder):
         """Runs ON the builder thread as it finishes. Starts the next queued job.
@@ -1655,6 +1752,21 @@ class SessionManager:
         """
         if self._pending and time.monotonic() >= self._pending["until"]:
             self._resolve_pending(keep=False, reason="not saved")
+
+        # ROLL THE CLIP ON A TIMER so the save happens DURING the recording -
+        # see config.RECORD_SEGMENT_S and _prep_clip. Exactly what the SAVE tap
+        # does, minus the toast: close this clip, open the next, and hand the
+        # closed one to the encoder while filming continues.
+        #
+        # Driven from poll() because main.py already calls it once per UI frame,
+        # so the check costs a float compare and needs no thread of its own.
+        seg = config.RECORD_SEGMENT_S
+        if (seg > 0 and self.state == RECORDING and self.session_dir
+                and not self._pending and self._clip_elapsed() >= seg):
+            closing = self.clip
+            self._capture_skew(self.clip)
+            self._begin_clip()
+            self._prep_clip(closing)
 
     def _discard_if_empty(self):
         """Remove the session directory if nothing was ever written into it.
@@ -1751,8 +1863,11 @@ class SessionManager:
         # which meant that in a run of five clips only the FIFTH was aligned:
         # full_001..004 were hstacked with a zero lead-in and put two different
         # moments side by side, up to the 1s of skew measured on SESSION009.
+        closing = self.clip
         self._capture_skew(self.clip)
         self._begin_clip()
+        # Finalise the clip just banked while the run carries on - see _prep_clip.
+        self._prep_clip(closing)
 
         if frames == 0:
             self._toast_now("SAVED (EMPTY)", f"{label}  no video")

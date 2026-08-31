@@ -126,6 +126,17 @@ def find_port():
     return None
 
 
+# Throttle below which the stick still spins the robot on the spot, and above
+# which it steers proportionally - see mix(). 0 disables spin entirely.
+#
+# It has to be a BAND rather than a point. DEADZONE snaps a small y to exactly
+# zero, so a point test makes spin the behaviour for a whole strip of stick
+# travel and then drops it abruptly at the edge - which is exactly the jolt this
+# constant exists to remove. A quarter of full throttle is enough travel for the
+# hand to feel the change happen rather than trip over it.
+SPIN_ZONE = float(os.environ.get("UNO_SPIN_ZONE", "0.25"))
+
+
 def mix(x, y):
     """Arcade mix: stick to (left, right) in -MAX_PWM..MAX_PWM.
 
@@ -141,9 +152,70 @@ def mix(x, y):
     if abs(y) < DEADZONE:
         y = 0.0
 
-    left = y + x
-    right = y - x
+    # PROPORTIONAL STEERING, 2026-08-31. Operator: "in half forward and right to
+    # its slowly work one side" - a half-deflected stick should give a gentle
+    # turn, and it did not.
+    #
+    # WHAT THE OLD SUM DID WRONG, which is worth keeping because the formula
+    # itself is the classic one and looks right:
+    #
+    #     left = y + x        right = y - x       then scale by the peak
+    #
+    # At full forward + full right that gives 2 and 0, scaled to 255 and 0 - the
+    # correct answer. At HALF and half it gives 1.0 and 0.0, and the peak scaling
+    # pushes that back up to 255 and 0 as well. Identical output from half the
+    # stick: the same sharpest-possible turn at full speed, with the throttle
+    # position thrown away. Every turn was the hardest turn.
+    #
+    # The fix is to steer by REDUCING THE INNER WHEEL from the throttle, rather
+    # than adding and subtracting and renormalising:
+    #
+    #     outer = y                    the throttle, untouched
+    #     inner = y * (1 - |x|)        eased off in proportion to the turn
+    #
+    # so a quarter turn keeps three quarters of the inner wheel, a half turn
+    # keeps half, and only a FULL turn stops it dead. Both the throttle and the
+    # steering now survive to the wheels, which is what makes a half-stick input
+    # a half-speed gentle turn.
+    #
+    # SPIN ON THE SPOT IS KEPT, and it has to be a separate case: the formula
+    # above multiplies by y, so with no throttle it yields nothing at all and the
+    # robot could not be turned while stationary. With y at zero the wheels go
+    # opposite ways as before.
+    # SPIN IS BLENDED IN, NOT SWITCHED TO, and that blend is the whole reason
+    # this is not two lines. Operator, 2026-08-31: "when i slightly right down to
+    # left tyre reverse and right stop".
+    #
+    # The first version of this special-cased y == 0 for spin-on-the-spot. That
+    # made a cliff either side of centre, because DEADZONE snaps a small y to
+    # exactly zero: sweeping the stick down through the middle at full right
+    # went L=5 R=0, then L=255 R=-255, then L=-5 R=0. A full-power spin, entered
+    # and left within a few counts of stick travel. Nothing in the arithmetic was
+    # wrong; the two behaviours simply did not meet.
+    #
+    # So the two are mixed over SPIN_ZONE of throttle instead. At rest the robot
+    # spins as before; by a quarter throttle it steers proportionally; in between
+    # it is a weighted sum of the two, which is continuous everywhere and cannot
+    # produce a jolt at any stick position.
+    #
+    # x > 0 is a right turn - the RIGHT wheel is the inner one. That pairing came
+    # from the original formula (right = y - x fell as x rose) and is what keeps
+    # the steering the same way round as it has always been.
+    inner = y * (1.0 - abs(x))
+    prop_l, prop_r = (y, inner) if x >= 0 else (inner, y)
 
+    # Spin authority, faded out as the throttle comes up.
+    w = 1.0 - min(1.0, abs(y) / SPIN_ZONE) if SPIN_ZONE > 0 else 0.0
+    if w > 0.0:
+        left = (1.0 - w) * prop_l + w * x
+        right = (1.0 - w) * prop_r + w * -x
+    else:
+        left, right = prop_l, prop_r
+
+    # Left as a clamp rather than a scaler. Neither branch above can exceed 1.0
+    # now - inner is always a fraction of outer, and spin is bounded by x - so
+    # this no longer rescales anything. It stays because a future edit that does
+    # overshoot should be clipped, not silently sent to the motors.
     peak = max(1.0, abs(left), abs(right))
     left /= peak
     right /= peak

@@ -134,11 +134,50 @@ def probe_codec(url: str, timeout: float = 4.0):
         with socket.create_connection((host, port), timeout=timeout) as sock:
             sock.settimeout(timeout)
             sock.sendall(request)
+            # STOP AS SOON AS THE ANSWER IS COMPLETE. This loop used to read
+            # until it had 8192 bytes or the peer hung up, and did neither: a
+            # DESCRIBE response is a few hundred bytes and the camera keeps the
+            # connection OPEN afterwards, so recv() blocked until the 4 s timeout
+            # expired every single time. Measured 2026-08-31: probe=4.1s against
+            # open=1.6s and first-frame=0.0s, so the wait for data that was never
+            # coming was most of the time to first picture - twice over, once per
+            # camera, on every start and every reconnect.
+            #
+            # Two exits, in order of how early they can fire:
+            #
+            #   1. The codec token is already present. That is the whole question
+            #      this function exists to answer, and rtpmap sits inside the SDP
+            #      body, so finding it means the body has started arriving.
+            #   2. Content-Length is satisfied. The correct general answer, and
+            #      the one that still terminates if a camera ever answers without
+            #      a recognisable codec line.
+            #
+            # The timeout stays as the backstop for a camera that answers slowly
+            # or not at all; it is now the exception rather than the rule.
+            header_end = -1
+            want = None
             while len(data) < 8192:
                 chunk = sock.recv(2048)
                 if not chunk:
                     break
                 data += chunk
+
+                low = data.lower()
+                if b"h265" in low or b"hevc" in low or b"h264" in low:
+                    break
+
+                if header_end < 0:
+                    header_end = data.find(b"\r\n\r\n")
+                    if header_end >= 0:
+                        for line in data[:header_end].split(b"\r\n"):
+                            if line.lower().startswith(b"content-length:"):
+                                try:
+                                    want = int(line.split(b":", 1)[1].strip())
+                                except ValueError:
+                                    want = None
+                if header_end >= 0 and want is not None:
+                    if len(data) - (header_end + 4) >= want:
+                        break
     except OSError:
         if not data:
             return None

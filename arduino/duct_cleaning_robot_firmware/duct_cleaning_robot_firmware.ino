@@ -66,6 +66,17 @@ void loop() {
         Serial.println(packetsReceived);
     }
 
+    // HOLD the stop, do not just write it once. The trip above fires on an edge;
+    // this re-drives every output to neutral for as long as the link stays down,
+    // so a channel that browns out and recovers cannot come back running.
+    {
+        static unsigned long lastHoldMs = 0;
+        if (!linkUp && (millis() - lastHoldMs) >= FAILSAFE_HOLD_MS) {
+            lastHoldMs = millis();
+            safeState();
+        }
+    }
+
     telemetryReport();
 
     resetCauseStash(linkVerdict, (uint16_t)packetsReceived, linkServiceCount,

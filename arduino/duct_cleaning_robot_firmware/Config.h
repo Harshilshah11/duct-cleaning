@@ -35,6 +35,35 @@ const uint8_t PIN_PWM1 = 6;    // Timer0 OC0A
 const uint8_t PIN_DIR2 = 4;    // SD CS - slot empty
 const uint8_t PIN_PWM2 = 5;    // Timer0 OC0B
 const bool INVERT_1 = false;
+// TRUE on this rig - measured, not a default. The right motor is landed the
+// other way round, so without this "forward" spins the robot and "turn right"
+// drives it straight. It was briefly false (429a21b) and that is exactly what
+// happened. Flip only against the hardware, never to taste.
+// FALSE. Both channels uninverted, which is what the wiring wants.
+//
+// Set true on the way to this and it is what CAUSED the fault it was meant to
+// fix: the operator reported the whole mapping rotated a quarter turn - "right
+// is forward and left is backward and forward is right and backward is left" -
+// with the panel reading correctly, so the stick and the picture agreed and only
+// the wheels did not.
+//
+// A ONE-WHEEL INVERSION IS EXACTLY THAT ROTATION. mix() carries the forward
+// demand in the COMMON component of the pair and the turn demand in the
+// DIFFERENCE. Invert one wheel and the two exchange roles: a common command
+// becomes a spin and a differential command drives straight. Forward becomes
+// turn and turn becomes forward - a rotation, not a mirror. So a rotated mapping
+// means the inverts DISAGREE with each other, and the cure is to make them
+// match, never to add another.
+//
+// WHICH WAY THE MATCHED PAIR THEN DRIVES is the second question, and separate:
+// both true and both false each stop the spin, and they drive opposite ways.
+// Both false is the pairing that drives forward on this rig, confirmed on the
+// bench 2026-08-29.
+//
+// NOT TO BE FIXED IN inputs.py. SWAP_XY and INVERT_X/INVERT_Y there feed the
+// panel as well as the mixer, and the panel is right; touching them would move
+// the picture to fix the wheels. This is the last point that reaches the motors
+// alone.
 const bool INVERT_2 = false;
 
 // Rod EXTENDS on DIR **LOW** - opposite to every other channel here.
@@ -80,6 +109,13 @@ const uint8_t PIN_LIGHT_PWM = 9;    // Timer1 OC1A
 const uint8_t PIN_STATUS_LED = LED_BUILTIN;   // D13 = SPI clock, not a real indicator
 
 const unsigned long FAILSAFE_MS = REAL_MS(300);
+
+// While the link is DOWN, re-assert neutral this often. The trip itself writes
+// safeState() once; this keeps writing it. A driver channel that browns out and
+// recovers - which happens on this rig, the brush shares the Uno's buck - would
+// otherwise come back to whatever its inputs floated to, with nothing driving
+// them again until a command arrived. Cheap: a handful of digitalWrites.
+const unsigned long FAILSAFE_HOLD_MS = REAL_MS(250);
 
 // DEADBAND rejects sender noise; MIN_DUTY is the smallest duty that turns a
 // loaded wheel. Zero stays zero. Keep DEADBAND below MIN_DUTY.

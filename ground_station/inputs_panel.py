@@ -817,10 +817,16 @@ class JoystickView(QWidget):
         self._timer.timeout.connect(self._tick)
 
     def _demand(self):
-        """|x|+|y| clamped - the same peak-wheel figure THROTTLE shows."""
+        """max(|x|,|y|) - the same peak-wheel figure THROTTLE shows.
+
+        Was |x|+|y| clamped, which matched the old adding mixer. Proportional
+        steering (see uno_serial.mix) never adds the axes, so the faster wheel is
+        simply the throttle - or the turn, when spinning on the spot with no
+        throttle at all.
+        """
         if self._x is None or self._y is None:
             return 0.0
-        return max(0.0, min(1.0, abs(self._x) + abs(self._y)))
+        return max(0.0, min(1.0, max(abs(self._x), abs(self._y))))
 
     def _tick(self):
         self._phase += 0.13
@@ -2584,9 +2590,17 @@ class InputsPanel(QFrame):
         if x is None or y is None:
             self.joy_text.setText("THROTTLE —")
         else:
-            left, right = y + x, y - x
-            peak = max(1.0, abs(left), abs(right))
-            demand = max(abs(left), abs(right)) / peak
+            # THE FASTER WHEEL, computed the way uno_serial.mix() now computes
+            # it. Proportional steering eases the INNER wheel off the throttle
+            # rather than adding the axes and rescaling, so the outer wheel is
+            # the throttle itself and this is max(|x|, |y|) - the turn only wins
+            # when spinning on the spot, where there is no throttle to beat it.
+            #
+            # Full forward reads 100%. Full spin reads 100%. Full forward AND
+            # full turn now also reads 100%, but for a different reason than it
+            # used to: the outer wheel is saturated while the inner one is
+            # stopped, rather than both being scaled back down from 2.0.
+            demand = max(abs(x), abs(y))
             self.joy_text.setText(f"THROTTLE {demand * 100:.0f}%")
 
         pot = state.get("pot") or {}

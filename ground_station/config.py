@@ -100,7 +100,26 @@ TEMP_POLL_S = float(os.environ.get("TEMP_POLL_S", "2.0"))
 # 50ms starves the decoder and 500ms is no better, see gst_pipeline() for the
 # full measurements. Every ms here is added glass-to-glass delay, so do not
 # raise it without measuring.
-RTSP_LATENCY_MS = int(os.environ.get("RTSP_LATENCY_MS", "200"))
+# 50 ms, down from 200 on 2026-08-31. This is DIRECT LAG: rtspsrc holds the
+# picture this long before the decoder ever sees it, so 200 ms was 200 ms of the
+# robot's past on screen.
+#
+# THE NOTE IN stream.py THAT SAID 50 WAS WORSE IS OUT OF DATE, and it is worth
+# knowing why rather than just overriding it. That measurement - "latency=50
+# drop-on-latency=true (no queue) .... 19.2 fps" - was taken BEFORE the leaky
+# queue was added after the decoder. Without a queue a short buffer starves the
+# sink and frames are lost; with one, the queue absorbs the jitter the buffer
+# used to. Re-measured 2026-08-31 on the current pipeline, at the source rate
+# throughout:
+#
+#     latency=200 .... 26.3 fps
+#     latency=100 .... 26.0 fps
+#     latency=50  .... 25.7 fps
+#
+# So the 150 ms is free. If the picture ever starts stuttering on a congested
+# link, this is the first knob to put back up - the buffer exists to absorb
+# network jitter, and a lossy link needs more of it than a quiet one.
+RTSP_LATENCY_MS = int(os.environ.get("RTSP_LATENCY_MS", "50"))
 
 # "tcp" is far more reliable on a long tether (no silent packet loss).
 # Switch to "udp" only if you are chasing the absolute lowest latency.
@@ -118,6 +137,28 @@ RTSP_PROTOCOL = os.environ.get("RTSP_PROTOCOL", "tcp")
 # the BGR that OpenCV requires costs more CPU than the software decode ever
 # saved - while also halving the frame rate. Software decode of one 720p stream
 # is only ~0.6 of a core, so there is nothing to rescue here.
+# OFF on 2026-08-31, and this was costing two thirds of the frame rate.
+#
+# v4l2h264dec is the Pi's hardware H.264 decoder and on paper it is the right
+# choice - it should cost less CPU and less latency than avdec_h264 in software.
+# Measured on this rig against a live camera, it does neither:
+#
+#     latency=200  hw=True ....  7.8 fps      hw=False .... 26.3 fps
+#     latency=100  hw=True .... 11.5 fps      hw=False .... 26.0 fps
+#     latency=50   hw=True ....  8.0 fps      hw=False .... 25.7 fps
+#
+# A THIRD OF THE SOURCE RATE, at every buffer setting, and GStreamer says why:
+# "v4l2h264dec0: 1 initial frames were not dequeued: bug in decoder". The
+# element does not hand its frames back cleanly to an appsink, so most of them
+# never reach the UI. That is visible as a laggy, stuttering picture rather than
+# as an error, which is why it survived so long.
+#
+# Software decode costs CPU - main.py sits near 190% with two 720p streams - and
+# that is the trade being made deliberately: a Pi 4 has four cores and nothing
+# else wants them, while dropped frames cannot be bought back.
+#
+# Worth retrying if the v4l2 stack is ever updated; the measurement above is the
+# bar it has to clear.
 USE_HW_DECODE = os.environ.get("USE_HW_DECODE", "0") == "1"
 
 # --- Behaviour ---------------------------------------------------------------
@@ -284,6 +325,44 @@ RECORD_DIR = os.path.expanduser(os.environ.get("RECORD_DIR", "/recordings"))
 # writes one frame per tick whether or not the camera delivered a new one, so an
 # hour of duct run is an hour of video and the timeline stays honest.
 RECORD_FPS = float(os.environ.get("RECORD_FPS", "15"))
+
+# HOW OFTEN A RUNNING RECORDING ROLLS TO A NEW CLIP, seconds. 0 disables it and
+# restores the old behaviour of one clip per run.
+#
+# THIS IS WHAT MAKES SAVING FAST, and it is worth knowing why a rollover buys
+# anything at all. The recorder writes MPEG-4 while filming because that is the
+# only codec cv2 can encode fast enough to keep up - 2.6s per 60 frames against
+# 49s for H.264, measured 2026-08-31. Everything then has to be re-encoded to
+# H.264 at save time, and that re-encode is the wait: a 100-minute session took
+# about 25 minutes, because 90,000 frames is genuinely that much work.
+#
+# The encoder runs at about 4x realtime, so it can finish a clip long before the
+# next one closes and still idle three quarters of the time. Rolling every
+# RECORD_SEGMENT_S turns one enormous job at the end into a stream of small ones
+# that keep pace with the filming, and leaves only the final partial clip plus
+# the join to do at stop.
+#
+# 60s, on the operator's call after the numbers were measured 2026-08-31:
+#
+#     encode rate .......... 5.3x realtime
+#      60s clip ............ encoded in 11.3s, then 49s idle
+#     120s clip ............ encoded in 22.7s, then 97s idle
+#
+# Both keep up with room to spare, so the only thing the length decides is the
+# TAIL - the unfinished clip still to encode when the operator presses stop.
+# That is the only wait anyone actually feels, and 60s halves it: about 11
+# seconds against 23. The cost is twice as many ffmpeg launches, which is cheap
+# now each one is niced and runs on the hardware encoder.
+#
+# WHY THE ENCODER HAS THE HEADROOM AT ALL, since it is the whole basis of this:
+# at 5.3x realtime it is idle about 80% of the time while filming. The old
+# design saved that idle capacity up and spent it after the stop; this spends it
+# as it goes. Nothing here is faster - the same frames are encoded either way -
+# it is only moved off the end of the run, where somebody is waiting.
+#
+# Do not raise this past the point where a clip takes longer to encode than to
+# film. At 5.3x that is far away, but a slower encoder or a busier Pi moves it.
+RECORD_SEGMENT_S = float(os.environ.get("RECORD_SEGMENT_S", "60"))
 
 # "mp4v" (MPEG-4 Part 2) is the one fourcc the apt OpenCV can always write into
 # a .mp4 without an external encoder. "avc1" gives smaller files where the build
