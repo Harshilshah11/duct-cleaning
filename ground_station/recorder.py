@@ -643,6 +643,28 @@ class FullViewBuilder(threading.Thread):
         self._stopping = threading.Event()
         self._proc = None
         # Published for the strip.
+        # WHAT THIS JOB WILL ACTUALLY DO, counted in equal steps, so overall
+        # progress can be a real 0..1 instead of something the UI infers.
+        #
+        # The UI used to guess it from the stage NAME, dividing by a fixed list
+        # of three - normalising, building, joining. Two of those usually do not
+        # run: COMBINED_AFTER_SAVE is off, so "building" is skipped entirely, and
+        # a while-recording pass skips "joining" too because joining is a
+        # whole-session operation. A dial fed that guess could only ever fill the
+        # fraction of stages that happened to execute, which is why it stopped
+        # partway and sat there looking wedged.
+        #
+        # Only this object knows which stages it will run, so it is the only
+        # thing that can count them.
+        steps = 0
+        if config.RECORD_NORMALIZE:
+            steps += len(clips)
+        if config.COMBINED_AFTER_SAVE:
+            steps += len(clips)
+        # The join, when this pass does one, is one more step - added in
+        # _overall() rather than here because `join` is stored after this runs.
+        self._steps_total = steps
+        self._steps_done = 0
         self._state = "queued"          # queued / building / done / error
         self._clip = 0
         self._total = len(clips)
@@ -652,9 +674,19 @@ class FullViewBuilder(threading.Thread):
 
     # -- published ------------------------------------------------------------
 
+    def _overall(self):
+        """0..1 across the WHOLE job. Caller holds _lock."""
+        joining = self._do_join and config.RECORD_JOIN_CLIPS
+        total = self._steps_total + (1 if joining else 0)
+        if total <= 0:
+            return 1.0 if self._state == "done" else 0.0
+        done = self._steps_done + max(0.0, min(1.0, self._frac))
+        return max(0.0, min(1.0, done / float(total)))
+
     def status(self):
         with self._lock:
             return {
+                "overall": self._overall(),
                 "state": self._state,
                 "clip": self._clip,
                 "clips_total": self._total,
@@ -773,11 +805,16 @@ class FullViewBuilder(threading.Thread):
         for i, (slug, path, _frames) in enumerate(usable):
             if self._stopping.is_set():
                 break
-            with self._lock:
-                self._frac = i / float(len(usable))
             reason = self._normalize_one(path, target)
             if reason:
                 problems.append("%s: %s" % (slug, reason))
+            # COUNTED AFTER THE WORK, NOT BEFORE. This read
+            # `frac = i / len(usable)` at the TOP of the loop, so with the rig's
+            # two cameras it reported 0.0 and then 0.5 and the loop ended - the
+            # dial stopped dead on 50% and sat there looking wedged, which is
+            # exactly what the operator filmed. Progress means work FINISHED.
+            with self._lock:
+                self._frac = (i + 1) / float(len(usable))
         return problems
 
     @staticmethod
@@ -838,13 +875,42 @@ class FullViewBuilder(threading.Thread):
         # The STOP-time pass is left at normal priority deliberately. Nothing is
         # being driven then, the operator is waiting on it, and it should have
         # the machine.
-        # Same cores as the live encoders - see config.RECORD_CPU_CORES. nice
-        # alone only decides who wins a core once two things want it; taskset
-        # decides which cores are contended at all, so the UI keeps the rest
-        # whatever the scheduler makes of the priorities.
+        # THE WHILE-RECORDING PASS RUNS IN THE IDLE CLASS, NOT MERELY NICE.
+        #
+        # Operator, 2026-09-01: "its lag when video saving process start, video
+        # save is finished to its not lagy". Exactly the window this ffmpeg runs
+        # in, so nice 19 and an affinity mask were not enough - and the reason is
+        # what nice actually means. A nice 19 task is still a NORMAL task: it
+        # gets a small share of every core it sits on even while something else
+        # wants that core, and a small share of a Pi core is enough to make a
+        # 30 Hz repaint miss its slot.
+        #
+        # SCHED_IDLE is a class BELOW every normal task. It cannot take time from
+        # the UI at all; it fills the gaps the UI leaves. That is precisely the
+        # bargain this work wants - the encoder runs at about 5x realtime and
+        # needs roughly a fifth of the interval, so it can afford to wait for
+        # scraps and still finish long before the next clip closes.
+        #
+        # ionice -c 3 is the same idea for the disk: idle-class I/O, so writing
+        # the normalised file cannot hold up a frame being written by the live
+        # recorder next to it.
+        #
+        # THE OPERATOR ASKED WHETHER SHORTER CLIPS WOULD HELP. They would not:
+        # the same total work would arrive in more frequent, shorter bursts, so
+        # the lag would be chopped up rather than removed - and interrupted every
+        # 30s instead of every 60s is worse to drive, not better. The fix has to
+        # be that the work yields, not that it is sliced differently.
+        #
+        # The STOP-time pass keeps normal priority: nothing is being driven then
+        # and the operator is waiting on it, so it should have the machine.
         cores = config.record_cores()
         pin = ["taskset", "-c", ",".join(str(c) for c in sorted(cores))] if cores else []
-        nice = [] if self._do_join else pin + ["nice", "-n", "19"]
+        if self._do_join:
+            nice = []
+        else:
+            nice = (pin + ["chrt", "--idle", "0"]
+                    + ["ionice", "-c", "3"]
+                    + ["nice", "-n", "19"])
         threads = [] if self._do_join else ["-threads", "1"]
         cmd = nice + ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                "-nostdin"] + threads + [
@@ -1219,6 +1285,7 @@ class FullViewBuilder(threading.Thread):
                 # Normalise-only mode: this clip is finished.
                 with self._lock:
                     self._built += 1
+                    self._steps_done += 1
                     self._frac = 1.0
                 continue
             if self._stopping.is_set():
@@ -1230,10 +1297,15 @@ class FullViewBuilder(threading.Thread):
                 reason = self._build_clip(clip_no, self.clips[clip_no])
             except Exception as exc:            # never take the viewer down
                 reason = str(exc)[:120]
-            if reason:
-                failures.append("clip %03d: %s" % (clip_no, reason))
-            else:
-                with self._lock:
+            with self._lock:
+                # Counted whether or not it succeeded: a failed clip is a step
+                # the job will not repeat, and a dial that stalls on a failure
+                # says only that something is wrong - which the error state
+                # already says, and says better.
+                self._steps_done += 1
+                if reason:
+                    failures.append("clip %03d: %s" % (clip_no, reason))
+                else:
                     self._built += 1
                     self._frac = 1.0
 
@@ -1241,7 +1313,8 @@ class FullViewBuilder(threading.Thread):
         # some clips failed: the clips that DID build are still worth joining,
         # and a session that half-merged is more useful than one left as
         # numbered fragments.
-        if not self._stopping.is_set() and self._do_join:
+        if (not self._stopping.is_set() and self._do_join
+                and config.RECORD_JOIN_CLIPS):
             with self._lock:
                 self._state, self._frac = "joining", 0.0
             try:
@@ -1677,7 +1750,12 @@ class SessionManager:
         a minute of Pi on footage the operator threw away was the other half of
         what made the old live encoder wasteful.
         """
-        if not (config.COMBINED_AFTER_SAVE or config.RECORD_NORMALIZE):
+        # The builder still has work when normalising is off: naming the output.
+        # Without RECORD_JOIN_CLIPS here it bailed out and left the clip called
+        # cam1_front_001.mp4, when a one-clip session only needs a rename to
+        # front.mp4 - which costs nothing and is the whole point of this path.
+        if not (config.COMBINED_AFTER_SAVE or config.RECORD_NORMALIZE
+                or config.RECORD_JOIN_CLIPS):
             return
         # The encoders close on their own tick; the build reads those files.
         self._await_closed()

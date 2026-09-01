@@ -312,10 +312,30 @@ AXIS_DEADBAND = float(os.environ.get("INPUTS_AXIS_DEADBAND", "0.3179"))
 #
 # RE-MEASURE, DO NOT NUDGE, if the stick is ever re-wired or replaced: log
 # x_raw/y_raw with the learned centres through a four-corner sweep and divide.
-AXIS_TRAVEL_X_POS = float(os.environ.get("INPUTS_AXIS_TRAVEL_X_POS", "0.851"))
-AXIS_TRAVEL_X_NEG = float(os.environ.get("INPUTS_AXIS_TRAVEL_X_NEG", "0.925"))
-AXIS_TRAVEL_Y_POS = float(os.environ.get("INPUTS_AXIS_TRAVEL_Y_POS", "0.614"))
-AXIS_TRAVEL_Y_NEG = float(os.environ.get("INPUTS_AXIS_TRAVEL_Y_NEG", "0.645"))
+# RE-MEASURED 2026-09-01, by asking the operator to rotate the stick round every
+# corner and reading the extremes back out of motor_cam.log:
+#
+#     centre at rest ....... x 8900   y 8960
+#     X reached ............ 8884 below centre, 8156 above
+#     Y reached ............ 8448 below centre, 8112 above
+#
+# The previous values were badly under-scaled and Y was the worst of it. Against
+# a half-scale of 8800 counts they assumed spans of 5403 and 5676, so the stick
+# hit FULL demand at about two thirds of its travel and the last third did
+# nothing at all - the operator reported it as "not full display in any corner".
+# Every direction saturated: X by 1.09x, Y by 1.50x.
+#
+# The fractions below are the measured deflection over that half-scale, pulled in
+# by 2% so full output is reachable without having to find the absolute
+# mechanical stop. All four differ because the stick genuinely is not symmetric -
+# X swings 9% further one way than the other.
+#
+# TO REDO THIS: rotate the stick round all four corners, then read the min and
+# max of the raw= column in ~/motor_cam.log. These are (extreme - centre) / 8800.
+AXIS_TRAVEL_X_POS = float(os.environ.get("INPUTS_AXIS_TRAVEL_X_POS", "0.908"))
+AXIS_TRAVEL_X_NEG = float(os.environ.get("INPUTS_AXIS_TRAVEL_X_NEG", "0.989"))
+AXIS_TRAVEL_Y_POS = float(os.environ.get("INPUTS_AXIS_TRAVEL_Y_POS", "0.903"))
+AXIS_TRAVEL_Y_NEG = float(os.environ.get("INPUTS_AXIS_TRAVEL_Y_NEG", "0.941"))
 
 # Which way the stick's electrical travel maps onto the robot's motion. Flip
 # these, not the mixer or the sketch, if a re-mount ever reverses an axis
@@ -407,7 +427,44 @@ AXIS_TRAVEL_Y_NEG = float(os.environ.get("INPUTS_AXIS_TRAVEL_Y_NEG", "0.645"))
 # reported as a highlight bug and chased as one; it was this.
 SWAP_XY = os.environ.get("INPUTS_SWAP_XY", "0") == "1"
 
-INVERT_X = os.environ.get("INPUTS_INVERT_X", "0") == "1"
+# SET 2026-09-01, and MEASURED, not guessed. With the stick held physically up
+# and to the right, 29 steady samples of ~/motor_cam.log read:
+#
+#     dx -4004   dy -7904        BOTH negative
+#
+# dy negative for "up" is correct and stays that way - straight forward drives
+# the robot forward, confirmed by the operator, and INVERT_Y must not be touched
+# or that breaks. But dx negative for "right" is backwards, and it was doing real
+# damage downstream: mix() picks which wheel to stop from the SIGN OF X, so every
+# right-hand command was landing in the left-hand branch. Up-and-right stopped
+# the left wheel and drove the right one in reverse, when the operator wanted the
+# left wheel forward and the right one stopped.
+#
+# It also had spin backwards - pushing right turned the robot left - which had
+# gone unreported because the one-wheel turn was the more obvious fault.
+#
+# THE PANEL'S ox SIGN MOVES WITH THIS. inputs_panel negates x to place the dot,
+# so flipping the axis here without flipping it there would mirror the display
+# instead of leaving it alone. Both changed together; the dot is unchanged.
+# 1 as of 2026-09-01, and this is the value the operator drove and kept. Physical
+# right reads a NEGATIVE dx on this stick, measured over 29 steady samples of
+# ~/motor_cam.log, which is why the axis is corrected here.
+#
+# IT WAS FLIPPED TO 0 TWICE ON 2026-09-01 AND REVERTED BOTH TIMES. Flipping it
+# mirrors the steering, and mirroring it swaps which wheel drives in all four
+# corners - which undid the up-corner behaviour the operator had already settled
+# on and signed off. If a future reading of the raw ADC tempts you to "correct"
+# this to 0 again: that reading is right, and the change is still wrong, because
+# the drive outputs are crossed too and only the PAIR shows at the wheels.
+# Read on: the drive outputs are
+# ALSO crossed on this rig - the `right` output drives the physical left wheel -
+# so there are two inversions in the path and only their PAIR is observable at
+# the wheels. Changing either one alone mirrors the steering. If the motor leads
+# are ever uncrossed, this constant has to move in the same change.
+#
+# THE PANEL'S ox SIGN MOVES WITH THIS - see inputs_panel. Both flipped together,
+# so the dot is unchanged and still follows the hand.
+INVERT_X = os.environ.get("INPUTS_INVERT_X", "1") == "1"
 # Y FLIPPED TO 0 (2026-08-25). Operator: "my forward backward is interchange in
 # my frontend". The panel's forward/reverse arrows, the FRONT/BACK camera
 # highlight and the wheels ALL read from the same already-inverted y - arrows

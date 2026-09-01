@@ -168,7 +168,7 @@ def other_transport(name):
     """The wire that is not this one. Used to fail over - see open_link()."""
     return "udp" if name == "serial" else "serial"
 # Shared with the USB serial transport so both agree on what a stick means.
-from uno_serial import (MAX_PWM, SAMPLE_STALE_S, SEND_HZ, act_demand,
+from uno_serial import (LIGHT_STALE_S, MAX_PWM, SAMPLE_STALE_S, SEND_HZ, act_demand,
                         brush_demand, light_demand, mix)
 
 # Health is judged over a window, like link.py debounces its status chip: a
@@ -602,8 +602,12 @@ class MotorLink(threading.Thread):
                         brush_fresh = (
                             time.monotonic() - self._brush_at) < SAMPLE_STALE_S
                         light_pct = self._light
-                        light_fresh = (
-                            time.monotonic() - self._light_at) < SAMPLE_STALE_S
+                        # LIGHT_STALE_S, not SAMPLE_STALE_S - see the note
+                        # there. A lamp is not a motion hazard, and holding the
+                        # last brightness through a scheduling hiccup is what
+                        # stops it flickering while the robot is driven.
+                        light_fresh = (time.monotonic() - self._light_at) < (
+                            LIGHT_STALE_S or SAMPLE_STALE_S)
                     left, right = mix(x, y) if fresh else (0, 0)
                     # Ramp the wheels rather than stepping them - see
                     # MOTOR_SLEW_PER_S. Uses the real frame time, so a jittery
@@ -625,8 +629,9 @@ class MotorLink(threading.Thread):
                     # stop the rod even if the last joystick sample was fine.
                     act = act_demand(act_state, act_pot) if act_fresh else 0
                     brush = brush_demand(brush_on) if brush_fresh else 0
-                    # Stale pot -> dark, for the same reason a stale stick means
-                    # stop: the last known value is not evidence of anything.
+                    # Stale pot -> dark, but on the LAMP's own longer timer: the
+                    # last known brightness is worth holding through a gap that
+                    # the last known steering angle is not.
                     light = light_demand(light_pct) if light_fresh else 0
 
                     # wait_ack=False: blocking for the reply would cap the loop

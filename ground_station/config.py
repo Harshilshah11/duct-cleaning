@@ -378,6 +378,38 @@ RECORD_THREAD_NICE = int(os.environ.get("RECORD_THREAD_NICE", "10"))
 # It should lose an argument with the UI, not be pushed to the back of the queue.
 STREAM_THREAD_NICE = int(os.environ.get("STREAM_THREAD_NICE", "5"))
 
+# Which cores GStreamer's decode threads may use. Empty disables the pinning.
+#
+# NICE ALONE WAS NOT ENOUGH, and the reason is worth stating because it is the
+# same lesson the recorder taught: priority decides who WINS a core, but the
+# loser still has to find one. With every decode thread free on all four cores,
+# the UI thread had to win an argument on whichever core it landed on, every
+# time. Measured while recording: it waited 1220ms in every 5 seconds.
+#
+# Keeping the decode off core 0 leaves that core for the control path - the UI
+# thread, the motor link and the ADC reader, none of which are pinned and all of
+# which can therefore use it without an argument. They keep the other three too;
+# this takes nothing away from them.
+#
+# THE ADC READER IS THE REASON THIS MATTERS BEYOND SMOOTHNESS. Its samples go
+# stale in 250 ms and a stale sample sends zero, so a starved reader is not a
+# cosmetic problem - it is the lamp switching off and the wheels dropping a
+# command mid-drive.
+STREAM_CPU_CORES = os.environ.get("STREAM_CPU_CORES", "1,2,3")
+
+
+def stream_cores():
+    """STREAM_CPU_CORES as a set of valid core numbers, or None if disabled."""
+    raw = (STREAM_CPU_CORES or "").strip()
+    if not raw:
+        return None
+    try:
+        want = {int(v) for v in raw.split(",") if v.strip() != ""}
+    except ValueError:
+        return None
+    cores = want & set(range(os.cpu_count() or 1))
+    return cores or None
+
 
 def record_cores():
     """RECORD_CPU_CORES as a set of valid core numbers, or None if disabled."""
@@ -434,7 +466,65 @@ RECORD_FPS = float(os.environ.get("RECORD_FPS", "15"))
 #
 # Do not raise this past the point where a clip takes longer to encode than to
 # film. At 5.3x that is far away, but a slower encoder or a busier Pi moves it.
-RECORD_SEGMENT_S = float(os.environ.get("RECORD_SEGMENT_S", "60"))
+# 60s - ON, restored on the operator's call 2026-09-01 after trying it off.
+#
+# WHAT TURNING IT OFF COSTS, which is why it came back: the whole session
+# normalises after STOP instead of a clip at a time, so a long run takes minutes
+# to save where this makes it about eleven seconds. The operator would rather
+# have the fast save.
+#
+# WHAT IT COSTS TO HAVE IT ON, measured and unresolved. Rolling a clip mid-run meant an ffmpeg
+# normalise ran WHILE the operator was driving, and that was felt: "its lag when
+# video saving process start, video save is finished to its not lagy". Three
+# attempts to make it unobtrusive all failed to help much, and the measurements
+# say why:
+#
+#     no ffmpeg ................ UI waited  533ms per 5s
+#     ffmpeg at nice 19 ........ UI waited 1042ms
+#     ffmpeg at SCHED_IDLE ..... UI waited  947ms
+#
+# SCHED_IDLE is a class below every normal task and it still cost nearly double
+# the wait. So the contention is NOT the CPU scheduler - it is memory bandwidth
+# and the hardware video block, and no priority, affinity or I/O class reaches
+# those. The work cannot be hidden; it can only be moved.
+#
+# SHORTER CLIPS WERE CONSIDERED AND REJECTED for the same reason. The operator
+# asked whether 30s would help. The same total work would arrive in more
+# frequent, shorter bursts - the lag chopped up rather than removed, and an
+# interruption every 30s is worse to drive through than one every 60s.
+#
+# WHAT THIS COSTS: the whole session normalises after STOP instead, so a long run
+# takes minutes to save where segmenting made it about eleven seconds. That is
+# the trade the operator chose, and it is the right way round - the wait happens
+# when nobody is driving, and driving is when lag actually matters.
+#
+# The machinery is all still here and still correct: set this to 60 and clips
+# roll again. Nothing else needs changing.
+RECORD_SEGMENT_S = float(os.environ.get("RECORD_SEGMENT_S", "0"))
+
+# Join the numbered clips into one file per camera at the end of a save.
+#
+# THIS IS THE SLOW PART OF A SAVE, and it is slow for a reason no amount of CPU
+# will change. /recordings is the SD card and it writes at about 20 MB/s,
+# measured 2026-09-01. The join reads every clip and writes one combined file,
+# so it moves the whole session across that card TWICE - roughly 100 seconds per
+# gigabyte per camera. The operator sees the dial race through the normalise
+# steps, which are already done by then, and stop dead around 60-80% while this
+# runs.
+#
+# TURNING IT OFF LEAVES THE NUMBERED CLIPS - cam1_front_001.mp4, _002 and so on.
+# They are already normalised H.264 and play on anything; there are just several
+# per camera instead of one. The USB backup copies them all either way.
+#
+# So this is a straight trade with no cleverness available: one tidy file per
+# camera, or a save that ends when the last clip finishes normalising. Nothing in
+# between, because concatenating MP4s means rewriting the container and that
+# means writing the bytes.
+# ON, and with RECORD_SEGMENT_S at 0 it costs nothing. A session that is one
+# clip per camera has nothing to concatenate, so _join RENAMES the file instead
+# of copying it - see the len(parts) == 1 branch there. That is where the whole
+# 100-seconds-per-gigabyte disappears to: not optimised, avoided.
+RECORD_JOIN_CLIPS = os.environ.get("RECORD_JOIN_CLIPS", "1") == "1"
 
 # "mp4v" (MPEG-4 Part 2) is the one fourcc the apt OpenCV can always write into
 # a .mp4 without an external encoder. "avc1" gives smaller files where the build
@@ -480,7 +570,26 @@ RECORD_SQUARE_PX = int(os.environ.get("RECORD_SQUARE_PX", "720"))
 # Two in-process x264 encoders do not fit beside two decodes and the UI. So the
 # live path stays mp4v and the size is fixed offline, on idle cores, exactly the
 # way COMBINED_AFTER_SAVE already fixes the full view.
-RECORD_NORMALIZE = os.environ.get("RECORD_NORMALIZE", "1") == "1"
+# OFF, 2026-09-01. This is the setting that buys "fast AND no lag AND one file".
+#
+# Normalising re-encodes every recorded frame from MPEG-4 to H.264, and that
+# encode is the only expensive thing a save does. It has to happen SOMEWHERE:
+# during the recording, where it lagged the driving, or after the stop, where it
+# made the operator wait minutes. Three attempts to schedule it out of the way
+# all failed - nice 19, SCHED_IDLE and core pinning each left the UI waiting
+# nearly twice as long, because the contention is memory bandwidth and the
+# hardware video block, not CPU time.
+#
+# So it is not done at all. The clips stay as the MPEG-4 the recorder wrote,
+# which plays anywhere, and a save becomes a rename.
+#
+# WHAT IT COSTS: measured on a real 58-second clip, mpeg4 is 19 MB against h264
+# at 8 MB - about 2.2x the disk. A 100-minute two-camera session is therefore
+# roughly 3.8 GB rather than 1.7 GB, against 18 GB free.
+#
+# WATCH THE FREE SPACE. That is about five long sessions rather than eleven, and
+# the honest fix for that is a bigger or faster card, not turning this back on.
+RECORD_NORMALIZE = os.environ.get("RECORD_NORMALIZE", "0") == "1"
 
 # A CAMERA THAT DROPS OUT PAUSES ITS RECORDING instead of being papered over,
 # operator 2026-08-26: "if its camera off to auto paused in saved and when

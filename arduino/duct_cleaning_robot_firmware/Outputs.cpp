@@ -16,15 +16,80 @@ void motorApply(uint8_t dirPin, uint8_t pwmPin, int demand, bool invert) {
     if (demand < -MAX_PWM) demand = -MAX_PWM;
     if (demand > -DEADBAND && demand < DEADBAND) demand = 0;
 
-    digitalWrite(dirPin, demand >= 0 ? HIGH : LOW);
-
     int duty = demand >= 0 ? demand : -demand;
-    if (duty == 0) { digitalWrite(pwmPin, LOW); return; }
+
+    /* A STOPPED WHEEL DROPS BOTH LINES. This used to write DIR from the sign
+     * before testing for zero, and `demand >= 0` takes the HIGH branch at zero,
+     * so a wheel commanded to a standstill was left DIR HIGH with the gate LOW.
+     * On this two-input driver that is FORWARD AT FULL SCALE - the same state
+     * brushApply() drops both lines to avoid, twenty lines below, and a state
+     * safeState() never uses: it writes both LOW.
+     *
+     * SO THE STOPPED WHEEL WAS THE ONE THAT RAN, at full speed, in whichever
+     * direction DIR HIGH happens to mean. Only steering that commands a wheel to
+     * exactly zero could hit it, which is why straight ahead and both spins were
+     * always correct and only the DIAGONALS misbehaved - and why no amount of
+     * sign-changing in uno_serial.mix() could fix them. The moving wheel was not
+     * the one being commanded, so flipping the command's sign changed nothing.
+     * That null result, 2026-09-01, is what pinned the fault to this line.
+     *
+     * IT ALSO MADE A CRAWL IMPOSSIBLE: DEADBAND below zeroes any small demand,
+     * so a wheel asked to inch forward got full scale instead. */
+    if (duty == 0) {
+        digitalWrite(pwmPin, LOW);
+        digitalWrite(dirPin, LOW);
+        return;
+    }
+
     if (MIN_DUTY > 0) {
         // long: 254 * 165 overflows a 16-bit int and wraps negative.
         duty = MIN_DUTY
              + (int)(((long)(duty - 1) * (MAX_PWM - MIN_DUTY)) / (MAX_PWM - 1));
     }
+
+    /* THESE ARE THE TWO INPUTS OF AN H-BRIDGE, NOT A DIRECTION PIN AND A GATE.
+     * The names say dir/pwm and that is what misled every fix before this one.
+     * What the driver actually does with the pair:
+     *
+     *     LOW  + LOW   coast          HIGH + HIGH  brake
+     *     LOW  + duty  drives, speed rises with duty
+     *     HIGH + duty  drives THE OTHER WAY, speed rises as duty FALLS
+     *
+     * brushApply() below has known this since it was written - "DIR high with
+     * the gate low is FORWARD AT FULL SCALE" - but motorApply drove the wheels
+     * as if dirPin picked a direction and pwmPin set a speed. That gives one
+     * working direction and one that lands on HIGH+HIGH, a brake:
+     *
+     *     demand -255  ->  LOW + 255   full speed          fine
+     *     demand +255  ->  HIGH + 255  both high = BRAKE   no motion
+     *
+     * SO REVERSE NEVER WORKED. Flipping a sign in uno_serial.mix() swapped one
+     * live direction for a standstill, which reads as "nothing changed" from the
+     * driving seat - the operator reported exactly that twice, 2026-09-01, and
+     * the second report is what sent me here. Hours of sign-flipping in Python
+     * were chasing a wheel that had only ever had one direction to give.
+     *
+     * The cure is the complement, exactly as writeBrushHardware() does it: hold
+     * one input LOW and PWM the other for one direction; hold it HIGH and PWM
+     * the INVERSE for the other. Both ends stay correct - duty 0 gives HIGH+HIGH
+     * (a brake, which is the stop the zero branch above has already taken) and
+     * duty 255 gives HIGH+LOW, full scale the other way. */
+    /* PLAIN DIR + PWM. The wheels really are on a direction pin and a speed
+     * gate, and this line is what the driver wants.
+     *
+     * IT WAS BRIEFLY WRITTEN AS A TWO-INPUT H-BRIDGE on 2026-09-01 - hold one
+     * input low and PWM the other, hold it high and PWM the complement, the way
+     * writeBrushHardware() does. The theory was that reverse had never worked
+     * because HIGH + full duty is a brake on such a bridge, which would have
+     * explained why flipping signs in uno_serial.mix() kept changing nothing.
+     *
+     * IT IS DISPROVED, and simply: with the complement in place, full reverse
+     * sends DIR HIGH with the gate at 0. On a two-input bridge that is full
+     * speed; on a direction-and-speed driver it is a standstill. The operator
+     * drove it and reported "now backward not work" - so it is the latter, and
+     * the brush's two-input note does not generalise to the wheels. Do not
+     * re-derive this: the drive motors and the brush are different drivers. */
+    digitalWrite(dirPin, demand >= 0 ? HIGH : LOW);
     analogWrite(pwmPin, duty);
 }
 

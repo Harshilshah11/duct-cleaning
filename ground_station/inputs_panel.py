@@ -820,16 +820,26 @@ class JoystickView(QWidget):
         """The peak-wheel figure THROTTLE shows - four-way, so a diagonal is 0.
 
         Mirrors uno_serial.mix(): the dominant axis carries the command and a
-        stick held between two of them commands nothing, so the dot must fall to
-        zero in a corner rather than reporting a throttle the wheels never get.
+        stick held between two of them commands nothing, so the dot has to fall
+        to zero in a corner rather than reporting a throttle the wheels never get.
         """
         if self._x is None or self._y is None:
             return 0.0
-        strong = max(abs(self._x), abs(self._y))
-        weak = min(abs(self._x), abs(self._y))
-        if not strong or weak > 0.5 * strong:
-            return 0.0
-        return max(0.0, min(1.0, strong))
+        # ASK THE MIXER, do not re-derive. This used to re-implement the
+        # four-way gate here, which meant two copies of the steering law and a
+        # standing risk of the dot saying one thing while the wheels did
+        # another. mix() is now the only place the law lives, so the halo
+        # brightens exactly when a wheel is actually being driven.
+        #
+        # Imported LOCALLY because this module does not import uno_serial at the
+        # top - it only names it in comments. A module-level reference here would
+        # raise NameError on the first repaint.
+        import uno_serial as _us
+        # mix_target(), NOT mix(): mix() advances the corner ramp as a side
+        # effect and this runs on every repaint.
+        left, right, _ = _us.mix_target(self._x, self._y)
+        peak = max(abs(left), abs(right))
+        return max(0.0, min(1.0, peak / float(_us.MAX_PWM or 1)))
 
     def _tick(self):
         self._phase += 0.13
@@ -934,7 +944,17 @@ class JoystickView(QWidget):
         # That is the whole rule for this line: it is not an opinion about
         # orientation, it is whatever keeps THE DOT FOLLOWING THE HAND given
         # INVERT_X upstream. Change one, check the other.
-        ox = -self._x if live_x else 0.0
+        # NEGATION REMOVED 2026-09-01, and ONLY to cancel INVERT_X going to 1
+        # in inputs.py on the same change. The dot was already following the
+        # hand correctly; correcting the axis at the source would have mirrored
+        # it, so this sign moves with it and the display is left exactly as it
+        # was. Same bargain as every other entry in this log: the sign here is
+        # not an opinion about orientation, it is whatever keeps THE DOT
+        # FOLLOWING THE HAND given INVERT_X upstream.
+        # Sign paired with INVERT_X in inputs.py - see the note there. It exists
+        # to keep THE DOT FOLLOWING THE HAND across that flip, not to express an
+        # opinion about orientation. Change one, change the other.
+        ox = self._x if live_x else 0.0
         oy = self._y if live_y else 0.0
 
         # Lit on ANY departure from centre rather than at some display
@@ -966,11 +986,49 @@ class JoystickView(QWidget):
                        Qt.AlignCenter, f"no ADC · {dead}")
 
         r = 5.0
-        # 26, not the old 14: the dot's travel is pulled in so a fully deflected
-        # dot stops just short of the arrow it is pointing at instead of sitting
-        # on top of it. Widen this and they collide at full stick.
-        half = (box.width() - 28) / 2.0
-        dx, dy = cx + ox * half, cy + oy * half
+        # THE DOT REACHES THE EDGE. Operator, 2026-09-01: "i want to print on box
+        # edges so make this in all direction". Full stick has to LOOK full, and
+        # in the corners as well as on the axes, so the travel is the box itself
+        # less the dot's own radius - at 1.0 the dot sits tangent to the border,
+        # and at (1,1) it lands in the actual corner.
+        #
+        # This replaces a 14px inset per side whose stated reason was to stop a
+        # fully deflected dot colliding with the arrow it points at. That reason
+        # does not survive the request: the collision is the point. The dot
+        # arriving ON the lit arrow is what full deflection should look like, and
+        # keeping them apart cost the operator the top 14px of every direction -
+        # the stick hit its stop with the dot still visibly short of the edge.
+        #
+        # PER AXIS, and that is not cosmetic. This used box.width() for BOTH
+        # halves, so the moment the widget was not square the vertical travel was
+        # scaled by the horizontal size - on a wide box the dot could never reach
+        # the top or bottom, on a tall one it ran past them. Width for x, height
+        # for y; each axis now reaches its own edge whatever shape the layout
+        # gives this widget.
+        # ONE RADIUS, EVERY DIRECTION. Operator, 2026-09-01: "i want radius for
+        # all direction joystick radius movement" - after the edge change above
+        # had the dot travelling a SQUARE.
+        #
+        # A square envelope is wrong for this control and looks it. The stick is
+        # a gimbal: it sweeps a CIRCLE, and its stop is the same distance from
+        # centre whichever way the hand pushes. Against a square the diagonal is
+        # 1.41x the axis, so the dot shot 41% further into the corners than it
+        # ever went straight up - it left the rounded border entirely and implied
+        # a reach the hardware does not have.
+        #
+        # So: clamp the vector's LENGTH, not each axis separately, and swing it
+        # on a single radius. Full stick now puts the dot the same distance out
+        # in all directions, on the axes and in the corners alike, which is what
+        # the hand is actually doing.
+        #
+        # The radius takes the SMALLER half-dimension so the circle stays inside
+        # a non-square widget, and subtracts r so the dot rides tangent to the
+        # border rather than straddling it.
+        rad = min(box.width(), box.height()) / 2.0 - r
+        mag = math.hypot(ox, oy)
+        if mag > 1.0:
+            ox, oy = ox / mag, oy / mag
+        dx, dy = cx + ox * rad, cy + oy * rad
 
         # The breathing halo, UNDER the dot so the dot itself stays a hard,
         # precisely-placed mark - the position is the primary reading here and
@@ -1547,13 +1605,29 @@ def _build_fraction(fv):
     completions, not clips, so it would run to 3x the clip count. `clip` is
     1-based, hence the -1.
     """
+    # THE BUILDER'S OWN FIGURE WHEN IT OFFERS ONE, and it does. Only the job
+    # knows which stages it is going to run, and the guess below could not know:
+    # it divided by a fixed list of three - normalising, building, joining -
+    # when COMBINED_AFTER_SAVE means "building" never runs at all, and a
+    # while-recording pass skips "joining" as well because joining is a
+    # whole-session operation. The dial therefore filled only the fraction of
+    # stages that happened to execute and then stopped, looking wedged partway.
+    #
+    # recorder.FullViewBuilder counts its real steps and reports "overall".
+    overall = fv.get("overall")
+    if overall is not None:
+        return max(0.0, min(1.0, float(overall)))
+
+    # FALLBACK for a status dict from an older recorder that has no "overall".
+    # Same stage-and-clip guess as before, kept only so a mismatched pair still
+    # animates something rather than sitting at zero.
     total = max(1, int(fv.get("clips_total") or 1))
     clip = max(0, int(fv.get("clip") or 1) - 1)
     state = fv.get("state")
     stage = _BUILD_STAGES.index(state) if state in _BUILD_STAGES else 0
     frac = max(0.0, min(1.0, float(fv.get("frac") or 0.0)))
-    overall = (clip + (stage + frac) / float(len(_BUILD_STAGES))) / float(total)
-    return max(0.0, min(1.0, overall))
+    guess = (clip + (stage + frac) / float(len(_BUILD_STAGES))) / float(total)
+    return max(0.0, min(1.0, guess))
 
 
 class RoundSaveButton(QWidget):
@@ -2319,22 +2393,28 @@ class SessionView(QWidget):
         # runs, a tick when the footage is on the card, a cross when it is not.
         fv = status.get("full_view") or {}
         fv_state = fv.get("state")
-        if fv_state in ("queued", "normalising", "joining", "building"):
+        # A RUN IN PROGRESS OUTRANKS A BUILD, and the order matters now in a way
+        # it did not before. Clips are normalised WHILE the recording continues
+        # (see config.RECORD_SEGMENT_S), so a builder is usually running during a
+        # run - and with the build tested first the dial showed that build's
+        # percentage instead of the elapsed clock. The operator filmed it:
+        # "RECORDING 5:30" beside a dial reading 50%.
+        #
+        # Operator, 2026-09-01: "when recording start to only show timing of
+        # recording start in save icon and when stop to show process". So while
+        # the run is going the dial is the run's clock; the percentage belongs to
+        # the save, which is what is happening once the run has stopped.
+        if state in ("RECORDING", "PAUSED"):
+            # THE DIAL STARTS TURNING WHEN THE RUN DOES. It shows ACTIVITY, not
+            # a percentage - a recording has no known length to be a fraction of.
+            self.save_btn.set_status(
+                "busy", 0.0, label=hms(status.get("elapsed") or 0))
+        elif fv_state in ("queued", "normalising", "joining", "building"):
             self.save_btn.set_status("busy", _build_fraction(fv))
         elif fv_state == "error":
             self.save_btn.set_status("error", 1.0)
         elif fv.get("ready"):
             self.save_btn.set_status("done", 1.0)
-        elif state in ("RECORDING", "PAUSED"):
-            # THE DIAL STARTS TURNING WHEN THE RUN DOES, operator 2026-08-27:
-            # "when start recording to also start in save button start
-            # progress". It shows ACTIVITY, not a percentage - a recording has
-            # no known length to be a fraction of, so the dial sits at zero and
-            # spins rather than inventing a number that would only ever be
-            # wrong. The percentage arrives when the build does, and by then it
-            # means something.
-            self.save_btn.set_status(
-                "busy", 0.0, label=hms(status.get("elapsed") or 0))
         else:
             self.save_btn.set_status("idle", 0.0)
 
@@ -2593,12 +2673,13 @@ class InputsPanel(QFrame):
         if x is None or y is None:
             self.joy_text.setText("THROTTLE —")
         else:
-            # THE FASTER WHEEL, computed the way uno_serial.mix() computes it.
-            # Four-way control: the dominant axis takes the whole command, and a
-            # diagonal commands nothing - so a corner has to read 0% here too,
-            # or the panel would claim throttle the wheels are not getting.
-            strong, weak = max(abs(x), abs(y)), min(abs(x), abs(y))
-            demand = strong if strong and weak <= 0.5 * strong else 0.0
+            # THE FASTER WHEEL, taken FROM uno_serial.mix() rather than worked
+            # out again here. Whatever the steering law is, this reads the
+            # faster of the two wheels it actually returns, so the number can
+            # never claim a throttle the wheels are not being given.
+            import uno_serial as _us          # local: see _demand() above
+            left, right, _ = _us.mix_target(x, y)   # pure - see _demand()
+            demand = max(abs(left), abs(right)) / float(_us.MAX_PWM or 1)
             self.joy_text.setText(f"THROTTLE {demand * 100:.0f}%")
 
         pot = state.get("pot") or {}

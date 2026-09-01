@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import math
 import os
 import sys
 import threading
@@ -100,6 +101,26 @@ MAX_PWM = int(os.environ.get("UNO_MAX_PWM", "255"))
 # reader coasts the robot to a stop instead of pinning the last demand forever.
 SAMPLE_STALE_S = 0.25
 
+# The same idea for the LAMP, but far more patient. 0 makes it share
+# SAMPLE_STALE_S again.
+#
+# WHY THE LAMP GETS ITS OWN NUMBER. 250 ms is the right answer for anything that
+# MOVES: a wheel or a rod acting on a reading that may no longer be true is a
+# robot running away, so the honest response to a missing sample is to stop. A
+# lamp cannot run away. The worst a stale reading does there is leave the duct
+# lit at slightly the wrong brightness for a moment.
+#
+# AND THE COST OF BEING STRICT IS REAL. The pot reading is pushed from the UI
+# thread, so a UI thread that gets no CPU for 250 ms - measured on this rig, it
+# waits about 600 ms in every 5 seconds - sends light=0 for those frames. The
+# operator sees the lamp switch off and on while driving, reported twice as a
+# lighting fault when it is a scheduling one. Two seconds rides over any gap the
+# scheduler produces while still going dark on a reader that has genuinely died.
+#
+# NOT EXTENDED TO THE BRUSH, deliberately: a spinning brush is a motion hazard
+# and belongs with the wheels on the strict timer.
+LIGHT_STALE_S = float(os.environ.get("UNO_LIGHT_STALE_S", "2.0"))
+
 # How long to wait before looking for the board again. The Uno is routinely
 # plugged in after the viewer is already up (and re-enumerates on every replug),
 # so the link has to keep looking -- one that only ever connects at startup
@@ -126,26 +147,93 @@ def find_port():
     return None
 
 
-# How far off a cardinal direction the stick may stray before the command is
-# dropped - see mix(). It is the ratio of the weaker axis to the stronger one, so
-# 0.5 means the off-axis component must be at most half the main one, which is a
-# sector of about 27 degrees either side of each of the four directions.
+# How far off a cardinal the stick may stray before the command is dropped - see
+# mix(). It is the ratio of the weaker axis to the stronger one.
 #
-# Raise it toward 1.0 to narrow the dead corners, lower it to widen them. At 0 a
-# perfectly clean cardinal is the only thing that moves at all, which no hand can
-# hold; 0.5 is generous enough to push against the gate without thinking about it
-# and still leaves an unambiguous gap between the four.
-AXIS_MARGIN = float(os.environ.get("UNO_AXIS_MARGIN", "0.5"))
+# 0.15 on the operator's instruction 2026-09-01: "only work on center, not any
+# some right and left, in all direction only in center work". At the previous
+# 0.5 a direction still answered with the stick a full 27 degrees off its axis,
+# which reads as the robot obeying a lazy input; at 0.15 it is about 8 degrees
+# and the stick has to be genuinely on the axis.
+#
+# THE FLOOR IS THE HAND, NOT THE MATHS. Lower values keep working - 0.05 is about
+# 3 degrees - but a bare stick has no detent to find, so past some point the
+# operator is holding a position they cannot feel and the robot reads as
+# unresponsive rather than precise. 0.15 is tight enough to refuse a sloppy input
+# and loose enough to hold on purpose.
+# HOW FAR OFF A CARDINAL the stick may stray and still count as that cardinal,
+# as a RATIO of the two axes so it behaves the same near the centre as at full
+# deflection. Inside it, forward means straight forward and right means spin;
+# outside it, mix() hands the whole command to one wheel and stops the other.
+# Raise it to make straight-ahead easier to hold, lower it to reach the
+# one-wheel turn sooner.
+AXIS_MARGIN = float(os.environ.get("UNO_AXIS_MARGIN", "0.10"))
 
 
-def mix(x, y):
-    """Arcade mix: stick to (left, right) in -MAX_PWM..MAX_PWM.
+# HOW FAST A CORNER IS ALLOWED TO COME ON AND GO OFF, in PWM counts per second.
+# Operator, 2026-09-01: "make slowly on and off acceleration and deacceleration
+# in UP+RIGHT, UP+LEFT, DOWN+RIGHT, DOWN+LEFT - in only this 4, not in other
+# forward backward left right".
+#
+# 400 puts a standstill-to-full corner at about 0.64s, and the same coming off.
+# Raise it for a snappier corner, lower it for a gentler one.
+#
+# THE CARDINALS ARE DELIBERATELY NOT RAMPED. Straight ahead, straight back and
+# both spins still respond instantly, which is what the operator asked for and
+# also what keeps a stop a stop - see _ramp_reset below.
+DIAG_RAMP_PWM_PER_S = float(os.environ.get("UNO_DIAG_RAMP_PWM_PER_S", "400"))
 
-    FOUR WAY: forward, back, spin right, spin left. A diagonal is a dead stop -
-    see AXIS_MARGIN and the note in the body.
+# Ramp state. A dict rather than three globals so the reset is one call and
+# cannot half-happen.
+_ramp = {"l": 0.0, "r": 0.0, "t": None}
+
+# mix() runs on the drive thread while the UI thread repaints. Both reached
+# _ramp unguarded until 2026-09-01. The critical section is four arithmetic ops,
+# so this is uncontended in practice, and it makes the ramp's timing mean what
+# it says no matter who else is asking.
+_ramp_lock = threading.Lock()
+
+
+def _ramp_reset(left_pwm=0.0, right_pwm=0.0):
+    """Abandon any ramp in progress and hold these values as the new start.
+
+    Called on every non-diagonal command, INCLUDING the stop paths. A ramp that
+    survived a stop would keep feeding the wheels the tail of a turn after the
+    stick was released, so a stop always lands whole and immediately.
     """
+    _ramp["l"] = float(left_pwm)
+    _ramp["r"] = float(right_pwm)
+    _ramp["t"] = None
+
+
+def _approach(current, target, step):
+    """Move current toward target by at most step."""
+    if step <= 0.0:
+        return current
+    delta = target - current
+    if delta > step:
+        return current + step
+    if delta < -step:
+        return current - step
+    return target
+
+
+def mix_target(x, y):
+    """The steering law itself: stick -> (left, right, diagonal), UNRAMPED.
+
+    Pure - no state, no side effects, safe to call from any thread and as often
+    as you like. Returns floats in -MAX_PWM..MAX_PWM plus a flag saying whether
+    the corner branch was taken.
+
+    Cardinals drive as they always did. Off a cardinal the outer wheel drives
+    and the inner one eases to a standstill at 45 degrees, then stays stopped
+    out to the spin. The nine-row table in the body is the acceptance test.
+    """
+    # Three-tuple like every other exit, and NO _ramp_reset here: this function
+    # is the pure law and mix() owns all the ramp state. Resetting from inside
+    # it would have made the panel's display calls clear the drive loop's ramp.
     if x is None or y is None:
-        return 0, 0
+        return 0.0, 0.0, False
     if abs(x) < DEADZONE:
         x = 0.0
     if abs(y) < DEADZONE:
@@ -184,43 +272,300 @@ def mix(x, y):
     # normalisation removed. Spin needs no special case: at zero forward the
     # shape is already (+1, -1) and the magnitude is |x|, so it falls out of the
     # same two lines and is continuous with everything around it.
-    # FOUR WAY ONLY. Operator, 2026-09-01: "only make forward backward right
-    # and left, not a perfect turn, and in all corner not any movement".
+    # ONE WHEEL ON A DIAGONAL, THE OTHER STOPPED DEAD. Operator, 2026-09-01:
+    # "not any other tyre move in between both forward to right, move only left
+    # motor run forward, right is stop, thats it no other".
     #
-    # One axis at a time. The stick is read as a direction pad rather than as a
-    # proportional mixer: whichever axis is dominant takes the whole command, and
-    # a stick held between two of them commands NOTHING.
+    # This replaces a continuous arc that eased the inner wheel down through zero
+    # and on into reverse across the quadrant. The operator does not want the
+    # easing and does not want the reverse: between the two cardinals there is
+    # ONE behaviour, the outer wheel driving and the inner one stopped, and it is
+    # the same behaviour everywhere in that space.
     #
-    #     forward / back .... both wheels together, at the stick's throttle
-    #     right / left ...... wheels opposed, turning on the spot
-    #     any diagonal ...... stopped
+    #     stick straight up ...... both wheels forward, together
+    #     ANYWHERE in between .... outer wheel alone, inner STOPPED
+    #     stick straight right ... wheels opposed, turning on the spot
     #
-    # THE DEAD CORNER IS THE POINT, not a side effect. A duct is a straight run
-    # with corners in it; a robot that can only be asked for one of four things
-    # cannot be accidentally asked for a curve, and the operator always knows
-    # which of the four is happening. Everything that made this a proportional
-    # mixer - arc turns, blended spin, a shape scaled by throttle - is gone
-    # rather than disabled, because a half-removed steering law is worse than
-    # either whole one.
+    # So the diagonal is not a blend of its two neighbours and is not trying to
+    # be. It is a third, distinct thing - a one-wheel turn - and the operator can
+    # tell which of the three they have by what the robot does, with no arc in
+    # between to be somewhere in the middle of.
     #
-    # AXIS_MARGIN decides how far off a cardinal the stick may stray before the
-    # command is dropped. It is a RATIO of the two axes rather than an angle, so
-    # it behaves the same at the edge of the gate as it does near the centre.
+    # WHICH wheel is the stopped one falls out of the sign of x, and WHICH WAY
+    # the moving one turns falls out of the sign of y, so all four diagonals come
+    # from the same two lines: up-and-right runs the left wheel forward, and
+    # down-and-left runs the right wheel back, without either being special-cased.
     strong = max(abs(x), abs(y))
     weak = min(abs(x), abs(y))
-
     if strong == 0.0:
-        return 0, 0
-    if weak > AXIS_MARGIN * strong:
-        # In a corner: no movement at all.
-        return 0, 0
+        return 0.0, 0.0, False
 
-    if abs(y) >= abs(x):
-        left = right = y                      # forward / back, together
+    # max(), not hypot(): the throttle has to read full with the stick at its
+    # stop in ANY direction. hypot is 1.41 on a diagonal, which would clip, and
+    # would make a corner-held stick faster than a forward-held one.
+    mag = strong
+
+    diagonal = weak > AXIS_MARGIN * strong
+
+    if not diagonal:
+        # On a cardinal, within tolerance. Unchanged from before.
+        if abs(y) >= abs(x):
+            left = right = y                  # forward / back, together
+        else:
+            # -x, x. Flipped 2026-09-01: the operator drove it and reported
+            # "my left turn is right and right turn is left", with the corners
+            # explicitly correct - "Up+right and UP+LEFT its perfect". So this
+            # is the spin alone, and the corners must not move with it.
+            #
+            # THIS DELIBERATELY DISAGREES WITH THE CORNER BRANCH, and that costs
+            # a step at AXIS_MARGIN. It is not an oversight and it cannot be
+            # tidied away: the corner drives one wheel forward with the other
+            # stopped, and the spin the operator wants rotates the opposite way,
+            # so BOTH wheels have to change as the stick crosses that edge.
+            # No sign choice here makes the two continuous - only changing one
+            # of the two behaviours would, and both are what was asked for.
+            #
+            # The step is confined to the last few degrees before the axis, and
+            # the spin-side taper below is flat so it lands in one place rather
+            # than ramping toward a value it then jumps away from.
+            left, right = -x, x               # right / left, on the spot
+    # SWAPPED AND NEGATED AGAINST THE CARDINALS, and that is not a typo - it is
+    # measured. Driven on the hardware 2026-09-01, the operator reported both
+    # diagonals coming out mirrored AND reversed from what this function emits:
+    #
+    #     emitted L -230, R 0   ->   robot stopped the LEFT and ran the RIGHT BACKWARD
+    #     emitted L 0, R -230   ->   robot stopped the RIGHT and ran the LEFT BACKWARD
+    #
+    # Both observations agree, so the two lines below apply the inverse of that:
+    # the drive goes on the OTHER output and with the sign flipped, which lands
+    # the robot on what was actually asked for - up-and-right runs the left wheel
+    # forward with the right stopped.
+    #
+    # WHY THIS DISAGREES WITH THE CARDINAL BRANCH ABOVE IS NOT YET EXPLAINED, and
+    # whoever touches this next should know that. A plain swap in the output
+    # mapping would have broken straight-right too, and it did not - spin turns
+    # the correct way and straight ahead drives the correct way, both confirmed
+    # on the hardware. So this is not a simple crossed pair of motor leads; only
+    # the path that carries a ZERO on one wheel behaves this way, which points at
+    # the Uno's DIR handling when one side is commanded to a standstill rather
+    # than at anything in this file.
+    #
+    # WHAT TO DO ABOUT IT: check what Outputs.cpp does with DIR when duty is 0 on
+    # ONE motor - the brush had exactly this shape of fault and was fixed by
+    # dropping both lines rather than just the PWM. If that turns out to be the
+    # cause, fix it there and these two lines go back to matching the cardinals.
+    # Until then this stays, because it is what makes the robot drive correctly.
+    # ONE RULE, matching the cardinals above: whichever wheel is on the inside
+    # of the turn stops, and the outer one drives in the direction y asks for.
+    #
+    # This spent 2026-09-01 as a pair of hand-tuned opposite signs, compensating
+    # for a wheel that was not actually stopping - see the note now in
+    # Outputs.cpp::motorApply. With the firmware dropping DIR at zero duty, the
+    # compensation is not just unnecessary, it is wrong, so it is gone. If a
+    # diagonal ever misbehaves again, fix the driver, not the sign here.
     else:
-        left, right = x, -x                   # right / left, on the spot
+        # THE INNER WHEEL EASES DOWN, IT DOES NOT DROP. Operator, 2026-09-01:
+        # "make this not direct stop, its slowly stop when joystick move, and
+        # when its arrive top right to stop" - and, said twice, ONLY here: "not
+        # in all, only + logic, forward backward left right is perfect". So the
+        # four cardinals above are untouched and this taper lives entirely
+        # inside the corner. THIS IS AN else: AND MUST STAY ONE - written flat,
+        # it runs after the cardinal branch and overwrites it, which turned both
+        # spins into one-wheel turns the first time it went in.
+        #
+        # Leaving a cardinal, the inner wheel starts at the SAME speed as the
+        # outer - the robot is still going straight - and falls away as the
+        # stick swings across, stopping dead at the 45 degree corner:
+        #
+        #     just off straight ... inner ~= outer, barely a curve
+        #     halfway to the corner  inner about half the outer, a wide arc
+        #     the corner itself .... inner STOPPED, pivoting on it
+        #     past the corner ...... stays stopped, until the spin margin
+        #
+        # t IS NORMALISED ACROSS THE MARGIN, not raw, and that is what makes it
+        # smooth. weak/strong does not start at 0 where the taper begins - it
+        # starts at AXIS_MARGIN, because everything below that was claimed by
+        # the cardinal branch. The raw ratio would hand the inner wheel 85% the
+        # instant it left the cardinal, a 15% step exactly where the operator
+        # asked for no step at all. Rescaling puts the taper's zero where the
+        # cardinal actually ends, so the two meet at full speed.
+        #
+        # PAST THE CORNER the inner wheel stays stopped rather than reversing.
+        # That is the whole span of the one-wheel turn; reverse is the spin's
+        # job, and the cardinal branch reaches it at its own margin.
+        # THE DRIVEN WHEEL FOLLOWS y: forward in the top corners, backward in the
+        # bottom two, so reverse mirrors forward.
+        #
+        # This was set to -mag twice on 2026-09-01, driving forward in all four
+        # corners, and reverted both times. -mag makes the bottom corners drive
+        # the robot FORWARD while straight-down still reverses, so easing off
+        # straight-back into a corner flips both wheels at AXIS_MARGIN. copysign
+        # puts the corner on the same side of a standstill as the cardinal beside
+        # it and that edge does not exist.
+        # BOTH BOTTOM CORNERS DRIVE FORWARD. Operator, 2026-09-01, after the
+        # down-and-right flip produced no visible change on the robot: "in this
+        # you flipped but not any changes show in this bot ... and also problem
+        # in DOWN + LEFT +0 +255 untouched, its not -255, so make this both".
+        # copysign, NOT -mag. Both branches of the conditional that used to be
+        # here evaluated to -mag, so EVERY corner drove forward while
+        # straight-down still reversed: leaning a reversing stick sideways past
+        # AXIS_MARGIN flipped both wheels from full back to full forward. Found
+        # by audit 2026-09-01. copysign puts each corner on the same side of a
+        # standstill as the cardinal it sits beside.
+        # THE TWO BOTTOM CORNERS ARE DEAD. Operator, 2026-09-01: "now off
+        # down+left and down+right, but not any change on up corner".
+        #
+        # Returned as a zero command that is STILL FLAGGED diagonal, deliberately,
+        # so mix() runs it through the ramp instead of snapping. Leaning a
+        # reversing stick into a corner therefore eases the wheels down to a stop
+        # over the ramp time rather than cutting them, which is the "full
+        # deacceleration" asked for in the same message. Returning early here
+        # would have made it a cliff.
+        #
+        # The four cardinals are untouched: straight down still reverses both
+        # wheels at full, and only the diagonal between them is dead.
+        if y > 0.0:
+            return 0.0, 0.0, True
 
-    return int(round(left * MAX_PWM)), int(round(right * MAX_PWM))
+        drive = math.copysign(mag, y)
+
+        # LEFT+DOWN DRIVES THE OTHER WHEEL, but at the NORMAL direction for its
+        # half of the stick. Operator, 2026-09-01, in two passes on the robot:
+        # first "its run opposite side motor run, and also in other direction",
+        # then - once the wheel was right - "now its motor side done, only
+        # direction revert". So the wheel-choice exception this corner used to
+        # carry is gone, which is what moved the drive onto the other output,
+        # and drive keeps its sign from y like every other corner.
+        #
+        # Net effect: no direction exception survives anywhere. All four corners
+        # take their direction from y again, and left+down differs from the rule
+        # only in holding its inner wheel fully off instead of tapering it.
+        ratio = weak / strong
+        span = 1.0 - AXIS_MARGIN
+
+        if x < 0.0 and y > 0.0:
+            # LEFT+DOWN HOLDS THE INNER WHEEL FULLY OFF, no taper at all.
+            # Operator, 2026-09-01: "right side motor fully off during between
+            # left+down". Every other quadrant eases the inner wheel down across
+            # the arc; in this one it is dead the moment the stick leaves the
+            # cardinal, so left+down is a clean one-wheel turn at every angle
+            # rather than an arc that tightens into one.
+            inner = 0.0
+        elif abs(y) >= abs(x):
+            # STRAIGHT SIDE of the corner. ratio runs AXIS_MARGIN -> 1 as the
+            # stick swings from the cardinal to 45 degrees, and the inner wheel
+            # falls from full to a standstill across it.
+            t = (ratio - AXIS_MARGIN) / span
+            inner = drive * (1.0 - max(0.0, min(1.0, t)))
+        else:
+            # SPIN SIDE. ratio now runs back 1 -> AXIS_MARGIN as the stick
+            # carries on toward the left/right axis, and the inner wheel keeps
+            # going the way it was already headed - from its standstill at the
+            # corner into full reverse at the spin.
+            #
+            # THIS USED TO BE FLAT ZERO, and that was the bug. The inner wheel
+            # sat stopped across the whole outer half of the quadrant and then
+            # jumped to full reverse the instant the cardinal branch took over.
+            # Carrying the taper through removes the jump: every one of the four
+            # quadrants is now continuous from straight, through the one-wheel
+            # turn at the corner, into the spin, with no step anywhere.
+            # FLAT ZERO on this side, not a taper. It briefly ramped toward
+            # the spin so the two would meet continuously; that only works
+            # while the spin agrees with the corner, and 2026-09-01 it stopped
+            # agreeing - see the note in the cardinal branch above. Ramping
+            # toward a value the cardinal then contradicts gives TWO changes of
+            # direction instead of one, which is the erratic forward/back
+            # flipping the operator hit before. Holding the inner wheel stopped
+            # across the whole outer half puts the single unavoidable step at
+            # the margin and nowhere else.
+            inner = 0.0
+
+        # WHICH WHEEL DRIVES DEPENDS ON BOTH SIGNS, so that reverse mirrors
+        # forward. Operator, 2026-09-01, on down-and-right: "i want right
+        # backward and left stop, thats it - now its problem, when i near to
+        # left its move to turn left".
+        #
+        # NOTE THE FRAME. The operator describes PHYSICAL WHEELS, and on this rig
+        # the `right` output drives the physical LEFT wheel - every test today
+        # has shown it. Read physically, the four corners are a clean mirror set
+        # and this line is what produces them:
+        #
+        #     up + right ..... left forward,   right stopped
+        #     up + left ...... right forward,  left stopped
+        #     down + right ... right backward, left stopped
+        #     down + left .... left backward,  right stopped
+        #
+        # Keying off x alone kept the SAME output driving whether the stick was
+        # up or down, which reversed the turn under reverse: down-and-right backed
+        # the left wheel and swung the robot LEFT. Choosing on both signs makes
+        # the two diagonally opposite corners share an assignment, which is what
+        # `(x > 0) == (y < 0)` picks out.
+        # DIAGONALLY OPPOSITE CORNERS SHARE AN ASSIGNMENT, so reverse mirrors
+        # forward. The operator drove every arrangement of these four corners on
+        # 2026-09-01 and settled here; this table is the acceptance test:
+        #
+        #     straight up ..... L -255  R -255
+        #     UP + RIGHT ...... L   +0  R -255
+        #     spin RIGHT ...... L -255  R +255
+        #     DOWN + RIGHT .... L +255  R   +0
+        #     straight down ... L +255  R +255
+        #     DOWN + LEFT ..... L   +0  R +255
+        #     spin LEFT ....... L +255  R -255
+        #     UP + LEFT ....... L -255  R   +0
+        #
+        # Three simpler rules were tried on the robot first and none survived it:
+        # keying off x alone made the bottom corners steer like the top ones
+        # rather than mirroring them; an exception bolted on for down-and-right
+        # made the two bottom corners identical to each other; and copying the
+        # top pair wholesale left the bottom half of the stick driving forward.
+        # Verify against the table above before touching this line.
+        outer_on_right = (x > 0.0) == (y < 0.0)
+
+
+        if outer_on_right:
+            left, right = inner, drive
+        else:
+            left, right = drive, inner
+
+    return left * MAX_PWM, right * MAX_PWM, diagonal
+
+
+def mix(x, y):
+    """Stick -> (left, right) in -MAX_PWM..MAX_PWM, with the corner ramp applied.
+
+    THE DRIVE LOOP IS THE ONLY THING THAT MAY CALL THIS. It advances the ramp as
+    a side effect, so every extra caller makes corners accelerate faster than
+    DIAG_RAMP_PWM_PER_S claims - inputs_panel was calling it twice per repaint
+    for the halo and the throttle text, which had corners reaching full at
+    roughly three times the configured rate. Anything that only wants to DISPLAY
+    the demand calls mix_target() instead.
+    """
+    left_pwm, right_pwm, diagonal = mix_target(x, y)
+
+    with _ramp_lock:
+        if not diagonal:
+            # Cardinals pass straight through, and reseat the ramp where they
+            # leave the wheels so the next corner accelerates FROM the current
+            # speed rather than from wherever the last corner ended.
+            _ramp_reset(left_pwm, right_pwm)
+            return int(round(left_pwm)), int(round(right_pwm))
+
+        # RATE-LIMITED, not smoothed. A slew limit reaches the target in a known
+        # time and then sits exactly on it; a low-pass filter would approach it
+        # asymptotically and never quite arrive, which on a wheel means a corner
+        # that is always slightly less than asked for.
+        now = time.monotonic()
+        prev = _ramp["t"]
+        _ramp["t"] = now
+        # dt is 0 on the first frame of a corner, so it begins from the speed
+        # the cardinal left behind instead of jumping. Capped at 200ms so a
+        # stalled sender cannot bank up a step and deliver the corner at once.
+        dt = 0.0 if prev is None else min(0.2, max(0.0, now - prev))
+        step = DIAG_RAMP_PWM_PER_S * dt
+
+        _ramp["l"] = _approach(_ramp["l"], left_pwm, step)
+        _ramp["r"] = _approach(_ramp["r"], right_pwm, step)
+        return int(round(_ramp["l"])), int(round(_ramp["r"]))
 
 
 # Ceiling on the linear actuator's PWM, separate from MAX_PWM: the rod and the

@@ -136,13 +136,23 @@ def renice_worker_threads(nice_to=None):
             continue
         try:
             # PRIO_PROCESS with a TID is per-thread on Linux, the same way
-            # sched_setaffinity(0, ...) is. Only ever RAISES the nice value:
-            # lowering one needs privileges this process does not have, and
-            # would be the wrong direction anyway.
+            # sched_setaffinity is. Only ever RAISES the nice value: lowering one
+            # needs privileges this process does not have, and would be the wrong
+            # direction anyway.
             if os.getpriority(os.PRIO_PROCESS, int(tid)) < nice_to:
                 os.setpriority(os.PRIO_PROCESS, int(tid), nice_to)
                 changed += 1
         except (OSError, ValueError, PermissionError):
+            pass
+        try:
+            # AND keep them off the control path's core - see
+            # config.STREAM_CPU_CORES. Passing a TID rather than 0 sets that
+            # thread's affinity from here, which is what lets one thread arrange
+            # another's without either of them cooperating.
+            cores = config.stream_cores()
+            if cores and os.sched_getaffinity(int(tid)) != cores:
+                os.sched_setaffinity(int(tid), cores)
+        except (OSError, ValueError):
             continue
     return changed
 
