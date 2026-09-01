@@ -416,7 +416,36 @@ class CameraRecorder(threading.Thread):
             frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
         self._writer.write(frame)
 
+    def _pin(self):
+        """Confine THIS thread to the recording cores - see config.record_cores.
+
+        os.sched_setaffinity(0, ...) applies to the CALLING THREAD on Linux, not
+        to the whole process, which is what makes it usable from inside one
+        thread of a program whose other threads must stay free to roam.
+
+        Best effort by design: any failure leaves the thread scheduled normally,
+        which is exactly how it behaved before this existed. Encoding on the
+        wrong core is a performance question; refusing to encode is a lost
+        recording.
+        """
+        try:
+            cores = config.record_cores()
+            if cores:
+                os.sched_setaffinity(0, cores)
+        except Exception:
+            pass
+        # AND yield to anything more urgent on those cores - see
+        # config.RECORD_THREAD_NICE. os.nice() applies to the calling THREAD on
+        # Linux, the same way sched_setaffinity does, so this lowers the encoder
+        # without touching the UI or the drive loop.
+        try:
+            if config.RECORD_THREAD_NICE:
+                os.nice(config.RECORD_THREAD_NICE)
+        except Exception:
+            pass
+
     def run(self):
+        self._pin()
         _load_cv2()
         period = 1.0 / max(1.0, config.RECORD_FPS)
         next_tick = time.monotonic()
@@ -809,7 +838,13 @@ class FullViewBuilder(threading.Thread):
         # The STOP-time pass is left at normal priority deliberately. Nothing is
         # being driven then, the operator is waiting on it, and it should have
         # the machine.
-        nice = [] if self._do_join else ["nice", "-n", "19"]
+        # Same cores as the live encoders - see config.RECORD_CPU_CORES. nice
+        # alone only decides who wins a core once two things want it; taskset
+        # decides which cores are contended at all, so the UI keeps the rest
+        # whatever the scheduler makes of the priorities.
+        cores = config.record_cores()
+        pin = ["taskset", "-c", ",".join(str(c) for c in sorted(cores))] if cores else []
+        nice = [] if self._do_join else pin + ["nice", "-n", "19"]
         threads = [] if self._do_join else ["-threads", "1"]
         cmd = nice + ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                "-nostdin"] + threads + [

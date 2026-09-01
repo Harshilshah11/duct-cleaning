@@ -799,6 +799,35 @@ class GroundStationWindow(QWidget):
         self.corr_timer.timeout.connect(self.log_correlation)
         self.corr_timer.start(1000)
 
+        # KEEP GSTREAMER BEHIND THE UI - see stream.renice_worker_threads and
+        # config.STREAM_THREAD_NICE. Periodic rather than once at startup because
+        # GStreamer creates these threads itself and makes a fresh set on every
+        # camera reconnect; a set that was never lowered is a set competing with
+        # the UI again, and reconnects are routine on this rig.
+        #
+        # Ten seconds is far more often than reconnects happen and costs a walk
+        # of /proc/self/task, which is a few dozen small reads.
+        self.nice_timer = QTimer(self)
+        self.nice_timer.timeout.connect(self._renice_workers)
+        self.nice_timer.start(10000)
+        self._renice_workers()
+
+    def _renice_workers(self):
+        """Lower GStreamer's decode threads. Never allowed to disturb the UI.
+
+        The import is LOCAL because main.py pulls names out of stream rather than
+        importing the module ("from stream import RTSPStream, ..."), so there is
+        no module object at this scope. The first version of this called
+        stream.renice_worker_threads() and raised NameError into the except
+        below on every tick - silently, which is what made it look like the
+        renice simply had no effect.
+        """
+        try:
+            import stream as _stream
+            _stream.renice_worker_threads()
+        except Exception:
+            pass
+
     # -- actions -------------------------------------------------------------
 
     def _install_shortcuts(self):

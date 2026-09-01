@@ -126,24 +126,23 @@ def find_port():
     return None
 
 
-# Throttle below which the stick still spins the robot on the spot, and above
-# which it steers proportionally - see mix(). 0 disables spin entirely.
+# How far off a cardinal direction the stick may stray before the command is
+# dropped - see mix(). It is the ratio of the weaker axis to the stronger one, so
+# 0.5 means the off-axis component must be at most half the main one, which is a
+# sector of about 27 degrees either side of each of the four directions.
 #
-# It has to be a BAND rather than a point. DEADZONE snaps a small y to exactly
-# zero, so a point test makes spin the behaviour for a whole strip of stick
-# travel and then drops it abruptly at the edge - which is exactly the jolt this
-# constant exists to remove. A quarter of full throttle is enough travel for the
-# hand to feel the change happen rather than trip over it.
-SPIN_ZONE = float(os.environ.get("UNO_SPIN_ZONE", "0.25"))
+# Raise it toward 1.0 to narrow the dead corners, lower it to widen them. At 0 a
+# perfectly clean cardinal is the only thing that moves at all, which no hand can
+# hold; 0.5 is generous enough to push against the gate without thinking about it
+# and still leaves an unambiguous gap between the four.
+AXIS_MARGIN = float(os.environ.get("UNO_AXIS_MARGIN", "0.5"))
 
 
 def mix(x, y):
     """Arcade mix: stick to (left, right) in -MAX_PWM..MAX_PWM.
 
-    y drives both wheels together (forward/back), x drives them in opposition
-    (turn). Full deflection on both axes would otherwise demand 2.0 from one
-    wheel, so the pair is scaled down together -- clipping each wheel
-    independently instead would bend the turn as the robot speeds up.
+    FOUR WAY: forward, back, spin right, spin left. A diagonal is a dead stop -
+    see AXIS_MARGIN and the note in the body.
     """
     if x is None or y is None:
         return 0, 0
@@ -152,73 +151,74 @@ def mix(x, y):
     if abs(y) < DEADZONE:
         y = 0.0
 
-    # PROPORTIONAL STEERING, 2026-08-31. Operator: "in half forward and right to
-    # its slowly work one side" - a half-deflected stick should give a gentle
-    # turn, and it did not.
+    # SHAPE FROM THE MIX, SPEED FROM THE STICK. Two things have to be true at
+    # once here, and every earlier version of this got one of them by giving up
+    # the other.
     #
-    # WHAT THE OLD SUM DID WRONG, which is worth keeping because the formula
-    # itself is the classic one and looks right:
+    #   1. Sweeping full-right round to full-forward must move the inner wheel
+    #      smoothly from full reverse, through stopped, to full forward - while
+    #      the outer wheel stays pinned at full. Operator, 2026-08-31: "when
+    #      slowly right up to decrease right motor... when full up and right to
+    #      right motor stop... when full up and right to slowly left to make
+    #      increase speed... and in center up to full forward".
     #
-    #     left = y + x        right = y - x       then scale by the peak
+    #   2. Half a stick must be half the speed. The same operator, earlier: "in
+    #      half forward and right to its slowly work one side".
     #
-    # At full forward + full right that gives 2 and 0, scaled to 255 and 0 - the
-    # correct answer. At HALF and half it gives 1.0 and 0.0, and the peak scaling
-    # pushes that back up to 255 and 0 as well. Identical output from half the
-    # stick: the same sharpest-possible turn at full speed, with the throttle
-    # position thrown away. Every turn was the hardest turn.
+    # THE CLASSIC FORMULA GIVES (1) AND NOT (2). left = y+x, right = y-x scaled
+    # by the peak has exactly the right SHAPE around that arc - it is why it is
+    # the classic - but the scaling renormalises every input back to full scale,
+    # so half a stick drove as hard as a whole one. Every turn was the hardest
+    # turn.
     #
-    # The fix is to steer by REDUCING THE INNER WHEEL from the throttle, rather
-    # than adding and subtracting and renormalising:
+    # THE PROPORTIONAL FORM GAVE (2) AND NOT (1). outer = y, inner = y(1-|x|)
+    # honours the throttle, but the outer wheel is then tied to y alone: pushing
+    # up from full-right dropped the outer wheel to a quarter throttle instead
+    # of holding it, and the inner jumped from full reverse to a standstill with
+    # nothing in between. It also needed a special case at zero throttle to spin
+    # at all, and that special case was a cliff.
     #
-    #     outer = y                    the throttle, untouched
-    #     inner = y * (1 - |x|)        eased off in proportion to the turn
+    # Separating the two settles it. The peak-normalised pair is a pure
+    # DIRECTION - which way each wheel turns and in what ratio - and multiplying
+    # it by how far the stick is actually pushed restores the throttle the
+    # normalisation removed. Spin needs no special case: at zero forward the
+    # shape is already (+1, -1) and the magnitude is |x|, so it falls out of the
+    # same two lines and is continuous with everything around it.
+    # FOUR WAY ONLY. Operator, 2026-09-01: "only make forward backward right
+    # and left, not a perfect turn, and in all corner not any movement".
     #
-    # so a quarter turn keeps three quarters of the inner wheel, a half turn
-    # keeps half, and only a FULL turn stops it dead. Both the throttle and the
-    # steering now survive to the wheels, which is what makes a half-stick input
-    # a half-speed gentle turn.
+    # One axis at a time. The stick is read as a direction pad rather than as a
+    # proportional mixer: whichever axis is dominant takes the whole command, and
+    # a stick held between two of them commands NOTHING.
     #
-    # SPIN ON THE SPOT IS KEPT, and it has to be a separate case: the formula
-    # above multiplies by y, so with no throttle it yields nothing at all and the
-    # robot could not be turned while stationary. With y at zero the wheels go
-    # opposite ways as before.
-    # SPIN IS BLENDED IN, NOT SWITCHED TO, and that blend is the whole reason
-    # this is not two lines. Operator, 2026-08-31: "when i slightly right down to
-    # left tyre reverse and right stop".
+    #     forward / back .... both wheels together, at the stick's throttle
+    #     right / left ...... wheels opposed, turning on the spot
+    #     any diagonal ...... stopped
     #
-    # The first version of this special-cased y == 0 for spin-on-the-spot. That
-    # made a cliff either side of centre, because DEADZONE snaps a small y to
-    # exactly zero: sweeping the stick down through the middle at full right
-    # went L=5 R=0, then L=255 R=-255, then L=-5 R=0. A full-power spin, entered
-    # and left within a few counts of stick travel. Nothing in the arithmetic was
-    # wrong; the two behaviours simply did not meet.
+    # THE DEAD CORNER IS THE POINT, not a side effect. A duct is a straight run
+    # with corners in it; a robot that can only be asked for one of four things
+    # cannot be accidentally asked for a curve, and the operator always knows
+    # which of the four is happening. Everything that made this a proportional
+    # mixer - arc turns, blended spin, a shape scaled by throttle - is gone
+    # rather than disabled, because a half-removed steering law is worse than
+    # either whole one.
     #
-    # So the two are mixed over SPIN_ZONE of throttle instead. At rest the robot
-    # spins as before; by a quarter throttle it steers proportionally; in between
-    # it is a weighted sum of the two, which is continuous everywhere and cannot
-    # produce a jolt at any stick position.
-    #
-    # x > 0 is a right turn - the RIGHT wheel is the inner one. That pairing came
-    # from the original formula (right = y - x fell as x rose) and is what keeps
-    # the steering the same way round as it has always been.
-    inner = y * (1.0 - abs(x))
-    prop_l, prop_r = (y, inner) if x >= 0 else (inner, y)
+    # AXIS_MARGIN decides how far off a cardinal the stick may stray before the
+    # command is dropped. It is a RATIO of the two axes rather than an angle, so
+    # it behaves the same at the edge of the gate as it does near the centre.
+    strong = max(abs(x), abs(y))
+    weak = min(abs(x), abs(y))
 
-    # Spin authority, faded out as the throttle comes up.
-    w = 1.0 - min(1.0, abs(y) / SPIN_ZONE) if SPIN_ZONE > 0 else 0.0
-    if w > 0.0:
-        left = (1.0 - w) * prop_l + w * x
-        right = (1.0 - w) * prop_r + w * -x
+    if strong == 0.0:
+        return 0, 0
+    if weak > AXIS_MARGIN * strong:
+        # In a corner: no movement at all.
+        return 0, 0
+
+    if abs(y) >= abs(x):
+        left = right = y                      # forward / back, together
     else:
-        left, right = prop_l, prop_r
-
-    # Left as a clamp rather than a scaler. Neither branch above can exceed 1.0
-    # now - inner is always a fraction of outer, and spin is bounded by x - so
-    # this no longer rescales anything. It stays because a future edit that does
-    # overshoot should be clipped, not silently sent to the motors.
-    peak = max(1.0, abs(left), abs(right))
-    left /= peak
-    right /= peak
+        left, right = x, -x                   # right / left, on the spot
 
     return int(round(left * MAX_PWM)), int(round(right * MAX_PWM))
 

@@ -324,6 +324,78 @@ RECORD_DIR = os.path.expanduser(os.environ.get("RECORD_DIR", "/recordings"))
 # It is also the *wall-clock* sample rate, not just the header value - recorder.py
 # writes one frame per tick whether or not the camera delivered a new one, so an
 # hour of duct run is an hour of video and the timeline stays honest.
+# WHICH CPU CORES THE RECORDING MAY USE. Empty disables the pinning entirely.
+#
+# Operator, 2026-09-01: "when i start recording to its generate lag on pi so use
+# other core for saving so its not create a lagy". Recording adds two live
+# encoders and, once a minute, an ffmpeg normalise - and on a 4-core Pi already
+# running two camera decodes that is enough to make the UI and the 50 Hz drive
+# frame wait behind video work.
+#
+# ONLY THE RECORDER IS PINNED, and that asymmetry is deliberate. Everything else
+# is left free to roam all four cores, so restricting the recorder to 2 and 3
+# does not take anything away from the UI - it guarantees the UI always has 0 and
+# 1 to itself while recording, without capping what it can use when idle.
+#
+# Hard-partitioning both sides was the obvious alternative and is worse: it caps
+# the decode at two cores even when nothing is recording, and the decode is the
+# heavier job of the two.
+RECORD_CPU_CORES = os.environ.get("RECORD_CPU_CORES", "2,3")
+
+# How much to lower the recording threads' scheduling priority. 0 disables it.
+#
+# AFFINITY ALONE WAS NOT ENOUGH, which is the thing worth writing down. Pinning
+# the recorder to cores 2 and 3 stops it taking 0 and 1 - but the UI thread is
+# left free to roam all four, so it still lands on 2 and 3 and still queues
+# behind an encoder there. Measured during a recording: the UI thread ran 3549ms
+# and WAITED 653ms for a core in a 5 second window, with every core only ~60%
+# busy. Not saturation - just the wrong thread going first.
+#
+# nice decides who goes first when both want the same core, so the two together
+# say what is actually meant: the recorder may use these cores, and it may only
+# have them when nothing else wants them.
+#
+# 10 rather than 19: the recorder must still keep up with a live camera, and 19
+# is the floor reserved for work that genuinely does not matter if it never runs.
+# The once-a-minute ffmpeg normalise IS that kind of work and does use 19.
+RECORD_THREAD_NICE = int(os.environ.get("RECORD_THREAD_NICE", "10"))
+
+# How much to lower GSTREAMER'S decode threads. 0 disables it.
+#
+# THEY OUTWEIGH THE UI AND RUN AT THE SAME PRIORITY, which is the whole reason
+# this exists. Measured at idle, no recording: the main thread had used 9029
+# jiffies while its GStreamer neighbours had used 10,700 between them - two
+# rtpjitterbuffers and two queue:src workers, every one at nice 0 and free on all
+# four cores. The UI thread waited 487ms out of every 5 seconds for a core with
+# the machine only 60% busy. Not saturation, just an even fight it should not
+# have been having.
+#
+# THE TRADE IS DELIBERATE: under load the video now drops a frame before the
+# control surface stutters. On a machine that drives a robot that is the right
+# way round, and there is headroom for both in the normal case.
+#
+# 5 rather than 10: the decoder still has to keep pace with a live 25 fps camera.
+# It should lose an argument with the UI, not be pushed to the back of the queue.
+STREAM_THREAD_NICE = int(os.environ.get("STREAM_THREAD_NICE", "5"))
+
+
+def record_cores():
+    """RECORD_CPU_CORES as a set of valid core numbers, or None if disabled."""
+    raw = (RECORD_CPU_CORES or "").strip()
+    if not raw:
+        return None
+    try:
+        want = {int(v) for v in raw.split(",") if v.strip() != ""}
+    except ValueError:
+        return None
+    have = set(range(os.cpu_count() or 1))
+    cores = want & have
+    # Never return an empty set: that would be an affinity mask no thread can be
+    # scheduled on. A machine with fewer cores than the config assumes falls back
+    # to no pinning rather than to something unschedulable.
+    return cores or None
+
+
 RECORD_FPS = float(os.environ.get("RECORD_FPS", "15"))
 
 # HOW OFTEN A RUNNING RECORDING ROLLS TO A NEW CLIP, seconds. 0 disables it and

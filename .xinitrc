@@ -31,6 +31,21 @@ plymouth quit --retain-splash 2>/dev/null || true
 # holds it. Keep the logs. STREAM_STATS_LOG adds one line per camera per second
 # (fps / reconnects / abandoned readers) - see stream.py.
 while true; do
+    # NO USE_HW_DECODE=1 HERE ANY MORE. It was forcing the Pi's v4l2 hardware
+    # H.264 decoder on, and that decoder drops more than half the frames on this
+    # machine: the ground station's own stats logged CAM 1 at 12.0 fps against a
+    # 25 fps source, with "v4l2h264dec: initial frames were not dequeued: bug in
+    # decoder" from GStreamer. Benchmarked 2026-08-31 at 7.8 fps hardware against
+    # 26.3 software, at every jitter-buffer setting.
+    #
+    # IT FAILS AS STUTTER, NOT AS AN ERROR, which is what let it survive: the
+    # picture simply looks laggy and nothing in the log says why unless the
+    # per-camera fps is being written out.
+    #
+    # AND AN ENV VAR HERE BEATS config.py, which is the part worth remembering.
+    # USE_HW_DECODE was set back to 0 in config.py on 2026-08-31 and nothing
+    # changed, because this line overrode it on every launch. Config defaults are
+    # not the last word - this file is.
     STREAM_STATS_LOG="$HOME/stream_stats.log" \
         python3 "/home/arnobot/ground_station/main.py" >> "$HOME/viewer.log" 2>&1
     [ -f "$HOME/.viewer-stop" ] && { rm -f "$HOME/.viewer-stop"; break; }

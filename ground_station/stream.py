@@ -102,6 +102,51 @@ def has_gstreamer() -> bool:
     return False
 
 
+def renice_worker_threads(nice_to=None):
+    """Lower the priority of GStreamer's decode threads. Best effort.
+
+    Called periodically rather than once, because these threads are created and
+    destroyed by GStreamer itself - every camera reconnect brings a fresh set,
+    and a set that was never reniced is a set competing with the UI again.
+
+    Matched by THREAD NAME, which is how GStreamer labels its workers:
+    "rtpjitterbuffer", "queue0:src" and friends. Anything that is not obviously
+    one of those is left alone - in particular the main thread, the recorder
+    threads (which set their own priority) and the motor link, none of which
+    should be touched from here.
+
+    Returns how many threads it lowered, for the caller to log if it wants to.
+    """
+    if nice_to is None:
+        nice_to = getattr(config, "STREAM_THREAD_NICE", 0)
+    if not nice_to:
+        return 0
+    changed = 0
+    try:
+        tids = os.listdir("/proc/self/task")
+    except OSError:
+        return 0
+    for tid in tids:
+        try:
+            with open("/proc/self/task/%s/comm" % tid) as fh:
+                name = fh.read().strip()
+        except OSError:
+            continue
+        if "jitterbuffer" not in name and ":src" not in name and ":sink" not in name:
+            continue
+        try:
+            # PRIO_PROCESS with a TID is per-thread on Linux, the same way
+            # sched_setaffinity(0, ...) is. Only ever RAISES the nice value:
+            # lowering one needs privileges this process does not have, and
+            # would be the wrong direction anyway.
+            if os.getpriority(os.PRIO_PROCESS, int(tid)) < nice_to:
+                os.setpriority(os.PRIO_PROCESS, int(tid), nice_to)
+                changed += 1
+        except (OSError, ValueError, PermissionError):
+            continue
+    return changed
+
+
 def probe_codec(url: str, timeout: float = 4.0):
     """Ask the RTSP server which video codec it serves; returns 'h264'/'h265'/None.
 
