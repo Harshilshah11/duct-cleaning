@@ -139,7 +139,7 @@ def _session_started(name):
 
 
 
-def stamp_unfinished_sessions(root, idle_s=120.0):
+def stamp_unfinished_sessions(root, idle_s=120.0, only=None):
     """Give an end time to any session folder that never got one.
 
     _finalize_dir_name() appends "end HH-MM-SS" when a run stops. If the ground
@@ -164,6 +164,13 @@ def stamp_unfinished_sessions(root, idle_s=120.0):
         return
     now = time.time()
     for name in names:
+        # `only` restricts the sweep the same way the recovery pass does - the
+        # boot path passes the folders that existed before the viewer started,
+        # which is what lets it use idle_s=0 without risking a live run.
+        if only is not None:
+            wanted = {only} if isinstance(only, str) else set(only)
+            if name not in wanted:
+                continue
         if " end " in name or not re.search(r"session(\d+)", name, re.I):
             continue
         path = os.path.join(root, name)
@@ -186,6 +193,320 @@ def stamp_unfinished_sessions(root, idle_s=120.0):
             pass
 
 
+_PART_NAME_RE = re.compile(r"^(.+)_(\d{3})" + re.escape(config.RECORD_EXT) + r"$", re.I)
+
+
+def recover_unfinished_sessions(root, idle_s=120.0, log=None, only=None):
+    """Merge the per-clip parts of any session that never got finalised.
+
+    WHY THIS EXISTS. Operator 2026-09-02: "i am off pi without stop recording,
+    to video is not ready for transfer - so make this, when in between recording
+    pi off, to recording save when pi off".
+
+    A run writes one file per camera PER CLIP - cam1_front_001.mp4 and so on -
+    and only joins them into 1_front.mp4 / 2_back.mp4 when the operator STOPS.
+    Cut the power mid-recording and the join never happens, so the footage is all
+    there but sits as numbered parts. usb_chooser.session_files() then refuses to
+    offer the session, by design, because a folder holding parts is one whose
+    merge has not finished - which is exactly the "not ready for transfer" the
+    operator hit. Eight sessions were stranded that way when this was written.
+
+    A HARD POWER CUT CANNOT BE CAUGHT, so this does not try. There is no signal,
+    no unmount, no last-gasp handler - the 5V simply stops. The only thing that
+    can be done is to finish the job on the way back up, which is what this is:
+    run at startup, before anything else touches /recordings.
+
+    STREAM COPY, never a re-encode. The parts already share a codec, a size and a
+    frame rate because one camera wrote them all back to back, which is the
+    concat demuxer's precondition. A copy runs at disk speed and cannot lose
+    quality; an encode here would take longer than the recording did and would
+    fight the cameras for the same hardware.
+
+    THE PARTS ARE ONLY DELETED AFTER A VERIFIED JOIN - ffmpeg exited clean and
+    the output is non-empty. If anything is off, the parts stay and the session
+    is left un-transferable rather than silently truncated. Footage that exists
+    in an awkward shape beats footage that does not exist.
+    """
+    def say(msg):
+        if log:
+            log(msg)
+
+    if not _have_ffmpeg():
+        say("recover: ffmpeg missing, leaving parts alone")
+        return 0
+
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+
+    now = time.time()
+    recovered = 0
+    for name in sorted(names):
+        # `only` narrows the sweep to named folders - a single name for the
+        # shutdown path, or a whole set for the boot pass, which snapshots what
+        # exists BEFORE the viewer can start recording and passes that. Either
+        # way a session created after the snapshot is never touched, which is
+        # what makes idle_s=0 safe there.
+        if only is not None:
+            wanted = {only} if isinstance(only, str) else set(only)
+            if name not in wanted:
+                continue
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            files = os.listdir(path)
+        except OSError:
+            continue
+
+        groups = {}
+        newest = 0.0
+        for fn in files:
+            try:
+                newest = max(newest, os.path.getmtime(os.path.join(path, fn)))
+            except OSError:
+                pass
+            m = _PART_NAME_RE.match(fn)
+            if m:
+                groups.setdefault(m.group(1), []).append((int(m.group(2)), fn))
+        if not groups:
+            continue
+
+        # LEAVE A LIVE SESSION ALONE. This runs at startup, when nothing should
+        # be recording, but a folder still being written to must never have its
+        # parts concatenated and deleted underneath the encoder.
+        if now - newest < idle_s:
+            say("recover: %s looks active, skipping" % name)
+            continue
+
+        for slug, parts in sorted(groups.items()):
+            parts.sort()
+
+            # SET ASIDE PARTS FFMPEG CANNOT OPEN, before trying to join them.
+            #
+            # A clip killed before its segment closed has no moov atom - the
+            # index an MP4 writes only on close - so it holds frames and no way
+            # to find them. ffprobe rejects it outright and the concat below
+            # fails on the whole group because of one bad member.
+            #
+            # WHY RENAME RATHER THAN DELETE: the bytes are still the operator's
+            # footage and a specialist tool can sometimes rebuild an index from a
+            # good file of the same shape. Deleting forecloses that. Renaming
+            # takes the file out of the _\d{3}.mp4 pattern, which is what
+            # usb_chooser.session_files() reads as "this session is still being
+            # worked on" - so a session whose parts are all dead stops reporting
+            # itself as processing for ever, which is what it did before this.
+            live = []
+            for no, fn in parts:
+                full = os.path.join(path, fn)
+                try:
+                    rc = subprocess.call(
+                        ["ffprobe", "-v", "error", "-show_entries",
+                         "format=duration", "-of", "default=nw=1:nk=1", full],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    rc = 1
+                if rc == 0:
+                    live.append((no, fn))
+                else:
+                    try:
+                        os.rename(full, full + ".unreadable")
+                        say("recover: %s/%s has no index, set aside" % (name, fn))
+                    except OSError:
+                        pass
+            if not live:
+                say("recover: %s/%s nothing readable to join" % (name, slug))
+                continue
+            parts = live
+            # cam1_front -> 1_front, matching what _join_all() writes on a clean
+            # stop, so a recovered session is indistinguishable from a normal one.
+            m = re.search(r"cam(\d+)_(.+)$", slug, re.I)
+            stem = ("%s_%s" % (m.group(1), m.group(2))) if m else slug
+            out = os.path.join(path, stem + config.RECORD_EXT)
+            if os.path.exists(out):
+                continue
+
+            lst = os.path.join(path, ".recover_%s.txt" % stem)
+            try:
+                with open(lst, "w", encoding="utf-8") as fh:
+                    for _no, fn in parts:
+                        full = os.path.join(path, fn)
+                        fh.write("file '%s'\n" % full.replace("'", "'\\''"))
+            except OSError as exc:
+                say("recover: %s/%s list failed: %s" % (name, stem, exc))
+                continue
+
+            tmp = out + ".part"
+            try:
+                rc = subprocess.call(
+                    # -f mp4 IS REQUIRED, because the output is written to
+                    # <name>.mp4.part and ffmpeg guesses the muxer from the
+                    # EXTENSION - ".part" matches nothing, so without this it
+                    # exits 1 having written nothing and every recovery
+                    # "failed" while the same command run by hand succeeded.
+                    ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                     "-nostdin", "-f", "concat", "-safe", "0", "-i", lst,
+                     "-c", "copy", "-f", "mp4", tmp],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as exc:
+                rc, _ = 1, say("recover: %s/%s ffmpeg failed: %s" % (name, stem, exc))
+
+            ok = rc == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0
+            if ok:
+                try:
+                    os.replace(tmp, out)
+                    for _no, fn in parts:
+                        os.remove(os.path.join(path, fn))
+                    recovered += 1
+                    say("recover: %s -> %s (%d parts)"
+                        % (name, os.path.basename(out), len(parts)))
+                except OSError as exc:
+                    say("recover: %s/%s cleanup failed: %s" % (name, stem, exc))
+            else:
+                # Leave everything as it was. A failed join is recoverable by
+                # hand; a deleted part is not.
+                say("recover: %s/%s join failed, parts kept" % (name, stem))
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            try:
+                os.remove(lst)
+            except OSError:
+                pass
+
+    return recovered
+
+
+def _dir_bytes(path):
+    """Bytes used by one session folder. Missing files count as zero."""
+    total = 0
+    try:
+        for fn in os.listdir(path):
+            try:
+                total += os.path.getsize(os.path.join(path, fn))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return total
+
+
+def prune_recordings(root, max_bytes, protect=None, log=None, max_per_pass=1):
+    """Keep /recordings under max_bytes by deleting the OLDEST sessions first.
+
+    Operator 2026-09-02: "when its above saved 20 gb to delete first recording -
+    means when last save to first delete when storage full". A ring buffer: the
+    newest recording is always the one kept, and age is what decides who goes.
+
+    OLDEST BY THE NAME, NOT BY MTIME. Every folder carries "date DD-MM-YY start
+    HH-MM-SS" and _session_started() parses it. mtime is the wrong clock here -
+    it moves when a session is merged, stamped or backed up, so the folder
+    touched most recently is often the OLDEST footage. Sorting on it would evict
+    close to at random.
+
+    THE LIVE SESSION IS NEVER A CANDIDATE. `protect` is the directory currently
+    being recorded into; deleting it would pull files from under an open encoder.
+    If everything else has already gone and the live run alone still exceeds the
+    cap, this stops rather than touching it - a recording in progress outranks a
+    limit, and the card still has the OS's spare room underneath.
+
+    RETURNS the number of sessions removed. Deleting is permanent and there is no
+    backup check: the operator asked for a ring buffer, and a ring buffer that
+    declines to overwrite is just a full disk.
+    """
+    def say(msg):
+        if log:
+            log(msg)
+
+    try:
+        names = [d for d in os.listdir(root)
+                 if os.path.isdir(os.path.join(root, d))]
+    except OSError:
+        return 0
+
+    sizes = {n: _dir_bytes(os.path.join(root, n)) for n in names}
+    total = sum(sizes.values())
+    if total <= max_bytes:
+        return 0
+
+    protect_name = os.path.basename(protect.rstrip("/")) if protect else None
+
+    def age(n):
+        started = _session_started(n)
+        if started is not None:
+            return started
+        try:
+            return os.path.getmtime(os.path.join(root, n))
+        except OSError:
+            return 0.0
+
+    order = sorted((n for n in names if n != protect_name), key=age)
+
+    # ONE SESSION PER PASS. Operator 2026-09-02: "not directly three session
+    # delete - delete one one session when required space ... and again same
+    # check, if again used to again one session delete".
+    #
+    # The sweep runs every 30 seconds, so freeing one session, re-measuring, and
+    # freeing another only if it is STILL over is the same end state reached in
+    # steps. The difference matters: measuring once and then deleting everything
+    # that arithmetic said would be needed can over-delete, because a merge
+    # finishing between the measurement and the deletions changes the totals
+    # underneath it. Deleting one and looking again cannot.
+    #
+    # It also bounds the damage of a wrong cap. Set max_bytes too low by mistake
+    # and this removes one session per 30s - visible, and stoppable - instead of
+    # emptying the card in a single sweep.
+    removed = 0
+    for n in order:
+        if total <= max_bytes or removed >= max_per_pass:
+            break
+        path = os.path.join(root, n)
+        freed = sizes.get(n, 0)
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            say("prune: could not remove %s: %s" % (n, exc))
+            continue
+        total -= freed
+        removed += 1
+        say("prune: removed %s (%.1f MB), now %.1f GB of %.1f GB"
+            % (n, freed / 1e6, total / 1e9, max_bytes / 1e9))
+
+    # WHOLE SESSIONS ONLY - the live run's own segments are never touched.
+    # Operator 2026-09-02, on seeing a test that trimmed inside the live run:
+    # "when session 7 is running live to delete session 1 2 3, not 4 5 6".
+    #
+    # A last-resort trim of the live session's oldest segments was written and
+    # removed again on the same day. It only ever ran once every OTHER session
+    # was already gone, but it made a recording in progress lose its own opening
+    # minutes, and a run that is still going is not something to eat into. If the
+    # cap cannot be met without doing that, the cap goes unmet and says so.
+    #
+    # WHAT PROTECTS THE CARD IN THAT CASE is the headroom under the cap: 20 GB
+    # against 22.8 GB free, so even a single run past the limit has room before
+    # the filesystem is in trouble. It takes 12h48m of continuous recording to
+    # get there.
+    # TWO DIFFERENT SITUATIONS, and they must not read the same. Being over the
+    # cap with sessions still to go is NORMAL - one goes per pass, so the next
+    # sweep continues. Being over with nothing left but the live run is the end
+    # of the line. The single message this replaced claimed the second whenever
+    # the first was true, which would have anyone reading the log believe the
+    # card was down to one session while six sat there.
+    if total > max_bytes:
+        more = [n for n in order if os.path.isdir(os.path.join(root, n))]
+        if more:
+            say("prune: %.1f GB over a %.1f GB cap - %d session(s) still to go, "
+                "one per pass" % (total / 1e9, max_bytes / 1e9, len(more)))
+        else:
+            say("prune: %.1f GB over a %.1f GB cap - only the live recording is "
+                "left and it is not touched" % (total / 1e9, max_bytes / 1e9))
+    return removed
+
+
 def _next_session_no(root):
     """1 + the highest SESSIONnnn in `root`, counting only sessions newer than
     the last verified USB backup - so a stick that has taken the footage away
@@ -206,7 +527,14 @@ def _next_session_no(root):
     """
     # Tidy up anything a previous run left unstamped, while the directory is
     # being listed anyway and before this session adds itself to it.
-    stamp_unfinished_sessions(root)
+    #
+    # idle_s=0 HERE ON PURPOSE. This runs as a new session is being numbered, so
+    # the previous one stopped moments ago and nothing is recording - the guard
+    # would only skip the folder we are here to stamp. That is exactly what
+    # happened in the 2026-09-02 reboot test: session01 was merged correctly but
+    # kept a start-only name, because it had been written to seconds earlier and
+    # the 120s guard declined it.
+    stamp_unfinished_sessions(root, idle_s=0.0)
 
     epoch = _reset_epoch(root)
     highest = 0
@@ -2209,6 +2537,35 @@ class SessionManager:
             rec.stop()
         for rec in self.recorders:
             rec.join(timeout=3.0)
+
+        # MERGE THE LIVE RUN BEFORE WE GO, synchronously. Operator 2026-09-02:
+        # "i want also in live recording".
+        #
+        # Everything above closes the files, and _resolve_pending(keep=True)
+        # queues the merge - but that merge runs in a FullViewBuilder thread, and
+        # on a shutdown the process is gone long before it finishes. The footage
+        # survives as numbered parts and usb_chooser refuses to offer it, which
+        # is the "not ready for transfer" this fixes. The recovery pass at the
+        # next boot would eventually catch it, but that is no help to someone who
+        # powers the Pi down in order to take the card away.
+        #
+        # A STREAM COPY IS FAST ENOUGH TO DO HERE. It runs at disk speed - the
+        # 4-minute session this was tested on joined in well under a second - so
+        # it fits inside systemd's TERM-to-KILL grace period with room to spare.
+        # An encode would not, which is exactly why this joins and never encodes.
+        #
+        # idle_s=0 because the folder was being written to a moment ago by
+        # definition; the usual idle guard exists to protect a LIVE session from
+        # a background sweep, and here we are the thing that just stopped it.
+        if self.session_dir:
+            try:
+                recover_unfinished_sessions(
+                    os.path.dirname(self.session_dir), idle_s=0.0,
+                    only=os.path.basename(self.session_dir))
+            except Exception:
+                # Never let a tidy-up stop the shutdown. The parts are on disk
+                # either way and the next boot will pick them up.
+                pass
 
 
 def main():

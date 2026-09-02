@@ -500,7 +500,71 @@ RECORD_FPS = float(os.environ.get("RECORD_FPS", "15"))
 #
 # The machinery is all still here and still correct: set this to 60 and clips
 # roll again. Nothing else needs changing.
-RECORD_SEGMENT_S = float(os.environ.get("RECORD_SEGMENT_S", "0"))
+# 60, BECAUSE A POWER CUT CANNOT BE CAUGHT. Operator 2026-09-02: "i am off pi
+# without stop recording, to video is not ready for transfer".
+#
+# cv2.VideoWriter writes an MP4's moov atom - its index - only on release(). Pull
+# the plug and that never happens, so the file holds every frame and no way to
+# find them: ffmpeg reports "moov atom not found" and refuses to open it at all.
+# 22 sessions on this card are unreadable for exactly that reason and no amount
+# of repair logic will bring them back.
+#
+# AT 0 THE WHOLE RUN IS ONE FILE, so a cut at minute 59 of an hour costs the
+# hour. At 60 the writer closes and reopens every minute, so everything before
+# the last minute is already indexed and readable, and the cut costs a minute.
+#
+# THE COST IS A CONCATENATION AT STOP, and it is a stream copy - no decode, no
+# encode, disk speed. A four-minute session joined in well under a second when
+# this was measured, which is why segmenting is affordable here in a way that
+# re-encoding never was. It was set to 0 on 2026-08-31 to kill an encode that
+# ran per segment; that encode is gone (RECORD_NORMALIZE = 0), so the reason for
+# 0 went with it and only its downside remained.
+# 20, DOWN FROM 60 AFTER THE REBOOT TEST OF 2026-09-02.
+#
+# The test worked - the interrupted run came back merged and playable - but the
+# run that was live at the moment of reboot had lasted 12 seconds against a 60
+# second segment, so nothing had closed and the whole thing was unreadable. That
+# is the honest shape of this setting: EVERYTHING SHORTER THAN ONE SEGMENT IS
+# LOST, so the segment length is the size of the hole a power cut leaves.
+#
+# 20 makes that hole a third of what it was. The cost is three times the parts -
+# 3 per camera per minute - joined at stop by a stream copy that runs at disk
+# speed, so a long session costs seconds, not minutes. It is affordable here
+# only because RECORD_NORMALIZE is 0; with the old per-segment encode this
+# number could not have gone below a minute.
+#
+# NOW 10, down from 20, because the segment length IS the minimum recording that
+# survives a power cut. Operator 2026-09-02: "i want to when restart all small
+# and big video saved". A run shorter than one segment has nothing closed, so no
+# moov index was ever written and there is no video to recover - at 20 that made
+# every clip under 20 seconds unrecoverable, which is a lot of short inspection
+# runs.
+#
+# 10 is close to the practical floor. Below it the segment approaches the
+# keyframe interval, and a segment that cannot start on a keyframe stops being
+# joinable by stream copy - the join would need a re-encode, which is the thing
+# this whole design exists to avoid. If clips under 10 seconds must survive too,
+# the answer is not a smaller number here but a container that tolerates
+# truncation (Matroska, or fragmented MP4), which is a change to how the writer
+# is opened rather than to this constant.
+RECORD_SEGMENT_S = float(os.environ.get("RECORD_SEGMENT_S", "10"))
+
+
+# HOW MUCH OF THE CARD RECORDINGS MAY OCCUPY, in GB. Operator 2026-09-02: "i want
+# to use only 20 gb, and when its above saved 20 gb to delete first recording -
+# means when last save to first delete when storage full".
+#
+# A ring buffer, oldest out first. At the measured 1.56 GB/hour for both cameras
+# this holds about 12 hours 48 minutes, and a run that would push past it evicts
+# the oldest COMPLETE session rather than stopping or filling the card.
+#
+# 20 AGAINST 22.8 GB FREE IS THE POINT, not a rounding. The card is 29 GB with
+# the OS on the same filesystem - there is no separate partition - so recordings
+# and /var share what is left. Leaving ~2.8 GB spare is what keeps logs, the
+# journal and temp files writable, and a completely full filesystem is a
+# well-known way to corrupt a card.
+RECORD_MAX_GB = float(os.environ.get("RECORD_MAX_GB", "20"))
+RECORD_MAX_BYTES = int(RECORD_MAX_GB * 1e9)
 
 # Join the numbered clips into one file per camera at the end of a save.
 #

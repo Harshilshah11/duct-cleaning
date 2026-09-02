@@ -1744,7 +1744,15 @@ class RoundSaveButton(QWidget):
         # done clears it, which is exactly what starting another recording does.
         if mode == "done":
             if self._done_expired:
-                mode = "ready"                  # already shown; stay quiet
+                # "idle", NOT some other word. This dial paints exactly four
+                # modes - idle | busy | done | error - and "idle" is the only one
+                # that draws the WHITE body with a hairline edge and dark ink.
+                # Anything else falls through to the coloured branch, which is
+                # how the button ended up looking different after a save than it
+                # had before one: the tick cleared on time but the dial stayed
+                # tinted. Operator 2026-09-02: "after save done to its different,
+                # i want to replace same as first before save done".
+                mode = "idle"
             elif self._mode != "done":
                 self._check = 0.0
                 self._done_at = time.monotonic()
@@ -1778,9 +1786,12 @@ class RoundSaveButton(QWidget):
             if (self._done_at is not None
                     and time.monotonic() - self._done_at >= DONE_HOLD_S):
                 self._done_expired = True
-                self._mode = "ready"
+                self._mode = "idle"             # see set_status - four modes only
                 self._check = 0.0
                 self._target = 0.0
+                # Drain the ring too, or the dial keeps a full circle of lit
+                # ticks under an otherwise idle face.
+                self._frac = 0.0
         else:
             self._check = 0.0
         self.update()

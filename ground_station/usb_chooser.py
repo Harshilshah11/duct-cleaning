@@ -184,6 +184,20 @@ def session_files(path):
     except OSError:
         return [], False
     for n in names:
+        # SET-ASIDE DEAD CLIPS ARE NOT WORK IN PROGRESS. recorder's recovery pass
+        # renames a part it cannot read to <name>.unreadable - a clip killed
+        # before its segment closed has no moov index and nothing can ever join
+        # it. The kept bytes are for a future repair attempt, not for this
+        # dialog.
+        #
+        # WITHOUT THIS THEY READ AS TEMPS, because the test below is "anything
+        # that is not .mp4 means a merge is running". So the very rename that was
+        # meant to unstick a session pinned it at PROCESSING instead, and a
+        # 30-second run whose second segment never closed could not be
+        # transferred even though its first segment had merged perfectly.
+        # Operator 2026-09-02: "i want to this video also transferable".
+        if n.lower().endswith(".unreadable"):
+            continue
         if n.startswith(".") or not n.lower().endswith(".mp4"):
             working = True            # .norm / .tmp / the concat list file
         elif _PART_RE.search(n):
@@ -1616,15 +1630,59 @@ class UsbChooser(QDialog):
     def _delete_all(self):
         QTimer.singleShot(0, self._delete_all_now)
 
+    # A session written to within this many seconds is taken to be RECORDING and
+    # is never deleted, however the operator asked. Everything else goes.
+    LIVE_GRACE_S = 30.0
+
     def _delete_all_now(self):
-        jobs = [r for r in self._rows if r[4] == "ready"]
-        held = len(self._rows) - len(jobs)
+        """Delete everything, INCLUDING sessions that never finished processing.
+
+        Operator 2026-09-02: "when i select delete all to all delete, also
+        processing video which is not done in usb".
+
+        This used to delete only the "ready" rows and announce that the rest were
+        being left alone. That guard was written for a session with a merge
+        actually in flight, where deleting underneath the worker would take the
+        job down - but "processing" also covers a session that can never finish:
+        a run cut by a power failure leaves parts with no moov index, nothing can
+        join them, and the row sits there for ever. Delete All that cannot delete
+        those is a Delete All that leaves the card full.
+
+        THE ONE THING STILL PROTECTED IS A LIVE RUN. Anything written to inside
+        LIVE_GRACE_S is assumed to be recording right now and is skipped - the
+        chooser cannot see SessionManager to ask, so recent writes are the
+        available proxy, and the same test guards the recovery sweep in
+        recorder.py for the same reason.
+        """
+        now = time.time()
+        jobs, live = [], 0
+        for row in self._rows:
+            path = row[1]
+            try:
+                newest = max((os.path.getmtime(os.path.join(path, f))
+                              for f in os.listdir(path)), default=0.0)
+            except OSError:
+                newest = 0.0
+            if now - newest < self.LIVE_GRACE_S:
+                live += 1
+            else:
+                jobs.append(row)
+
         if not jobs:
-            self.hint.setText(
-                "Nothing to delete - every recording is still processing.")
+            self.hint.setText("Nothing to delete." if not live
+                              else "Only a recording in progress - left alone.")
             return
-        extra = ("\n\n%d still being processed and will be left alone."
-                 % held) if held else ""
+
+        n_proc = sum(1 for r in jobs if r[4] != "ready")
+        extra = ""
+        if n_proc:
+            # Named explicitly, because these are the ones whose video cannot be
+            # recovered - the operator should know that is what they are losing.
+            extra += ("\n\n%d of them never finished processing and hold no "
+                      "playable video." % n_proc)
+        if live:
+            extra += "\n\n%d recording in progress will be left alone." % live
+
         if not self._confirm("Delete everything",
                              "Delete ALL %d recordings from the Pi?\n\n"
                              "This cannot be undone.%s"

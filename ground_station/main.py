@@ -34,7 +34,9 @@ import json
 import math
 import os
 import re
+import signal
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -812,6 +814,43 @@ class GroundStationWindow(QWidget):
         self.nice_timer.start(10000)
         self._renice_workers()
 
+        # THE 20 GB RING BUFFER, checked while recording rather than only at
+        # startup. A boot-time-only check would let a long run walk straight past
+        # the cap and fill the card, which is the failure this exists to prevent.
+        #
+        # 30s is chosen against the fill rate, not picked round: at the measured
+        # 26 MB/min the card gains ~13 MB between checks, so the cap can only
+        # ever be overshot by a fraction of one 20-second segment.
+        self.prune_timer = QTimer(self)
+        self.prune_timer.timeout.connect(self._prune_recordings)
+        self.prune_timer.start(30000)
+
+    def _prune_recordings(self):
+        """Drop the oldest sessions if /recordings is over the cap.
+
+        ON A WORKER THREAD because it stats every session folder and may delete
+        several, and this is called from the UI timer - doing it inline would
+        drop frames on a rig where the video feed is the whole point. Never
+        allowed to raise: a housekeeping job must not take the viewer down.
+        """
+        if getattr(self, "_pruning", False):
+            return                      # a slow sweep must not stack up
+        self._pruning = True
+
+        live = getattr(self.session, "session_dir", None)
+
+        def run():
+            try:
+                import recorder as _rec
+                _rec.prune_recordings(config.RECORD_DIR, config.RECORD_MAX_BYTES,
+                                      protect=live, log=print)
+            except Exception as exc:
+                print("prune failed: %s" % exc)
+            finally:
+                self._pruning = False
+
+        threading.Thread(target=run, name="prune", daemon=True).start()
+
     def _renice_workers(self):
         """Lower GStreamer's decode threads. Never allowed to disturb the UI.
 
@@ -1267,6 +1306,46 @@ def show_window(window, app):
         window.setGeometry(screen.geometry())
 
 
+def _install_shutdown_handler(window):
+    """Close the window cleanly when systemd or a script sends us a signal.
+
+    WHY QT NEEDS HELP HERE. closeEvent() is what stops the recorders and merges
+    the run, and it fires when a WINDOW closes - but a shutdown does not close
+    windows, it sends SIGTERM to processes. Python's default handler raises
+    SystemExit from whichever thread happens to be running, Qt's event loop
+    unwinds, and the app dies without closeEvent ever being called. A recording
+    in flight was left as unmerged parts every single time the Pi was powered
+    off, which is what the operator hit on 2026-09-02.
+
+    THE 0-MS TIMER IS THE TRICK, and it is not decoration. A Python signal
+    handler runs between bytecodes, and calling into Qt from there is not safe -
+    it can re-enter the event loop from inside C++ code that is mid-call. Posting
+    a zero-delay timer defers the close to the event loop's own thread, where
+    closeEvent can run normally. This is the standard shape for signals in Qt and
+    the reason it is written this way rather than calling close() directly.
+    """
+    def _bye(signum, _frame):
+        QTimer.singleShot(0, window.close)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _bye)
+        except (ValueError, OSError):
+            # Not the main thread, or a signal this platform will not take.
+            # Losing one of the three is survivable; the boot-time recovery
+            # pass is the backstop.
+            pass
+
+    # WAKE THE INTERPRETER. Qt's event loop sits in a C++ select() that does not
+    # return for a signal, so without a periodic trip back into Python the
+    # handler above can be delayed until the next mouse move - or for ever, on a
+    # headless panel with nothing generating events.
+    nudge = QTimer(window)
+    nudge.timeout.connect(lambda: None)
+    nudge.start(250)
+    window._shutdown_nudge = nudge      # keep a reference or Qt collects it
+
+
 def main():
     # Optional: pass one or two RTSP URLs on the command line.
     urls = sys.argv[1:]
@@ -1286,6 +1365,48 @@ def main():
 
     _load_video_stack()
 
+    # FINISH WHAT A POWER CUT INTERRUPTED, before anything starts recording.
+    #
+    # The shutdown handler covers a clean stop, but the 5V simply going away
+    # cannot be caught by anything - so a run cut that way survives as numbered
+    # per-clip parts, and usb_chooser will not offer a session in that state.
+    # This joins them into the normal per-camera files on the way up.
+    #
+    # In a thread because it is disk-bound and the splash is on screen: a card
+    # holding several interrupted sessions would otherwise stall the boot behind
+    # a progress-less logo. Nothing else touches /recordings until the operator
+    # starts a run, and the idle guard inside declines anything recently written.
+    # SNAPSHOT FIRST, on this thread, before the window exists and before any
+    # switch can start a run. Everything in this list predates the viewer, so
+    # none of it can be live and the idle guard is not needed - which matters,
+    # because that guard is what would otherwise skip the very session we are
+    # here to rescue: a reboot takes well under its 120s and the interrupted
+    # folder still looks "recently written" on the way back up.
+    try:
+        _existing = [d for d in os.listdir(config.RECORD_DIR)
+                     if os.path.isdir(os.path.join(config.RECORD_DIR, d))]
+    except OSError:
+        _existing = []
+
+    def _recover():
+        if not _existing:
+            return
+        try:
+            import recorder as _rec
+            n = _rec.recover_unfinished_sessions(
+                config.RECORD_DIR, idle_s=0.0, only=_existing, log=print)
+            if n:
+                print("recovered %d interrupted clip file(s)" % n)
+            # AND NAME THEM PROPERLY. A run cut by a power failure never reached
+            # _finalize_dir_name(), so its folder still says only when it began.
+            # Same snapshot, same reasoning: nothing in it can be live.
+            _rec.stamp_unfinished_sessions(
+                config.RECORD_DIR, idle_s=0.0, only=_existing)
+        except Exception as exc:                  # never block the viewer
+            print("recovery pass failed: %s" % exc)
+
+    threading.Thread(target=_recover, name="recover", daemon=True).start()
+
     cameras = (
         [(config.camera_name(i), url) for i, url in enumerate(urls)]
         if urls else config.CAMERAS
@@ -1300,11 +1421,13 @@ def main():
 
     if splash is None:
         window = GroundStationWindow(cameras)
+        _install_shutdown_handler(window)
         show_window(window, app)
         sys.exit(app.exec())
 
     splash.set_status("starting video pipeline")
     window = GroundStationWindow(cameras)
+    _install_shutdown_handler(window)
     total = len(window.streams)
     started = time.monotonic()
 
