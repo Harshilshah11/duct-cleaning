@@ -65,25 +65,33 @@ WARN = theme.DARK["orange"]          # a session still being merged
 BAD = theme.DARK["red"]
 GOOD = theme.DARK["green"]
 
-# POPUP GROUNDS. Both dialogs used WIN - the same near-black as the window behind
-# them - so neither read as a raised surface and the two were indistinguishable
-# from each other. Operator 2026-08-27: "both popup color same ... make some
-# light color".
+# POPUP GROUNDS - DARK, after a spell as light sheets. Operator 2026-09-01:
+# "copy popup and delete confirm popup is very light so make it some dark", with
+# Windows 11's file-operation dialogs given as the reference.
 #
-# LIGHT, deliberately, against a dark window. A pale sheet is the clearest way to
-# say "this is on top and it wants an answer", and it separates far better than
-# another shade of grey.
+# The light sheets came from an earlier ask - the two popups had both been the
+# same near-black as the window and were indistinguishable, so they were made
+# pale to read as raised. Pale solved the separation and overshot the brightness:
+# against a near-black file manager on a screen used in a duct, a white slab is
+# what the operator is now objecting to.
 #
-# Then TINTED APART BY WHAT THEY DO, not decorated:
-#   copying  - cool blue. Progress; nothing at stake, nothing to decide.
-#   deleting - warm red. Destructive and unrecoverable, and it must not look
-#              like the harmless one at a glance.
-POPUP_COPY_BG = "#EAF2FE"                      # light blue sheet - progress
-POPUP_COPY_EDGE = "rgba(0, 122, 255, 0.35)"
-POPUP_DEL_BG = "#FDEDEC"                       # light red sheet - destructive
-POPUP_DEL_EDGE = "rgba(255, 59, 48, 0.40)"
-POPUP_INK = theme.LIGHT["label"]               # dark ink, the sheets are light
-POPUP_INK2 = theme.LIGHT["label2"]
+# WINDOWS 11 SOLVES THE SAME PROBLEM WITHOUT GOING LIGHT. Its copy dialog is a
+# raised DARK surface - a step or two above the window, never below it - with a
+# hairline rim, a thin accent progress bar and one muted line of detail under it.
+# Elevation is carried by the rim and the step in value, not by inverting.
+#
+# Still TINTED APART BY WHAT THEY DO, because that ask has not gone away and the
+# reason behind it holds - the destructive one must not look like the harmless
+# one at a glance. The tint is now carried in a dark ground rather than a pale
+# one, which is much less shouty at the same hue:
+#   copying  - cool. Progress; nothing at stake, nothing to decide.
+#   deleting - warm. Destructive and unrecoverable.
+POPUP_COPY_BG = "#1E252E"                      # cool raised dark - progress
+POPUP_COPY_EDGE = "rgba(10, 132, 255, 0.45)"
+POPUP_DEL_BG = "#2B1F21"                       # warm raised dark - destructive
+POPUP_DEL_EDGE = "rgba(255, 69, 58, 0.50)"
+POPUP_INK = theme.DARK["label"]                # light ink, the sheets are dark
+POPUP_INK2 = theme.DARK["label2"]
 TRACK = theme.DARK["gray4"]
 INK = TEXT
 
@@ -223,7 +231,20 @@ def list_sessions(root):
 class _Worker(QThread):
     """Copies or deletes in the background. One job per instance."""
 
-    progressed = Signal(str, int, int)      # label, done, total
+    # BYTES, not sessions. Operator 2026-09-01: "when copying and delete popup
+    # not processing 1-100%, its direct close".
+    #
+    # Two faults, and this signal carried both. It was emitted BEFORE each job
+    # and never after the last one, so with three sessions it reported 0, 1, 2
+    # and the dialog closed at 67% having never shown 100. And the unit was the
+    # SESSION, so a single 1 GB copy was one step - the bar sat at 0 for the
+    # whole transfer and then vanished. Neither is a progress bar; both are a
+    # spinner that lies about being one.
+    #
+    # Now: bytes actually written, emitted from inside the copy loop, plus the
+    # item counts the dialog's "Items remaining" line still wants.
+    progressed = Signal(str, int, int, int, int)
+    # name, bytes_done, bytes_total, items_done, items_total
     finished_ok = Signal(str)               # summary
     failed = Signal(str)
 
@@ -237,16 +258,50 @@ class _Worker(QThread):
     def stop(self):
         self._stop = True
 
+    # 1 MiB. Big enough that the read/write syscalls are not the cost on a FAT
+    # stick, small enough that a 4 GB session still emits a few thousand updates
+    # - about one per 40ms at this card's measured 20 MB/s, which is smooth
+    # without flooding the UI thread's event queue.
+    CHUNK = 1024 * 1024
+
+    def _copy_with_progress(self, src, dst, name, sent, total, items, n_items):
+        """shutil.copy2, but reporting as it goes. Returns bytes copied.
+
+        copy2 is one opaque call - it returns when the file is on the card and
+        says nothing in between, which is exactly why the old bar could not
+        move. This is the same operation with the loop opened up, and copystat
+        afterwards so the timestamps still ride along.
+        """
+        moved = 0
+        with open(src, "rb") as fin, open(dst, "wb") as fout:
+            while not self._stop:
+                buf = fin.read(self.CHUNK)
+                if not buf:
+                    break
+                fout.write(buf)
+                moved += len(buf)
+                self.progressed.emit(name, sent + moved, total, items, n_items)
+        shutil.copystat(src, dst)
+        return moved
+
     def run(self):
         done = 0
         total = max(1, len(self._jobs))
+        # Sized from the listing rather than re-stat'd: session_files() is about
+        # to re-read the folder anyway, and a byte total that shifts mid-copy
+        # makes the percentage go backwards.
+        bytes_total = max(1, sum(j[2] for j in self._jobs))
+        sent = 0
         try:
-            for name, path, _size, _mtime, _state in self._jobs:
+            for name, path, size, _mtime, _state in self._jobs:
                 if self._stop:
                     break
-                self.progressed.emit(name, done, total)
+                self.progressed.emit(name, sent, bytes_total, done, total)
                 if self._delete:
                     shutil.rmtree(path, ignore_errors=True)
+                    # A delete has no bytes to stream, so its progress is the
+                    # session's own size, credited when the folder is gone.
+                    sent += size
                 else:
                     # BY NAME, NOT copytree. The finished files are re-read
                     # here rather than trusted from the list, so even if a
@@ -261,9 +316,14 @@ class _Worker(QThread):
                     dst = os.path.join(self._dest, name)
                     os.makedirs(dst, exist_ok=True)
                     for fn in finals:
-                        shutil.copy2(os.path.join(path, fn),
-                                     os.path.join(dst, fn))
+                        sent += self._copy_with_progress(
+                            os.path.join(path, fn), os.path.join(dst, fn),
+                            name, sent, bytes_total, done, total)
                 done += 1
+                # AFTER the job as well as before it. The old loop only emitted
+                # on entry, so the final session's completion was never reported
+                # and the bar could not reach the end.
+                self.progressed.emit(name, sent, bytes_total, done, total)
             # One sync for the whole batch: per-file sync on a FAT stick costs
             # more than the copy. Without it a stick pulled straight after
             # "done" can still be missing the tail of the last file.
@@ -345,56 +405,108 @@ class ProgressPopup(QDialog):
 
     RADIUS = 12
 
-    def __init__(self, title, parent=None):
+    # THE WINDOWS 11 FILE-OPERATION LAYOUT, IN THIS APP'S CLOTHES. Operator
+    # 2026-09-01, with a screenshot of that dialog: "use this layout but in ios
+    # skill like mac mini".
+    #
+    # What is taken is the INFORMATION and its order, which is the part that was
+    # missing - a percentage you can read at a glance, then what is moving and
+    # where to, then a thin bar, then the small print that answers "how long":
+    #
+    #     42% complete
+    #     Copying 12 items to USB drive
+    #     [==========--------------------]
+    #     Name:            session53 date 01-09-26 ...
+    #     Speed:           1.2 MB/s
+    #     Time remaining:  About 15 seconds
+    #     Items remaining: 8 (336 MB)
+    #
+    # What is NOT taken is the chrome. No title bar, no minimise box, no inset
+    # 3D bevels, no green graph. Apple's dark palette, one accent, a hairline
+    # rim and a lot of air - the same language as every other surface here.
+    #
+    # EVERY NUMBER IS REAL. The jobs carry their byte sizes, so speed is measured
+    # bytes over measured seconds and the estimate divides what is left by it.
+    # None of it is a spinner dressed up as telemetry; where a figure cannot be
+    # known yet it is left as a dash rather than guessed.
+    ROWS = ("Name", "Speed", "Time remaining", "Items remaining")
+
+    def __init__(self, title, parent=None, sizes=None, verb=None, dest=None,
+                 prep=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.setFixedSize(500, 152)
+        self.setFixedSize(520, 250)
         # Frameless for the same reason the chooser is: there is no window
         # manager to draw a frame, so the window draws its own or has none.
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
-        # The COPYING sheet - see POPUP_COPY_BG. A light blue surface so it
-        # reads as raised above the dark window, and so it cannot be mistaken
-        # for the red delete sheet. The track is a tint of its own chunk; the
-        # old white-on-dark track vanished once the ground stopped being black.
+
+        self._sizes = list(sizes or [])
+        self._total_bytes = sum(self._sizes)
+        self._t0 = None                  # set on the first item that completes
+        self._verb = verb or "Copying"
+        self._dest = dest or "USB drive"
+        # The preposition BELONGS TO THE VERB. Hardcoding "to" read as "Deleting
+        # 3 items to the Pi" - caught by exercising the dialog rather than by
+        # looking at it, since it only ever appears with a stick plugged in.
+        self._prep = prep or "to"
+
+        # 6px and a white-tinted track, both from the reference: a thin bar under
+        # the headline rather than a slab through the middle of it. The track has
+        # to be a tint of WHITE now the ground is dark - the old blue-on-white
+        # track disappeared entirely against it.
         self.setStyleSheet(
             "QDialog { background: %s; border: 1px solid %s;"
             "   border-radius: 14px; }"
-            "QProgressBar { background: rgba(0,122,255,0.14); border: none;"
-            "   border-radius: 4px; height: 8px; text-align: center;"
+            "QProgressBar { background: rgba(255,255,255,0.12); border: none;"
+            "   border-radius: 3px; height: 6px; text-align: center;"
             "   color: transparent; }"
-            "QProgressBar::chunk { background: %s; border-radius: 4px; }"
-            % (POPUP_COPY_BG, POPUP_COPY_EDGE, theme.LIGHT["blue"]))
+            "QProgressBar::chunk { background: %s; border-radius: 3px; }"
+            % (POPUP_COPY_BG, POPUP_COPY_EDGE, theme.DARK["blue"]))
 
-        self.head = QLabel(title)
+        # THE PERCENTAGE IS THE HEADLINE, as in the reference. It was previously
+        # buried as "3 of 12" in the corner while the title took the large type,
+        # so the one number the operator actually waits on was the small one.
+        self.head = QLabel("0% complete")
         self.head.setFont(theme.font_for(theme.HEADLINE, theme.W_SEMIBOLD))
         self.head.setStyleSheet("color: %s;" % POPUP_INK)
 
-        self.count = QLabel("")
-        self.count.setFont(theme.font_for(theme.FOOTNOTE, theme.W_MEDIUM))
-        self.count.setStyleSheet("color: %s;" % POPUP_INK2)
-        self.count.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-
-        self.detail = QLabel("Starting\u2026")
-        self.detail.setFont(theme.font_for(theme.FOOTNOTE, theme.W_REGULAR))
-        self.detail.setStyleSheet("color: %s;" % POPUP_INK2)
-        self.detail.setWordWrap(False)
+        self.sub = QLabel(title)
+        self.sub.setFont(theme.font_for(theme.FOOTNOTE, theme.W_REGULAR))
+        self.sub.setStyleSheet("color: %s;" % POPUP_INK2)
 
         self.bar = QProgressBar()
         self.bar.setTextVisible(False)
 
-        top = QHBoxLayout()
-        top.setContentsMargins(0, 0, 0, 0)
-        top.addWidget(self.head)
-        top.addStretch(1)
-        top.addWidget(self.count)
-
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(26, 24, 26, 24)
-        lay.setSpacing(14)
-        lay.addLayout(top)
+        lay.setContentsMargins(26, 22, 26, 22)
+        lay.setSpacing(10)
+        lay.addWidget(self.head)
+        lay.addWidget(self.sub)
+        lay.addSpacing(4)
         lay.addWidget(self.bar)
-        lay.addWidget(self.detail)
+        lay.addSpacing(6)
+
+        # One row per fact, key left and value right, so the values line up in a
+        # column and the eye can drop straight to the one it wants.
+        self._vals = {}
+        for key in self.ROWS:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            k = QLabel(key)
+            k.setFont(theme.font_for(theme.FOOTNOTE, theme.W_REGULAR))
+            k.setStyleSheet("color: %s;" % POPUP_INK2)
+            k.setFixedWidth(124)
+            v = QLabel("\u2014")
+            v.setFont(theme.font_for(theme.FOOTNOTE, theme.W_MEDIUM))
+            v.setStyleSheet("color: %s;" % POPUP_INK)
+            v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            row.addWidget(k)
+            row.addStretch(1)
+            row.addWidget(v)
+            lay.addLayout(row)
+            self._vals[key] = v
+        lay.addStretch(1)
 
     def resizeEvent(self, event):
         self.setMask(_round_mask(self.width(), self.height(), self.RADIUS))
@@ -414,13 +526,112 @@ class ProgressPopup(QDialog):
                           self.RADIUS, self.RADIUS)
         p.end()
 
-    def update_progress(self, name, done, total):
-        self.bar.setRange(0, total)
-        self.bar.setValue(done)
-        self.count.setText("%d of %d" % (min(done + 1, total), total))
+    @staticmethod
+    def _bytes(n):
+        """1.2 MB. Binary steps, one decimal, because that is what a file
+        manager shows and the operator is comparing against a stick's capacity."""
+        if n < 1024:
+            return "%d B" % n
+        for unit in ("KB", "MB", "GB"):
+            n /= 1024.0
+            if n < 1024 or unit == "GB":
+                return "%.1f %s" % (n, unit)
+
+    @staticmethod
+    def _secs(n):
+        """About 15 seconds / About 2 minutes. Deliberately vague wording: the
+        estimate is a division of two noisy numbers and should not read like a
+        countdown that can be trusted to the second."""
+        n = int(round(n))
+        if n < 5:
+            return "A few seconds"
+        if n < 60:
+            return "About %d seconds" % (5 * ((n + 4) // 5))
+        mins = (n + 29) // 60
+        return "About %d minute%s" % (mins, "" if mins == 1 else "s")
+
+    def finish(self):
+        """Pin the dialog to a completed state, whatever the last update said.
+
+        The final emit already carries the full byte count, but a copy can also
+        end early - a skipped file, a session that vanished between listing and
+        copying - and the dialog must still read as finished rather than stuck.
+        """
+        self.bar.setRange(0, 1000)
+        self.bar.setValue(1000)
+        self.head.setText("100% complete")
+        self._vals["Items remaining"].setText("0 (0 B)")
+        self._vals["Time remaining"].setText("Done")
+
+    def update_progress(self, name, done, total, items=None, n_items=None):
+        """done/total are BYTES; items/n_items are the session counts.
+
+        The bar runs on bytes so it moves during a single large copy, which is
+        the common case here - one session can be most of a transfer.
+        """
+        total = max(1, total)
+        # Qt's range is a C int and a big transfer overflows it, so the bar is
+        # driven in permille and the true byte figures are kept for the text.
+        self.bar.setRange(0, 1000)
+        self.bar.setValue(max(0, min(1000, int(1000.0 * done / total))))
+
+        pct = int(round(100.0 * done / total))
+        self.head.setText("%d%% complete" % pct)
+        n = n_items or 0
+        self.sub.setText("%s %d item%s %s %s"
+                         % (self._verb, n, "" if n == 1 else "s",
+                            self._prep, self._dest))
+
         # Elide from the LEFT: session names differ at the end (the times), so
         # trimming the tail would make every row read the same.
-        self.detail.setText(name if len(name) <= 52 else "\u2026" + name[-51:])
+        self._vals["Name"].setText(
+            (name if len(name) <= 34 else "\u2026" + name[-33:]) if name else "\u2014")
+
+        done_bytes = done
+        left_bytes = max(0, total - done)
+        left_items = max(0, (n_items or 0) - (items or 0))
+        self._vals["Items remaining"].setText(
+            "%d (%s)" % (left_items, self._bytes(left_bytes)))
+
+        # THE CLOCK STARTS AT THE FIRST COMPLETED ITEM, not at show(). Starting
+        # it earlier folds the dialog's own construction and the first stat() of
+        # a cold directory into the rate, which made the first estimate wildly
+        # pessimistic and then visibly collapse.
+        if done_bytes and self._t0 is None:
+            self._t0 = time.monotonic()
+            self._t0_bytes = done_bytes
+        if self._t0 is not None and done_bytes > self._t0_bytes:
+            elapsed = time.monotonic() - self._t0
+            if elapsed > 0.4:
+                rate = (done_bytes - self._t0_bytes) / elapsed
+                self._vals["Speed"].setText("%s/s" % self._bytes(rate))
+                if rate > 0:
+                    self._vals["Time remaining"].setText(
+                        self._secs(left_bytes / rate))
+                return
+        self._vals["Speed"].setText("\u2014")
+        self._vals["Time remaining"].setText("\u2014")
+
+
+def _stick_lr(joy):
+    """The stick's horizontal axis, POSITIVE MEANING PHYSICALLY RIGHT.
+
+    ONE PLACE, because this window has now had the same bug twice. The axes were
+    transposed here on 2026-08-26 to cancel INPUTS_SWAP_XY; that was un-swapped
+    on 2026-09-01 when SWAP_XY went to 0 - but only in on_inputs(), leaving the
+    confirm popup still reading `y` for a left/right choice, so forward and back
+    moved between Yes and No. Two call sites, one fixed, one missed.
+
+    THE NEGATION IS MEASURED, not derived. inputs.py has INVERT_X = 1, which the
+    drive path needs because the motor outputs are crossed as well - see the note
+    on that constant. Only the PAIR is observable at the wheels, so the value
+    arriving here is not the one under the operator's hand, and this window has
+    no motors to cancel against. Operator, driving it: "in left right is swped".
+
+    Returns None when the axis is dead, which both callers already handle.
+    """
+    x = joy.get("x")
+    return None if x is None else -x
 
 
 def _centre_on_parent(dlg):
@@ -1118,19 +1329,11 @@ class UsbChooser(QDialog):
             self._modal_inputs(snap)
             return
         joy = (snap or {}).get("joy") or {}
-        # AXES SWAPPED, IN THIS WINDOW ONLY, operator 2026-08-26: "in
-        # popup view x is y and y is x ... only change in popup view".
-        # inputs.py applies INPUTS_SWAP_XY once for DRIVING, and
-        # inputs_panel then swaps them back again for the joystick
-        # display - so the snapshot carries the driving axes, which are
-        # not the ones the operator sees under their hand. Everywhere
-        # else that is right, because everywhere else the stick is
-        # steering a robot. In here it is steering a cursor and the only
-        # reference is the physical stick, so this window takes them the
-        # display way round. Nothing outside these two lines changes; if
-        # a direction ends up mirrored rather than transposed, it is the
-        # sign that is wrong here, not the swap.
-        x, y = joy.get("y"), joy.get("x")
+        # NO TRANSPOSE any more - the axes are their own again, and the
+        # horizontal one comes from _stick_lr() so this window and its confirm
+        # popup cannot disagree about which way is right. y needs no correction:
+        # pushing UP already gives a negative y and the code below expects that.
+        x, y = _stick_lr(joy), joy.get("y")
         now = time.monotonic()
 
         # Vertical: step the cursor.
@@ -1234,16 +1437,16 @@ class UsbChooser(QDialog):
     def _modal_inputs(self, snap):
         """Drive the confirm popup from the stick. See _confirm().
 
-        Yes and No sit side by side, so this is the HORIZONTAL axis - and it
-        takes the same swapped axis the rest of this window uses, because the
-        reference is the physical stick under the hand, not the driving frame.
+        Yes and No sit side by side, so this is the HORIZONTAL axis, taken from
+        _stick_lr() exactly as the chooser behind it does. It used to read `y`
+        here, which is why forward and back moved between the two buttons.
 
         Edge-triggered on both axes: holding the stick over must not walk the
         choice back and forth, and the SAVE count is compared with > so a
         counter reset cannot fire a phantom press.
         """
         joy = (snap or {}).get("joy") or {}
-        h = joy.get("y")            # same swap as on_inputs()
+        h = _stick_lr(joy)          # the SAME axis the chooser uses
         if h is not None and abs(h) >= self.NAV_DEADBAND:
             if self._modal_h_dir == 0:
                 self._modal_h_dir = 1 if h > 0 else -1
@@ -1303,7 +1506,9 @@ class UsbChooser(QDialog):
             "QMessageBox { background: %s; border: 1px solid %s;"
             "   border-radius: 14px; }"
             "QLabel { color: %s; }"
-            "QPushButton { background: rgba(0,0,0,0.06); color: %s;"
+            # A WHITE tint now, not a black one: on the dark ground the old
+            # rgba(0,0,0,0.06) was invisible and the buttons had no body at all.
+            "QPushButton { background: rgba(255,255,255,0.10); color: %s;"
             "   border: none; border-radius: 7px; padding: 8px 20px;"
             "   min-width: 84px; font-weight: 600; }"
             "QPushButton:default { background: %s; color: #ffffff; }"
@@ -1316,7 +1521,7 @@ class UsbChooser(QDialog):
             "QPushButton[navfocus=\"true\"] { background: %s; color: #ffffff;"
             "   border: 2px solid #ffffff; }"
             % (POPUP_DEL_BG, POPUP_DEL_EDGE, POPUP_INK, POPUP_INK,
-               theme.LIGHT["red"], theme.LIGHT["blue"]))
+               theme.DARK["red"], theme.DARK["blue"]))
         # Stick navigation, and NO is index 0 - the cursor starts on the safe
         # answer for the same reason setDefaultButton does.
         self._modal = box
@@ -1352,8 +1557,16 @@ class UsbChooser(QDialog):
     def _start(self, jobs, delete):
         if not jobs:
             return
+        # Sizes ride along so the popup can report speed and time remaining from
+        # real bytes rather than counting items - a session is anywhere from a
+        # few MB to a couple of GB, so items-per-second says almost nothing.
+        sizes = [j[2] for j in jobs]
         self._popup = ProgressPopup(
-            "Deleting from the Pi" if delete else "Saving to USB drive", self)
+            "Deleting from the Pi" if delete else "Saving to USB drive", self,
+            sizes=sizes,
+            verb="Deleting" if delete else "Copying",
+            prep="from" if delete else "to",
+            dest="the Pi" if delete else "USB drive")
         self._popup.update_progress("", 0, len(jobs))
         self._popup.show()
         self._worker = _Worker(jobs, dest=self.mount, delete=delete, parent=self)
@@ -1421,9 +1634,9 @@ class UsbChooser(QDialog):
 
     # -- worker callbacks -----------------------------------------------------
 
-    def _on_progress(self, name, done, total):
+    def _on_progress(self, name, done, total, items=0, n_items=0):
         if self._popup is not None:
-            self._popup.update_progress(name, done, total)
+            self._popup.update_progress(name, done, total, items, n_items)
 
     def _close_popup(self):
         """Shut the little box. Called on BOTH endings - a popup left up after a
@@ -1433,7 +1646,15 @@ class UsbChooser(QDialog):
             self._popup = None
 
     def _on_done(self, summary):
-        self._close_popup()
+        # SHOW THE END BEFORE CLOSING. A dialog that vanishes at 97% reads as a
+        # job that was interrupted, which is the complaint this answers - the
+        # copy had finished, but nothing ever said so. 500ms is long enough to
+        # register and short enough not to feel like waiting.
+        if self._popup is not None:
+            self._popup.finish()
+            QTimer.singleShot(500, self._close_popup)
+        else:
+            self._close_popup()
         self.hint.setText(summary)
         self._worker = None
         self.reload()

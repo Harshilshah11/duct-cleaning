@@ -139,6 +139,53 @@ def _session_started(name):
 
 
 
+def stamp_unfinished_sessions(root, idle_s=120.0):
+    """Give an end time to any session folder that never got one.
+
+    _finalize_dir_name() appends "end HH-MM-SS" when a run stops. If the ground
+    station dies or is restarted mid-recording, that call never happens and the
+    folder is left with only a start time - `session50 date 01-09-26 start
+    17-10-58`. It is not damaged, but it reads as a run that never ended and it
+    sorts oddly against its neighbours. Several were left behind by the restarts
+    of 2026-09-01, which is what prompted this.
+
+    The end time comes from the NEWEST FILE INSIDE, which is when the footage
+    actually stopped growing - far closer to the truth than now(), and it stays
+    correct however long the folder sat unstamped before anyone noticed.
+
+    IDLE GUARD: a folder touched within idle_s is assumed to be recording and is
+    left alone. This runs at the start of a new session, when nothing else should
+    be live, but stamping a running session's directory would put "end" on a run
+    still in progress - so the cheap check is worth having.
+    """
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    now = time.time()
+    for name in names:
+        if " end " in name or not re.search(r"session(\d+)", name, re.I):
+            continue
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            newest = max((os.path.getmtime(os.path.join(path, f))
+                          for f in os.listdir(path)), default=None)
+        except OSError:
+            continue
+        if newest is None or now - newest < idle_s:
+            continue
+        try:
+            os.rename(path, os.path.join(
+                root, "%s end %s" % (name, time.strftime("%H-%M-%S",
+                                                         time.localtime(newest)))))
+        except OSError:
+            # Cosmetic only - the footage is untouched and every path into it
+            # still resolves. Never let a tidy-up cost a recording.
+            pass
+
+
 def _next_session_no(root):
     """1 + the highest SESSIONnnn in `root`, counting only sessions newer than
     the last verified USB backup - so a stick that has taken the footage away
@@ -157,6 +204,10 @@ def _next_session_no(root):
     number, so a second SESSION001 is a different directory from the first, on
     the Pi and on the stick alike.
     """
+    # Tidy up anything a previous run left unstamped, while the directory is
+    # being listed anyway and before this session adds itself to it.
+    stamp_unfinished_sessions(root)
+
     epoch = _reset_epoch(root)
     highest = 0
     try:
@@ -1235,7 +1286,24 @@ class FullViewBuilder(threading.Thread):
                     by_slug.setdefault(slug, []).append(path)
 
         for slug, parts in by_slug.items():
-            stem = (self.labels.get(slug) or slug).strip().lower() or slug
+            label = (self.labels.get(slug) or slug).strip().lower() or slug
+            # NUMBERED, so the cameras land in camera order. Operator 2026-09-01:
+            # "i want to first video is front and second is back".
+            #
+            # They were named from the label alone - front.mp4 and back.mp4 -
+            # which sorts BACK first in every file manager, on the Pi and on the
+            # stick, because b precedes f. The front camera is the one an
+            # operator opens first and it was always the second row.
+            #
+            # The camera number is already in the slug (cam1_front), put there
+            # by config.camera_slug(), so nothing new has to be derived or
+            # configured: 1_front.mp4, 2_back.mp4, and full.mp4 after them.
+            #
+            # NOT the bare slug, which would give cam1_front.mp4 - that is one
+            # underscore away from the per-clip parts (cam1_front_001.mp4) and
+            # the two would be easy to confuse by eye when a join goes wrong.
+            m = re.search(r"cam(\d+)", slug, re.IGNORECASE)
+            stem = ("%s_%s" % (m.group(1), label)) if m else label
             reason = self._join(stem, parts)
             if reason:
                 problems.append("%s: %s" % (stem, reason))

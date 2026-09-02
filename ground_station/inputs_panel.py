@@ -1630,6 +1630,12 @@ def _build_fraction(fv):
     return max(0.0, min(1.0, guess))
 
 
+# HOW LONG THE GREEN TICK STAYS UP after a save completes, in seconds. Operator
+# 2026-09-01 asked for 30. Long enough to catch across the cab, short enough that
+# the dial goes back to being a dial rather than a permanent badge.
+DONE_HOLD_S = 30.0
+
+
 class RoundSaveButton(QWidget):
     """SAVE, as a round control that doubles as the transfer dial.
 
@@ -1700,6 +1706,10 @@ class RoundSaveButton(QWidget):
         self._check = 0.0
         self._tick = 0.0
         self._armed = False
+        # See DONE_HOLD_S. _done_at times the tick; _done_expired latches it off
+        # so the panel re-asserting "done" every refresh cannot restart it.
+        self._done_at = None
+        self._done_expired = False
         self.setFixedSize(self.WIDTH, self.WIDTH)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._step)
@@ -1716,8 +1726,31 @@ class RoundSaveButton(QWidget):
         an operator actually wants while a run is going.
         """
         self._label = label
-        if mode == "done" and self._mode != "done":
-            self._check = 0.0
+        # THE TICK IS NOT PERMANENT. Operator 2026-09-01: "when recording save,
+        # in save icon its only show green right arrow, so its show only 30
+        # second after its save".
+        #
+        # "done" had no timeout. The panel re-asserts it on every refresh for as
+        # long as the full-view build reports done, so the green check sat on the
+        # dial until the next recording started - which on a rig left idle is
+        # indefinitely. It stops being information after the first few seconds
+        # and just hides the dial's real job.
+        #
+        # THE LATCH IS THE WHOLE TRICK. Simply flipping back to "ready" on
+        # timeout does not work: the very next refresh calls set_status("done")
+        # again, sees a mode that is no longer "done", and starts the tick over -
+        # a 30-second blink, for ever. _done_expired remembers that this
+        # particular completion has had its turn, and only a state that is NOT
+        # done clears it, which is exactly what starting another recording does.
+        if mode == "done":
+            if self._done_expired:
+                mode = "ready"                  # already shown; stay quiet
+            elif self._mode != "done":
+                self._check = 0.0
+                self._done_at = time.monotonic()
+        else:
+            self._done_expired = False
+            self._done_at = None
         self._mode = mode
         self._target = max(0.0, min(1.0, float(frac or 0.0)))
         # A fresh build starts the dial at zero rather than easing down from
@@ -1742,6 +1775,12 @@ class RoundSaveButton(QWidget):
             self._press = 0.0
         if self._mode == "done":
             self._check += (1.0 - self._check) * 0.16
+            if (self._done_at is not None
+                    and time.monotonic() - self._done_at >= DONE_HOLD_S):
+                self._done_expired = True
+                self._mode = "ready"
+                self._check = 0.0
+                self._target = 0.0
         else:
             self._check = 0.0
         self.update()
